@@ -4,8 +4,8 @@
 #   ./bin/create-overlay.sh <base.qcow2> [overlay.qcow2]
 #
 # Examples:
-#   ./bin/create-overlay.sh Assets/Qemu/qemu~/win95/win95.qcow2
-#   ./bin/create-overlay.sh Assets/Qemu/qemu~/win95/win95.qcow2 Assets/Qemu/qemu~/win95/o1.qcow2
+#   ./bin/create-overlay.sh Assets/qemu~/win95/win95.qcow2
+#   ./bin/create-overlay.sh Assets/qemu~/win95/win95.qcow2 Assets/qemu~/win95/o1.qcow2
 #
 # Then run QEMU with -hda pointing at the overlay (not the base).
 

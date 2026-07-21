@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using TriInspector;
 using UnityEngine;
+using UnityEngine.Serialization;
 using UnityQemu;
 using Debug = UnityEngine.Debug;
 #if UNITY_EDITOR
@@ -18,11 +20,23 @@ public enum GuestMemoryScanScope { ActiveProcess, FullPhysicalRam }
 /// Windows XP guest process list + per-process RAM search (gdbstub physical memory).
 /// Typical flow: Refresh processes → Regions on a row → New search = value → Keep changed → poke.
 /// </summary>
+[ExecuteAlways]
 [DeclareFoldoutGroup("Processes")]
 [DeclareFoldoutGroup("RAM search")]
-public class QemuProcessList : MonoBehaviour
+[DeclareBoxGroup("RAM search/scan", Title = "Scan settings")]
+[DeclareBoxGroup("RAM search/search", Title = "Search")]
+[DeclareHorizontalGroup("RAM search/search/new")]
+[DeclareHorizontalGroup("RAM search/search/keep")]
+[DeclareBoxGroup("RAM search/add", Title = "Add candidate manually")]
+[DeclareHorizontalGroup("RAM search/add/row")]
+[DeclareBoxGroup("RAM search/candidates", Title = "Candidates")]
+[DeclareHorizontalGroup("RAM search/candidates/maintain")]
+public class RamSearch : MonoBehaviour
 {
-    public QemuEmulator qemu;
+    [FormerlySerializedAs("qemu")]
+    public VirtualMachine virtualMachine;
+
+    // --- Processes group ---
 
     [Group("Processes")]
     [Tooltip("How many MiB of physical RAM to scan when auto-finding System (clamped to guest RAM from QMP)")]
@@ -47,7 +61,7 @@ public class QemuProcessList : MonoBehaviour
 
     [Group("Processes")]
     [ShowInInspector, ReadOnly]
-    bool GdbReady => qemu != null && qemu.GdbConnected;
+    bool GdbReady => virtualMachine != null && virtualMachine.GdbConnected;
 
     [Group("Processes")]
     [ShowInInspector, ReadOnly]
@@ -75,54 +89,230 @@ public class QemuProcessList : MonoBehaviour
     [Tooltip("Asset to save/load the active process physical memory map")]
     public GuestProcessMemoryMap memoryMapAsset;
 
-    [Group("RAM search")]
+    // --- RAM search: scan settings ---
+
+    [Group("RAM search/scan")]
     [Tooltip("Default: scan only the active process memory map")]
     public GuestMemoryScanScope scanScope = GuestMemoryScanScope.ActiveProcess;
 
-    [Group("RAM search")]
+    [Group("RAM search/scan")]
     [ShowIf(nameof(scanScope), GuestMemoryScanScope.FullPhysicalRam)]
     [Tooltip("Guest physical address when scanning full RAM")]
     public long scanStart;
 
-    [Group("RAM search")]
+    [Group("RAM search/scan")]
     [ShowIf(nameof(scanScope), GuestMemoryScanScope.FullPhysicalRam)]
     [Tooltip("Bytes to scan when scanning full RAM")]
     public int scanLength = 1024 * 1024;
 
-    [Group("RAM search")]
+    [Group("RAM search/scan")]
     [Tooltip("1 / 2 / 4 byte values")]
     public int valueSize = 4;
 
-    [Group("RAM search")]
+    [Group("RAM search/scan")]
     public bool littleEndian = true;
 
-    [Group("RAM search")]
-    [Tooltip("Value for 'New = value' / 'Keep = value'")]
+    // --- RAM search: search value + scan/filter buttons ---
+
+    [Group("RAM search/search")]
+    [Tooltip("Value compared by 'New: = value' / 'Keep = value' / 'Keep ≠ value'")]
     public long searchValue;
 
-    [Group("RAM search")]
-    [Tooltip("Value written by Poke on the selected candidate")]
+    [Group("RAM search/search/new")]
+    [Button("New: = value")]
+    [EnableIf(nameof(CanScan))]
+    public void NewSearchEquals()
+    {
+        if (!SearchReady(out string err)) { status = err; return; }
+
+        uint target = (uint)searchValue;
+        _cands.Clear();
+        int step = Mathf.Clamp(valueSize, 1, 4);
+
+        using (virtualMachine.BeginMemorySession())
+        {
+            foreach (var window in GetScanWindows())
+            {
+                if (!TryReadWindow(window.start, window.length, out byte[] mem, out err))
+                {
+                    status = err;
+                    RebuildCandidateEntries();
+                    return;
+                }
+
+                for (int off = 0; off + step <= mem.Length; off += step)
+                {
+                    uint v = ReadValue(mem, off, step);
+                    if (v != target) continue;
+                    _cands.Add(new Candidate { Address = window.start + off, LastValue = v });
+                    if (_cands.Count >= MaxCandidates)
+                    {
+                        status = $"Hit MaxCandidates ({MaxCandidates}); narrow the scan range";
+                        RebuildCandidateEntries();
+                        return;
+                    }
+                }
+            }
+        }
+
+        status = DescribeScanResult($"New = {searchValue}");
+        RebuildCandidateEntries();
+    }
+
+    [Group("RAM search/search/new")]
+    [Button("New: unknown")]
+    [EnableIf(nameof(CanScan))]
+    public void NewSearchUnknown()
+    {
+        if (!SearchReady(out string err)) { status = err; return; }
+        int step = Mathf.Clamp(valueSize, 1, 4);
+
+        _cands.Clear();
+        using (virtualMachine.BeginMemorySession())
+        {
+            foreach (var window in GetScanWindows())
+            {
+                long alignedCount = Math.Max(0, (window.length - step) / step + 1);
+                if (_cands.Count + alignedCount > MaxCandidates)
+                {
+                    status = $"Range too large for unknown search ({_cands.Count + alignedCount} > {MaxCandidates})";
+                    return;
+                }
+                if (!TryReadWindow(window.start, window.length, out byte[] mem, out err))
+                {
+                    status = err;
+                    return;
+                }
+
+                for (int off = 0; off + step <= mem.Length; off += step)
+                {
+                    _cands.Add(new Candidate
+                    {
+                        Address = window.start + off,
+                        LastValue = ReadValue(mem, off, step),
+                    });
+                }
+            }
+        }
+
+        status = DescribeScanResult("Unknown snapshot");
+        RebuildCandidateEntries();
+    }
+
+    [Group("RAM search/search/keep")]
+    [Button("Keep = value")]
+    [EnableIf(nameof(CanFilterCandidates))]
+    public void KeepEqualsValue()
+    {
+        uint target = (uint)searchValue;
+        FilterCandidates((cur, _) => cur == target, $"= {searchValue}");
+    }
+
+    [Group("RAM search/search/keep")]
+    [Button("Keep ≠ value")]
+    [EnableIf(nameof(CanFilterCandidates))]
+    public void KeepNotEqualsValue()
+    {
+        uint target = (uint)searchValue;
+        FilterCandidates((cur, _) => cur != target, $"!= {searchValue}");
+    }
+
+    [Group("RAM search/search/keep")]
+    [Button("Keep changed")]
+    [EnableIf(nameof(CanFilterCandidates))]
+    public void KeepChanged() => FilterCandidates((cur, last) => cur != last, "changed");
+
+    [Group("RAM search/search/keep")]
+    [Button("Keep unchanged")]
+    [EnableIf(nameof(CanFilterCandidates))]
+    public void KeepUnchanged() => FilterCandidates((cur, last) => cur == last, "unchanged");
+
+    // --- RAM search: manual candidate entry ---
+
+    [Group("RAM search/add/row")]
+    [HideLabel]
+    [Tooltip("Physical address to add — hex (0x12AB00 or 12AB00) ")]
+    public string manualAddress = "";
+
+    [Group("RAM search/add/row")]
+    [Button("Add candidate")]
+    [EnableIf(nameof(GdbReady))]
+    public void AddManualCandidate()
+    {
+        if (!Ready(out string err)) { status = err; return; }
+        if (!TryParseAddress(manualAddress, out long address))
+        {
+            status = $"Cannot parse address '{manualAddress}' — use hex like 0x0012AB00";
+            return;
+        }
+        if (_cands.Any(c => c.Address == address))
+        {
+            status = $"0x{address:X8} is already a candidate";
+            return;
+        }
+
+        int size = Mathf.Clamp(valueSize, 1, 4);
+        uint value = 0;
+        try
+        {
+            using (virtualMachine.BeginMemorySession())
+            {
+                byte[] mem = virtualMachine.ReadBytes(address, size);
+                value = ReadValue(mem, 0, size);
+            }
+        }
+        catch (Exception e)
+        {
+            status = $"Read failed @ 0x{address:X8}: {e.Message}";
+            return;
+        }
+
+        _cands.Add(new Candidate { Address = address, LastValue = value });
+        status = $"Added 0x{address:X8} = {value} ({_cands.Count} candidates)";
+        RebuildCandidateEntries();
+    }
+
+    // --- RAM search: candidates ---
+
+    [Group("RAM search/candidates")]
+    [Tooltip("Value written by Poke on a candidate row")]
     public long pokeValue;
 
-    [Group("RAM search")]
+    [Group("RAM search/candidates")]
     [Tooltip("When ≤10 candidates, periodically re-read displayed values")]
     public bool autoRefreshCandidates = true;
 
-    [Group("RAM search")]
+    [Group("RAM search/candidates")]
     [ShowIf(nameof(autoRefreshCandidates))]
     [Tooltip("Seconds between auto-refreshes (only while ≤10 candidates)")]
     public float autoRefreshInterval = 0.5f;
 
-    [Group("RAM search")]
+    [Group("RAM search/candidates/maintain")]
+    [Button("Refresh values")]
+    [ShowIf(nameof(ShowManualRefreshButton))]
+    [EnableIf(nameof(CanFilterCandidates))]
+    public void RefreshCandidateValuesButton() => RefreshCandidateValues(silent: false);
+
+    [Group("RAM search/candidates/maintain")]
+    [Button("Clear candidates")]
+    [EnableIf(nameof(HasCandidates))]
+    public void ClearCandidates()
+    {
+        _cands.Clear();
+        RebuildCandidateEntries();
+        status = "Cleared candidates";
+    }
+
+    [Group("RAM search/candidates")]
     [ShowInInspector, ReadOnly]
     int candidateCount;
 
-    [Group("RAM search")]
+    [Group("RAM search/candidates")]
     [ShowInInspector, ReadOnly]
     [ShowIf(nameof(CandidatesListCollapsed))]
     string candidateListNote = "";
 
-    [Group("RAM search")]
+    [Group("RAM search/candidates")]
     [ListDrawerSettings(
         Draggable = false,
         HideAddButton = true,
@@ -169,8 +359,10 @@ public class QemuProcessList : MonoBehaviour
 
     void OnEnable()
     {
-        if (qemu == null)
-            qemu = FindFirstObjectByType<QemuEmulator>();
+        if (virtualMachine == null)
+            virtualMachine = GetComponent<VirtualMachine>();
+        if (virtualMachine == null)
+            virtualMachine = FindFirstObjectByType<VirtualMachine>();
         _nextCandidateRefresh = 0f;
     }
 
@@ -211,9 +403,9 @@ public class QemuProcessList : MonoBehaviour
         int scanMiB = systemScanMaxMiB;
         try
         {
-            if (qemu.QmpConnected)
+            if (virtualMachine.QmpConnected)
             {
-                long ramBytes = await qemu.GetGuestRamBytesAsync();
+                long ramBytes = await virtualMachine.GetGuestRamBytesAsync();
                 guestRamMiB = (int)Math.Max(1, ramBytes / (1024 * 1024));
                 if (scanMiB <= 0 || scanMiB > guestRamMiB)
                     scanMiB = guestRamMiB;
@@ -235,7 +427,7 @@ public class QemuProcessList : MonoBehaviour
         long walkMs = 0;
         bool didFind = systemEproc == 0;
 
-        using (qemu.BeginMemorySession())
+        using (virtualMachine.BeginMemorySession())
         {
             if (systemEproc == 0)
             {
@@ -267,7 +459,7 @@ public class QemuProcessList : MonoBehaviour
         string findNote = didFind ? $"find {findMs} ms" : "find skipped (cached)";
         status = $"Found {_processes.Count} processes (System @ phys 0x{systemEproc:X}{ramNote}) — {findNote}, walk {walkMs} ms, total {swTotal.ElapsedMilliseconds} ms";
         Debug.Log(
-            $"[QemuProcessList] RefreshProcessList: {findNote}, walk {walkMs} ms, " +
+            $"[RamSearch] RefreshProcessList: {findNote}, walk {walkMs} ms, " +
             $"total {swTotal.ElapsedMilliseconds} ms, processes={_processes.Count}, scanMiB={scanMiB}");
         ApplyProcessNameFilter();
     }
@@ -304,7 +496,7 @@ public class QemuProcessList : MonoBehaviour
         status = $"Walking VADs for {proc.Name} (PID {proc.Pid})...";
 
         _selectedRegions.Clear();
-        using (qemu.BeginMemorySession())
+        using (virtualMachine.BeginMemorySession())
         {
             _selectedRegions.AddRange(
                 Win32X86GuestMemory.EnumerateUserPhysicalRanges(
@@ -376,122 +568,7 @@ public class QemuProcessList : MonoBehaviour
         RebuildProcessEntries();
     }
 
-    // --- RAM search ---
-
-    [Group("RAM search")]
-    [Button("New search: = value")]
-    [EnableIf(nameof(CanScan))]
-    public void NewSearchEquals()
-    {
-        if (!SearchReady(out string err)) { status = err; return; }
-
-        uint target = (uint)searchValue;
-        _cands.Clear();
-        int step = Mathf.Clamp(valueSize, 1, 4);
-
-        using (qemu.BeginMemorySession())
-        {
-            foreach (var window in GetScanWindows())
-            {
-                if (!TryReadWindow(window.start, window.length, out byte[] mem, out err))
-                {
-                    status = err;
-                    RebuildCandidateEntries();
-                    return;
-                }
-
-                for (int off = 0; off + step <= mem.Length; off += step)
-                {
-                    uint v = ReadValue(mem, off, step);
-                    if (v != target) continue;
-                    _cands.Add(new Candidate { Address = window.start + off, LastValue = v });
-                    if (_cands.Count >= MaxCandidates)
-                    {
-                        status = $"Hit MaxCandidates ({MaxCandidates}); narrow the scan range";
-                        RebuildCandidateEntries();
-                        return;
-                    }
-                }
-            }
-        }
-
-        status = DescribeScanResult($"New = {searchValue}");
-        RebuildCandidateEntries();
-    }
-
-    [Group("RAM search")]
-    [Button("New search: unknown")]
-    [EnableIf(nameof(CanScan))]
-    public void NewSearchUnknown()
-    {
-        if (!SearchReady(out string err)) { status = err; return; }
-        int step = Mathf.Clamp(valueSize, 1, 4);
-
-        _cands.Clear();
-        using (qemu.BeginMemorySession())
-        {
-            foreach (var window in GetScanWindows())
-            {
-                long alignedCount = Math.Max(0, (window.length - step) / step + 1);
-                if (_cands.Count + alignedCount > MaxCandidates)
-                {
-                    status = $"Range too large for unknown search ({_cands.Count + alignedCount} > {MaxCandidates})";
-                    return;
-                }
-                if (!TryReadWindow(window.start, window.length, out byte[] mem, out err))
-                {
-                    status = err;
-                    return;
-                }
-
-                for (int off = 0; off + step <= mem.Length; off += step)
-                {
-                    _cands.Add(new Candidate
-                    {
-                        Address = window.start + off,
-                        LastValue = ReadValue(mem, off, step),
-                    });
-                }
-            }
-        }
-
-        status = DescribeScanResult("Unknown snapshot");
-        RebuildCandidateEntries();
-    }
-
-    [Group("RAM search")]
-    [Button("Keep unchanged")]
-    [EnableIf(nameof(CanFilterCandidates))]
-    public void KeepUnchanged() => FilterCandidates((cur, last) => cur == last, "unchanged");
-
-    [Group("RAM search")]
-    [Button("Keep changed")]
-    [EnableIf(nameof(CanFilterCandidates))]
-    public void KeepChanged() => FilterCandidates((cur, last) => cur != last, "changed");
-
-    [Group("RAM search")]
-    [Button("Keep = value")]
-    [EnableIf(nameof(CanFilterCandidates))]
-    public void KeepEqualsValue()
-    {
-        uint target = (uint)searchValue;
-        FilterCandidates((cur, _) => cur == target, $"= {searchValue}");
-    }
-
-    [Group("RAM search")]
-    [Button("Keep != value")]
-    [EnableIf(nameof(CanFilterCandidates))]
-    public void KeepNotEqualsValue()
-    {
-        uint target = (uint)searchValue;
-        FilterCandidates((cur, _) => cur != target, $"!= {searchValue}");
-    }
-
-    [Group("RAM search")]
-    [Button("Refresh displayed values")]
-    [ShowIf(nameof(ShowManualRefreshButton))]
-    [EnableIf(nameof(CanFilterCandidates))]
-    public void RefreshCandidateValuesButton() => RefreshCandidateValues(silent: false);
+    // --- RAM search internals ---
 
     void RefreshCandidateValues(bool silent)
     {
@@ -503,14 +580,14 @@ public class QemuProcessList : MonoBehaviour
         int size = Mathf.Clamp(valueSize, 1, 4);
         int updated = 0;
 
-        using (qemu.BeginMemorySession())
+        using (virtualMachine.BeginMemorySession())
         {
             for (int i = 0; i < _cands.Count; i++)
             {
                 var c = _cands[i];
                 try
                 {
-                    byte[] mem = qemu.ReadBytes(c.Address, size);
+                    byte[] mem = virtualMachine.ReadBytes(c.Address, size);
                     c.LastValue = ReadValue(mem, 0, size);
                     _cands[i] = c;
                     updated++;
@@ -529,22 +606,15 @@ public class QemuProcessList : MonoBehaviour
         if (silent && candidates.Count == _cands.Count && _cands.Count <= MaxListedCandidates)
         {
             for (int i = 0; i < candidates.Count; i++)
-                candidates[i].label = FormatCandidateLabel(_cands[i], i);
+            {
+                candidates[i].address = FormatCandidateAddress(_cands[i]);
+                candidates[i].value = FormatCandidateValue(_cands[i]);
+            }
             candidateCount = _cands.Count;
             return;
         }
 
         RebuildCandidateEntries();
-    }
-
-    [Group("RAM search")]
-    [Button("Clear candidates")]
-    [EnableIf(nameof(HasCandidates))]
-    public void ClearCandidates()
-    {
-        _cands.Clear();
-        RebuildCandidateEntries();
-        status = "Cleared candidates";
     }
 
     void FilterCandidates(Func<uint, uint, bool> pred, string label)
@@ -559,7 +629,7 @@ public class QemuProcessList : MonoBehaviour
         int size = Mathf.Clamp(valueSize, 1, 4);
         var next = new List<Candidate>(_cands.Count);
 
-        using (qemu.BeginMemorySession())
+        using (virtualMachine.BeginMemorySession())
         {
             // Candidates are physical addresses and often scattered — don't read min..max.
             // Group by 4 KiB page and read each page once.
@@ -582,7 +652,7 @@ public class QemuProcessList : MonoBehaviour
                 byte[] mem;
                 try
                 {
-                    mem = qemu.ReadBytes(page, pageSize);
+                    mem = virtualMachine.ReadBytes(page, pageSize);
                 }
                 catch (Exception e)
                 {
@@ -621,8 +691,8 @@ public class QemuProcessList : MonoBehaviour
         int size = Mathf.Clamp(valueSize, 1, 4);
         try
         {
-            using (qemu.BeginMemorySession())
-                qemu.WriteUnsigned(_cands[index].Address, (uint)pokeValue, size, !littleEndian);
+            using (virtualMachine.BeginMemorySession())
+                virtualMachine.WriteUnsigned(_cands[index].Address, (uint)pokeValue, size, !littleEndian);
             var c = _cands[index];
             c.LastValue = (uint)pokeValue;
             _cands[index] = c;
@@ -633,6 +703,33 @@ public class QemuProcessList : MonoBehaviour
         {
             status = $"Poke failed: {e.Message}";
         }
+    }
+
+    void SaveCandidateToWatches(CandidateEntry entry)
+    {
+        if (entry == null || !entry.TryGetCandidateIndex(out int index))
+        {
+            status = "Invalid candidate — refresh search";
+            return;
+        }
+        if (memoryMapAsset == null)
+        {
+            status = "Assign memoryMapAsset first";
+            return;
+        }
+
+        var c = _cands[index];
+        int size = Mathf.Clamp(valueSize, 1, 4);
+        if (!memoryMapAsset.AddWatch(c.Address, size))
+        {
+            status = $"0x{c.Address:X8} ({size}B) already saved in {memoryMapAsset.name}";
+            return;
+        }
+
+#if UNITY_EDITOR
+        EditorUtility.SetDirty(memoryMapAsset);
+#endif
+        status = $"Saved 0x{c.Address:X8} ({size}B) → {memoryMapAsset.name} ({memoryMapAsset.watches.Count} watches)";
     }
 
     void RemoveCandidate(CandidateEntry entry)
@@ -668,11 +765,26 @@ public class QemuProcessList : MonoBehaviour
             {
                 owner = this,
                 candidateIndex = i,
-                label = FormatCandidateLabel(c, i),
+                address = FormatCandidateAddress(c),
+                value = FormatCandidateValue(c),
             });
         }
         foreach (var entry in candidates)
             entry.owner = this;
+    }
+
+    static bool TryParseAddress(string text, out long address)
+    {
+        address = 0;
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        string s = text.Trim();
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            s = s.Substring(2);
+
+        return long.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out address)
+            && address >= 0;
     }
 
     IEnumerable<(long start, int length)> GetScanWindows()
@@ -721,7 +833,7 @@ public class QemuProcessList : MonoBehaviour
         mem = null;
         try
         {
-            mem = qemu.ReadBytes(start, length);
+            mem = virtualMachine.ReadBytes(start, length);
             err = null;
             return true;
         }
@@ -752,8 +864,9 @@ public class QemuProcessList : MonoBehaviour
         return be;
     }
 
-    static string FormatCandidateLabel(Candidate c, int index) =>
-        $"[{index}]  0x{c.Address:X8}  = {c.LastValue}  (0x{c.LastValue:X})";
+    static string FormatCandidateAddress(Candidate c) => $"0x{c.Address:X8}";
+
+    static string FormatCandidateValue(Candidate c) => $"= {c.LastValue}  (0x{c.LastValue:X})";
 
     // --- Shared helpers ---
 
@@ -790,7 +903,7 @@ public class QemuProcessList : MonoBehaviour
             entry.owner = this;
     }
 
-    byte[] ReadPhys(long address, int length) => qemu.ReadBytes(address, length);
+    byte[] ReadPhys(long address, int length) => virtualMachine.ReadBytes(address, length);
 
     bool TryGetKernelDirectoryTableBase(out uint dtb)
     {
@@ -808,12 +921,12 @@ public class QemuProcessList : MonoBehaviour
 
     bool Ready(out string err)
     {
-        if (qemu == null)
+        if (virtualMachine == null)
         {
-            err = "No QemuEmulator assigned";
+            err = "No VirtualMachine assigned";
             return false;
         }
-        if (!qemu.GdbConnected)
+        if (!virtualMachine.GdbConnected)
         {
             err = "GDB not connected";
             return false;
@@ -869,7 +982,7 @@ public class QemuProcessList : MonoBehaviour
         [HideLabel, DisplayAsString]
         public string label;
 
-        [NonSerialized] public QemuProcessList owner;
+        [NonSerialized] public RamSearch owner;
         [NonSerialized] public int processIndex = -1;
 
         public bool TryGetProcessIndex(out int index)
@@ -892,13 +1005,19 @@ public class QemuProcessList : MonoBehaviour
     }
 
     [Serializable]
-    [DeclareHorizontalGroup("cactions")]
+    [DeclareHorizontalGroup("row")]
     public class CandidateEntry
     {
-        [HideLabel, DisplayAsString]
-        public string label;
+        // Plain text field (not [ReadOnly]) so the address can be selected and copied;
+        // edits are ignored — the list is rebuilt from internal state.
+        [Group("row"), HideLabel]
+        [ReadOnly, Tooltip("Physical address")]
+        public string address;
 
-        [NonSerialized] public QemuProcessList owner;
+        [Group("row"), HideLabel, DisplayAsString]
+        public string value;
+
+        [NonSerialized] public RamSearch owner;
         [NonSerialized] public int candidateIndex = -1;
 
         public bool TryGetCandidateIndex(out int index)
@@ -907,7 +1026,7 @@ public class QemuProcessList : MonoBehaviour
             return owner != null && index >= 0 && index < owner._cands.Count;
         }
 
-        [Group("cactions")]
+        [Group("row")]
         [Button("Poke")]
         public void Poke()
         {
@@ -915,7 +1034,16 @@ public class QemuProcessList : MonoBehaviour
             owner.PokeCandidate(this);
         }
 
-        [Group("cactions")]
+        [Group("row")]
+        [Button("Save")]
+        [Tooltip("Save this address as a watch on the memory map asset")]
+        public void Save()
+        {
+            if (owner == null) return;
+            owner.SaveCandidateToWatches(this);
+        }
+
+        [Group("row")]
         [GUIColor(1.0f, 0.55f, 0.55f)]
         [Button("×")]
         public void Remove()

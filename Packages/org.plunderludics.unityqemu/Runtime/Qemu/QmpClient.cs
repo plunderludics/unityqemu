@@ -11,7 +11,7 @@ using UnityEngine;
 /// Handles connection, handshake, and command execution.
 /// </summary>
 namespace UnityQemu {
-public class QemuQmpClient : IDisposable
+public class QmpClient : IDisposable
 {
     private TcpClient _tcpClient;
     private NetworkStream _stream;

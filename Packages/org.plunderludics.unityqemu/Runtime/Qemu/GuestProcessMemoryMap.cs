@@ -5,7 +5,7 @@ using UnityEngine;
 namespace UnityQemu {
 /// <summary>
 /// Saved physical memory map for a guest process (from VAD / page-table walk).
-/// Assign to <see cref="QemuProcessList"/> to reuse without rescanning.
+/// Assign to <see cref="RamSearch"/> to reuse without rescanning.
 /// </summary>
 [CreateAssetMenu(fileName = "GuestProcessMemoryMap", menuName = "UnityQemu/Guest Process Memory Map")]
 public class GuestProcessMemoryMap : ScriptableObject
@@ -25,6 +25,36 @@ public class GuestProcessMemoryMap : ScriptableObject
     }
 
     public List<Range> ranges = new List<Range>();
+
+    /// <summary>
+    /// BizHawk ram-watch style saved address.
+    /// </summary>
+    [Serializable]
+    public struct Watch
+    {
+        [Tooltip("Guest physical address")]
+        public long address;
+        [Tooltip("Value size in bytes (1 / 2 / 4)")]
+        public int byteCount;
+        public string note;
+    }
+
+    public List<Watch> watches = new List<Watch>();
+
+    /// <summary>
+    /// Adds a watch unless one with the same address and size already exists.
+    /// Returns false if it was a duplicate.
+    /// </summary>
+    public bool AddWatch(long address, int byteCount, string note = "")
+    {
+        for (int i = 0; i < watches.Count; i++)
+        {
+            if (watches[i].address == address && watches[i].byteCount == byteCount)
+                return false;
+        }
+        watches.Add(new Watch { address = address, byteCount = byteCount, note = note });
+        return true;
+    }
 
     public long TotalBytes
     {

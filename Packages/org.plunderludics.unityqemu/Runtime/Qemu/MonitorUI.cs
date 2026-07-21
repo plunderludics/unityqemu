@@ -2,18 +2,21 @@ using System;
 using System.Threading.Tasks;
 using TriInspector;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace UnityQemu {
 /// <summary>
 /// Inspector UI for sending HMP monitor commands over QMP (no native QEMU GUI needed).
 /// </summary>
-public class QemuMonitorUI : MonoBehaviour
+[ExecuteAlways]
+public class MonitorUI : MonoBehaviour
 {
-    public QemuEmulator qemu;
+    [FormerlySerializedAs("qemu")]
+    public VirtualMachine virtualMachine;
 
 #if UNITY_EDITOR
     [ShowInInspector, ReadOnly]
-    bool QmpReady => qemu != null && qemu.QmpConnected;
+    bool QmpReady => virtualMachine != null && virtualMachine.QmpConnected;
 
     [Tooltip("HMP command to run (e.g. info mice, mouse_set 3)")]
     public string command = "info mice";
@@ -24,8 +27,8 @@ public class QemuMonitorUI : MonoBehaviour
 
     void OnEnable()
     {
-        if (qemu == null)
-            qemu = GetComponent<QemuEmulator>();
+        if (virtualMachine == null)
+            virtualMachine = GetComponent<VirtualMachine>();
     }
 
     [Button("Run")]
@@ -50,9 +53,9 @@ public class QemuMonitorUI : MonoBehaviour
 
     public async Task<string> RunAsync(string commandLine)
     {
-        if (qemu == null)
+        if (virtualMachine == null)
         {
-            lastOutput = "No QemuEmulator assigned";
+            lastOutput = "No VirtualMachine assigned";
             Debug.LogWarning(lastOutput);
             return lastOutput;
         }
@@ -65,7 +68,7 @@ public class QemuMonitorUI : MonoBehaviour
 
         try
         {
-            string result = await qemu.RunHumanMonitorCommandAsync(commandLine.Trim());
+            string result = await virtualMachine.RunHumanMonitorCommandAsync(commandLine.Trim());
             lastOutput = string.IsNullOrWhiteSpace(result) ? "(ok, empty reply)" : result.TrimEnd();
             Debug.Log($"HMP `{commandLine.Trim()}`:\n{lastOutput}");
             return lastOutput;

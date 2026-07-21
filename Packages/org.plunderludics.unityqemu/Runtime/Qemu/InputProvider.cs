@@ -4,7 +4,7 @@ using UnityEngine;
 namespace UnityQemu {
 
 /// <summary>
-/// Base class for supplying keyboard and pointer input to a <see cref="QemuEmulator"/>.
+/// Base class for supplying keyboard and pointer input to a <see cref="VirtualMachine"/>.
 /// Subclasses implement <see cref="PollInput"/> and enqueue events with the public input API.
 /// </summary>
 public abstract class InputProvider : MonoBehaviour
@@ -13,15 +13,15 @@ public abstract class InputProvider : MonoBehaviour
     MouseInputEvent _mouseEvent;
     bool _hasMouseEvent;
 
-    protected QemuEmulator Emulator { get; private set; }
+    protected VirtualMachine Machine { get; private set; }
 
     /// <summary>
-    /// Called once per emulator frame before queued input is sent.
+    /// Called once per frame before queued input is sent.
     /// Override this to poll a custom input source and call AddKeyEvent or SetMouseState.
     /// </summary>
     protected abstract void PollInput();
 
-    /// <summary>Queue a Unity key press or release for the next emulator input update.</summary>
+    /// <summary>Queue a Unity key press or release for the next input update.</summary>
     public void AddKeyEvent(KeyCode key, bool down)
     {
         _keyEvents.Add(new KeyInputEvent(key, down));
@@ -63,26 +63,26 @@ public abstract class InputProvider : MonoBehaviour
         _hasMouseEvent = true;
     }
 
-    internal void ProcessInput(QemuEmulator emulator)
+    internal void ProcessInput(VirtualMachine machine)
     {
-        if (!isActiveAndEnabled || emulator.Texture == null)
+        if (!isActiveAndEnabled || machine.Texture == null)
             return;
 
-        Emulator = emulator;
+        Machine = machine;
         PollInput();
 
         foreach (var keyEvent in _keyEvents)
         {
             if (keyEvent.isRawKeysym)
-                emulator.SendKeyEvent(keyEvent.keysym, keyEvent.down);
+                machine.SendKeyEvent(keyEvent.keysym, keyEvent.down);
             else
-                emulator.SendKeyEvent(keyEvent.key, keyEvent.down);
+                machine.SendKeyEvent(keyEvent.key, keyEvent.down);
         }
         _keyEvents.Clear();
 
         if (_hasMouseEvent)
         {
-            emulator.SendMouseEvent(
+            machine.SendMouseEvent(
                 _mouseEvent.x,
                 _mouseEvent.y,
                 _mouseEvent.leftButton,

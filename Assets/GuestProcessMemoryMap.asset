@@ -11,7 +11,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 53ef53cc4072af4418fec603deaffce0, type: 3}
   m_Name: GuestProcessMemoryMap
-  m_EditorClassIdentifier: Assembly-CSharp::UnityQemu.GuestProcessMemoryMap
+  m_EditorClassIdentifier: UnityQemu::UnityQemu.GuestProcessMemoryMap
   processName: winmine.exe
   pid: 212
   directoryTableBase: 240234496

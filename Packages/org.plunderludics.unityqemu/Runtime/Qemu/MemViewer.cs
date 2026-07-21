@@ -1,15 +1,17 @@
 using UnityEngine;
-using UnityQemu;
+using UnityEngine.Serialization;
 using System.Text;
 using TriInspector;
 
 namespace UnityQemu {
 /// <summary>
-/// Simple inspector hex dump of guest memory via QemuEmulator's gdbstub API.
+/// Simple inspector hex dump of guest memory via VirtualMachine's gdbstub API.
 /// </summary>
-public class QemuMemViewer : MonoBehaviour
+[ExecuteAlways]
+public class MemViewer : MonoBehaviour
 {
-    public QemuEmulator qemu;
+    [FormerlySerializedAs("qemu")]
+    public VirtualMachine virtualMachine;
     public long startAddress = 0x0;
     public int length = 256;
     public int bytesPerRow = 16;
@@ -24,15 +26,21 @@ public class QemuMemViewer : MonoBehaviour
 
     float _nextRefresh;
 
+    void OnEnable()
+    {
+        if (virtualMachine == null)
+            virtualMachine = GetComponent<VirtualMachine>();
+    }
+
     void Update()
     {
-        if (qemu == null)
+        if (virtualMachine == null)
         {
-            status = "No QemuEmulator assigned";
+            status = "No VirtualMachine assigned";
             return;
         }
 
-        if (!qemu.GdbConnected)
+        if (!virtualMachine.GdbConnected)
         {
             status = "GDB not connected";
             return;
@@ -46,7 +54,7 @@ public class QemuMemViewer : MonoBehaviour
 
         try
         {
-            byte[] bytes = qemu.ReadBytes(startAddress, length);
+            byte[] bytes = virtualMachine.ReadBytes(startAddress, length);
             var sb = new StringBuilder(length * 3 + length / Mathf.Max(1, bytesPerRow));
             for (int i = 0; i < bytes.Length; i++)
             {
@@ -70,12 +78,12 @@ public class QemuMemViewer : MonoBehaviour
     [Button("Write test byte 0xAB at startAddress")]
     public void WriteTestByte()
     {
-        if (qemu == null || !qemu.GdbConnected)
+        if (virtualMachine == null || !virtualMachine.GdbConnected)
         {
             Debug.LogWarning("GDB not connected");
             return;
         }
-        qemu.WriteUnsigned(startAddress, 0xAB, 1, false);
+        virtualMachine.WriteUnsigned(startAddress, 0xAB, 1, false);
         _nextRefresh = 0f;
         Debug.Log($"Wrote 0xAB to 0x{startAddress:X}");
     }

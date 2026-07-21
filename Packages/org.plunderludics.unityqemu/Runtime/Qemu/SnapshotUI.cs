@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using TriInspector;
 using UnityEngine;
+using UnityEngine.Serialization;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -12,16 +13,18 @@ namespace UnityQemu {
 /// <summary>
 /// Inspector UI for QEMU internal snapshots (HMP savevm / loadvm / delvm).
 /// </summary>
-public class QemuSnapshotUI : MonoBehaviour
+[ExecuteAlways]
+public class SnapshotUI : MonoBehaviour
 {
-    public QemuEmulator qemu;
+    [FormerlySerializedAs("qemu")]
+    public VirtualMachine virtualMachine;
 
     [Tooltip("Refresh the snapshot list when the QEMU emulator finishes starting")]
     public bool refreshOnReady = true;
 
 #if UNITY_EDITOR
     [ShowInInspector, ReadOnly]
-    bool QmpReady => qemu != null && qemu.QmpConnected;
+    bool QmpReady => virtualMachine != null && virtualMachine.QmpConnected;
 
     [ListDrawerSettings(
         Draggable = false,
@@ -32,39 +35,39 @@ public class QemuSnapshotUI : MonoBehaviour
     [SerializeField]
     List<SnapshotEntry> snapshots = new List<SnapshotEntry>();
 
-    QemuEmulator _boundQemu;
+    VirtualMachine _boundMachine;
 
     void OnEnable()
     {
-        if (qemu == null)
-            qemu = GetComponent<QemuEmulator>();
-        BindQemu(qemu);
+        if (virtualMachine == null)
+            virtualMachine = GetComponent<VirtualMachine>();
+        BindMachine(virtualMachine);
 
-        if (refreshOnReady && qemu != null && qemu.QmpConnected)
+        if (refreshOnReady && virtualMachine != null && virtualMachine.QmpConnected)
             _ = RefreshSnapshotsAsync();
     }
 
     void OnDisable()
     {
-        BindQemu(null);
+        BindMachine(null);
     }
 
     void OnValidate()
     {
-        if (!Application.isPlaying && qemu != _boundQemu)
-            BindQemu(qemu);
+        if (!Application.isPlaying && virtualMachine != _boundMachine)
+            BindMachine(virtualMachine);
     }
 
-    void BindQemu(QemuEmulator next)
+    void BindMachine(VirtualMachine next)
     {
-        if (_boundQemu != null)
-            _boundQemu.OnReady -= HandleQemuReady;
-        _boundQemu = next;
-        if (_boundQemu != null)
-            _boundQemu.OnReady += HandleQemuReady;
+        if (_boundMachine != null)
+            _boundMachine.OnReady -= HandleMachineReady;
+        _boundMachine = next;
+        if (_boundMachine != null)
+            _boundMachine.OnReady += HandleMachineReady;
     }
 
-    void HandleQemuReady()
+    void HandleMachineReady()
     {
         if (!refreshOnReady)
             return;
@@ -80,7 +83,7 @@ public class QemuSnapshotUI : MonoBehaviour
     [Button("Save New Snapshot")]
     public async void SaveNewSnapshotButton()
     {
-        if (qemu == null || !qemu.QmpConnected)
+        if (virtualMachine == null || !virtualMachine.QmpConnected)
         {
             Debug.LogWarning("QMP not connected");
             return;
@@ -103,7 +106,7 @@ public class QemuSnapshotUI : MonoBehaviour
     /// <summary>Pause, savevm (overwrites if tag exists), resume, refresh list.</summary>
     async Task SaveTagWithPauseAsync(string tag)
     {
-        if (qemu == null || !qemu.QmpConnected)
+        if (virtualMachine == null || !virtualMachine.QmpConnected)
         {
             Debug.LogWarning("QMP not connected");
             return;
@@ -112,7 +115,7 @@ public class QemuSnapshotUI : MonoBehaviour
         bool paused = false;
         try
         {
-            await qemu.PauseAsync();
+            await virtualMachine.PauseAsync();
             paused = true;
             await SaveVmAsync(tag);
             await RefreshSnapshotsAsync();
@@ -125,7 +128,7 @@ public class QemuSnapshotUI : MonoBehaviour
         {
             if (paused)
             {
-                try { await qemu.ResumeAsync(); }
+                try { await virtualMachine.ResumeAsync(); }
                 catch (Exception e) { Debug.LogError($"Failed to resume after savevm: {e.Message}"); }
             }
         }
@@ -191,9 +194,9 @@ public class QemuSnapshotUI : MonoBehaviour
 
     async Task<string> RunHmpAsync(string command)
     {
-        if (qemu == null)
-            throw new InvalidOperationException("No QemuEmulator assigned");
-        return await qemu.RunHumanMonitorCommandAsync(command);
+        if (virtualMachine == null)
+            throw new InvalidOperationException("No VirtualMachine assigned");
+        return await virtualMachine.RunHumanMonitorCommandAsync(command);
     }
 
     static List<string> ParseSnapshotNames(string infoSnapshotsOutput)
@@ -237,7 +240,7 @@ public class QemuSnapshotUI : MonoBehaviour
         [HideLabel, DisplayAsString]
         public string name;
 
-        [NonSerialized] public QemuSnapshotUI owner;
+        [NonSerialized] public SnapshotUI owner;
 
         [Group("actions")]
         [Button("Load")]
@@ -297,6 +300,26 @@ public class QemuSnapshotUI : MonoBehaviour
 
         void OnGUI()
         {
+            // Capture Return/Escape before the TextField draws — a single-line IMGUI
+            // TextField consumes the Enter KeyDown while focused, so checking after it
+            // (as the buttons do) would never see it.
+            bool submit = false;
+            bool cancel = false;
+            Event e = Event.current;
+            if (e.type == EventType.KeyDown)
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
+                {
+                    submit = true;
+                    e.Use();
+                }
+                else if (e.keyCode == KeyCode.Escape)
+                {
+                    cancel = true;
+                    e.Use();
+                }
+            }
+
             EditorGUILayout.Space(8);
             EditorGUILayout.LabelField("Snapshot name");
             GUI.SetNextControlName("SnapshotNameField");
@@ -310,26 +333,23 @@ public class QemuSnapshotUI : MonoBehaviour
             EditorGUILayout.Space(4);
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Cancel") ||
-                    (Event.current.type == EventType.KeyDown && Event.current.keyCode == KeyCode.Escape))
-                {
-                    _accepted = false;
-                    Close();
-                    return;
-                }
-
+                cancel |= GUILayout.Button("Cancel");
                 GUILayout.FlexibleSpace();
+                submit |= GUILayout.Button("Save");
+            }
 
-                bool submit = GUILayout.Button("Save") ||
-                    (Event.current.type == EventType.KeyDown &&
-                     (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter));
-                if (submit)
-                {
-                    if (string.IsNullOrWhiteSpace(_value))
-                        return;
-                    _accepted = true;
-                    Close();
-                }
+            if (cancel)
+            {
+                _accepted = false;
+                Close();
+                return;
+            }
+
+            // Evaluate submit after the field draws so _value reflects the latest text.
+            if (submit && !string.IsNullOrWhiteSpace(_value))
+            {
+                _accepted = true;
+                Close();
             }
         }
     }

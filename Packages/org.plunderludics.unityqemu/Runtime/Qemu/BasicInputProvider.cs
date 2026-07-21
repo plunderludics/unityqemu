@@ -12,7 +12,7 @@ public class BasicInputProvider : InputProvider
 
     protected override void PollInput()
     {
-        if (Emulator == null || Emulator.Texture == null)
+        if (Machine == null || Machine.Texture == null)
             return;
 
         if (passMouseInput)
@@ -24,8 +24,8 @@ public class BasicInputProvider : InputProvider
 
     void PollMouse()
     {
-        int width = Emulator.Width;
-        int height = Emulator.Height;
+        int width = Machine.Width;
+        int height = Machine.Height;
         if (width <= 0 || height <= 0 || Screen.width <= 0 || Screen.height <= 0)
             return;
 
@@ -71,7 +71,7 @@ public class BasicInputProvider : InputProvider
             if (IsUsShiftedDigitChar(character))
                 continue;
 
-            int keysym = QemuEmulator.CharToVncKeysym(character);
+            int keysym = VirtualMachine.CharToVncKeysym(character);
             if (keysym == 0)
                 continue;
 

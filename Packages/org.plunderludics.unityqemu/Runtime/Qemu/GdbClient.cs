@@ -8,7 +8,7 @@ namespace UnityQemu {
 /// Minimal GDB remote serial protocol client for QEMU's gdbstub.
 /// Supports guest memory read/write (virtual or physical).
 /// </summary>
-public class QemuGdbClient : IDisposable
+public class GdbClient : IDisposable
 {
     readonly object _lock = new object();
     TcpClient _tcpClient;

@@ -16,12 +16,12 @@ using TriInspector;
 
 namespace UnityQemu {
 [ExecuteAlways]
-public class QemuEmulator : MonoBehaviour
+public class VirtualMachine : MonoBehaviour
 {
     Process _qemuProcess;
-    QemuVncClient _vncClient;
-    QemuQmpClient _qmpClient;
-    QemuGdbClient _gdbClient;
+    VncClient _vncClient;
+    QmpClient _qmpClient;
+    GdbClient _gdbClient;
     bool _starting;
     
     [ShowInInspector] bool VncConnected => _vncClient != null && _vncClient.IsConnected;
@@ -45,7 +45,7 @@ public class QemuEmulator : MonoBehaviour
     [Tooltip("Run QEMU and stream the VNC texture while the editor is not in Play mode")]
     public bool runInEditMode = false;
 
-    [Tooltip("Hard disk image path (project-relative, e.g. Assets/Qemu/qemu~/winXP/o1.qcow2)")]
+    [Tooltip("Hard disk image path (project-relative, e.g. Assets/qemu~/winXP/o1.qcow2)")]
     public string diskImagePath = "";
 
     [Tooltip("CD-ROM images — drag .iso assets here (each becomes -drive media=cdrom).")]
@@ -493,7 +493,7 @@ public class QemuEmulator : MonoBehaviour
 
     Task ConnectVncAsync()
     {
-        _vncClient = new QemuVncClient();
+        _vncClient = new VncClient();
         if (outputTexture == null)
         {
             outputTexture = new RenderTexture(640, 480, 0);
@@ -502,7 +502,7 @@ public class QemuEmulator : MonoBehaviour
         return ConnectVncCoreAsync(_vncClient, vncPort - 5900);
     }
 
-    static async Task ConnectVncCoreAsync(QemuVncClient client, int display)
+    static async Task ConnectVncCoreAsync(VncClient client, int display)
     {
         try
         {
@@ -517,11 +517,11 @@ public class QemuEmulator : MonoBehaviour
 
     Task ConnectQmpAsync()
     {
-        _qmpClient = new QemuQmpClient { Verbose = verboseQmp };
+        _qmpClient = new QmpClient { Verbose = verboseQmp };
         return ConnectQmpCoreAsync(_qmpClient, qmpPort, verboseQmp);
     }
 
-    static async Task ConnectQmpCoreAsync(QemuQmpClient client, int port, bool verbose)
+    static async Task ConnectQmpCoreAsync(QmpClient client, int port, bool verbose)
     {
         try
         {
@@ -718,7 +718,7 @@ public class QemuEmulator : MonoBehaviour
         try
         {
             _gdbClient?.Dispose();
-            _gdbClient = new QemuGdbClient { Verbose = verboseGdb };
+            _gdbClient = new GdbClient { Verbose = verboseGdb };
             _gdbClient.Connect("127.0.0.1", gdbPort, gdbPhysicalMemory);
         }
         catch (Exception e)
@@ -817,9 +817,9 @@ public class QemuEmulator : MonoBehaviour
     /// <summary>Scoped GDB pause for batched memory reads/writes.</summary>
     public readonly struct GdbMemorySession : IDisposable
     {
-        readonly QemuGdbClient _client;
+        readonly GdbClient _client;
 
-        internal GdbMemorySession(QemuGdbClient client)
+        internal GdbMemorySession(GdbClient client)
         {
             _client = client ?? throw new InvalidOperationException("GDB client not connected");
             _client.BeginMemorySession();

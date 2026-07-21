@@ -41,3 +41,6 @@
 # loadvm mysavestate
 
 # Leaning towards migrate for convenient general use but savevm/loadvm seems like the only way to get fast loadstate at runtmie 
+
+
+# For ms office 2000: https://archive.org/details/en_office2000_standard
