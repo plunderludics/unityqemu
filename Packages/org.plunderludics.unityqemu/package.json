@@ -1,0 +1,31 @@
+{
+  "name": "org.plunderludics.unityqemu",
+  "version": "0.1.0",
+  "displayName": "UnityQemu",
+  "description": "Run QEMU guests inside Unity (VNC display, QMP, GDB).",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.0.2",
+    "com.codewriter.triinspector": "1.15.1"
+  },
+  "documentationUrl": "https://github.com/plunderludics/unity-qemu",
+  "keywords": [
+    "plunderludics",
+    "qemu",
+    "emulation",
+    "virtualization"
+  ],
+  "author": {
+    "name": "plunderludics working group",
+    "url": "https://plunderludics.github.io"
+  },
+  "scopedRegistries": [
+    {
+      "name": "package.openupm.com",
+      "url": "https://package.openupm.com",
+      "scopes": [
+        "com.codewriter.triinspector",
+        "com.openupm"
+      ]
+    }
+  ]
+}

@@ -1,37 +1,13 @@
 # Ignore docs html files and generated metadata
-# (These files are not ignored on the docs branch, which is where github-pages points to)
 /docs/
 /docfx/api
 
-# Ignore bizhawk logs
-/BizHawkLogs/
-/Assets/StreamingAssets/Firmware/
-**/BizHawk~/Lua/
-**/BizHawk~/N64/
-**/BizHawk~/NES/
-**/BizHawk~/SNES/
-**/BizHawk~/PSX/
-**/BizHawk~/GBA/
-**/BizHawk~/C64/
-**/BizHawk~/Gameboy/
-**/BizHawk~/Genesis/
-**/BizHawk~/Shaders/
-**/BizHawk~/Tools/
-**/BizHawk~/overlay/
-**/BizHawk~/DiscoHawk*
-**/BizHawk~/defctrl.json
-**/BizHawk~/EmuHawkMono.sh
-**/BizHawk~/FormBase.cs
-**/BizHawk~/OpenTK.dll.config
-**/BizHawk~/**/*.SaveRAM
-**/BizHawk~/**/*.SaveRAM.bak
+# Ignore qemu assets and testing stuff
+/Packages/org.plunderludics.unityqemu/qemu~/
+/Assets/Qemu/
 
-
-# Ignore Assets/Samples/ (actual Samples are in Packages/org.plunderludics.UnityHawk/Samples~/)
-/Assets/Samples/
-
-# Ignore the dlls - these should be copied from BizHawk/output/dlls
-/Assets/Plugins/
+b.sh
+UnityAgentBridge/
 
 # Ignore any artifacts
 /[Aa]rtifacts/

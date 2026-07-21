@@ -1,1 +1,0 @@
-rm -rf api; rm -rf ../docs; docfx docfx.json --serve
