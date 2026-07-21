@@ -37,8 +37,10 @@ public class QemuEmulator : MonoBehaviour
     [Tooltip("Log GDB attach/interrupt/packet chatter")]
     public bool verboseGdb = false;
     public bool showGui = false;
-    public bool passKeyboardInputFromUnity = true;
-    public bool passMouseInputFromUnity = true;
+
+    [Header("Input")]
+    [Tooltip("If null, uses an attached InputProvider or adds a BasicInputProvider in Play mode.")]
+    public InputProvider inputProvider;
 
     [Tooltip("Run QEMU and stream the VNC texture while the editor is not in Play mode")]
     public bool runInEditMode = false;
@@ -412,7 +414,18 @@ public class QemuEmulator : MonoBehaviour
         // Play mode entry — OnEnable may have skipped during the transition.
         Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
         Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
+        EnsureInputProvider();
         TryAutoStart();
+    }
+
+    void EnsureInputProvider()
+    {
+        if (!Application.isPlaying || inputProvider != null)
+            return;
+
+        inputProvider = GetComponent<InputProvider>();
+        if (inputProvider == null)
+            inputProvider = gameObject.AddComponent<BasicInputProvider>();
     }
 
     void Update() {
@@ -438,83 +451,7 @@ public class QemuEmulator : MonoBehaviour
 
         // Unity Input is unreliable outside play mode.
         if (Application.isPlaying)
-            HandleInput();
-    }
-
-    // TODO move into some kind of BasicInputProvider type of class
-    void HandleInput()
-    {
-        if (!passKeyboardInputFromUnity && !passMouseInputFromUnity)
-            return;
-
-        if (_vncClient == null || _vncClient.Texture == null)
-            return;
-
-        if (passMouseInputFromUnity) {
-            var texture = _vncClient.Texture;
-            int vncWidth = texture.width;
-            int vncHeight = texture.height;
-
-            // Mouse input
-            Vector3 mousePos = Input.mousePosition;
-            
-            // Convert Unity screen coordinates to VNC coordinates
-            // Assuming the texture is displayed in a UI element or render texture
-            // For now, map directly from screen space to VNC space
-            // You may need to adjust this based on how you're displaying the texture
-
-
-            int vncX = Mathf.Clamp((int)(mousePos.x * vncWidth / Screen.width), 0, vncWidth - 1);
-            int vncY = Mathf.Clamp((int)(mousePos.y * vncHeight / Screen.height), 0, vncHeight - 1);
-            
-            // Flip Y coordinate (Unity has origin at bottom-left, VNC at top-left)
-            vncY = vncHeight - 1 - vncY;
-
-            bool leftButton = Input.GetMouseButton(0);
-            bool middleButton = Input.GetMouseButton(2);
-            bool rightButton = Input.GetMouseButton(1);
-            
-            SendMouseEvent(vncX, vncY, leftButton, middleButton, rightButton);
-        }
-
-        if (passKeyboardInputFromUnity) {
-            foreach (KeyCode key in SpecialKeyCodes)
-            {
-                if (Input.GetKeyDown(key))
-                    SendKeyEvent(key, true);
-                if (Input.GetKeyUp(key))
-                    SendKeyEvent(key, false);
-            }
-
-            // Letters/digits/space via KeyCode (hold + Ctrl/Alt chords).
-            foreach (KeyCode key in LetterDigitSpaceKeyCodes)
-            {
-                if (Input.GetKeyDown(key))
-                    SendKeyEvent(key, true);
-                if (Input.GetKeyUp(key))
-                    SendKeyEvent(key, false);
-            }
-
-            // Punctuation via inputString (layout-accurate). KeyCode.Slash is unreliable on
-            // some OEM layouts; ASCII '/' here is the correct VNC keysym (0x2F).
-            foreach (char c in Input.inputString)
-            {
-                if (c <= 0x1f || c == 0x7f)
-                    continue; // control chars; Enter/Backspace/Tab handled above
-                if (c == ' ' || char.IsLetterOrDigit(c))
-                    continue; // KeyCode path
-                // Shift+digit already sent as digit keysym + Shift; skip the shifted glyph.
-                if (IsUsShiftedDigitChar(c))
-                    continue;
-                int keysym = CharToVncKeysym(c);
-                if (keysym == 0)
-                    continue;
-                if (_vncClient == null || _vncClient.Texture == null)
-                    continue;
-                _vncClient.SendKeyEvent(keysym, true);
-                _vncClient.SendKeyEvent(keysym, false);
-            }
-        }
+            inputProvider?.ProcessInput(this);
     }
 
     // x and y are pixel coordinates from top-left, in actual display resolution (or does the VNC framebuffer have different resolution?)
@@ -534,6 +471,12 @@ public class QemuEmulator : MonoBehaviour
                 UnityEngine.Debug.LogWarning($"Unknown key: {key}");
             return;
         }
+
+        SendKeyEvent(keysym, down);
+    }
+
+    /// <summary>Send a raw VNC/X11 keysym.</summary>
+    public void SendKeyEvent(int keysym, bool down) {
         if (_vncClient == null || _vncClient.Texture == null) {
             UnityEngine.Debug.LogWarning("VNC client not connected");
             return;
@@ -541,42 +484,6 @@ public class QemuEmulator : MonoBehaviour
 
         _vncClient.SendKeyEvent(keysym, down);
     }
-
-    // Keys that are not reliably represented by Input.inputString (or need hold semantics).
-    static readonly KeyCode[] SpecialKeyCodes =
-    {
-        KeyCode.LeftShift, KeyCode.RightShift,
-        KeyCode.LeftControl, KeyCode.RightControl,
-        KeyCode.LeftAlt, KeyCode.RightAlt,
-        KeyCode.LeftCommand, KeyCode.RightCommand,
-        KeyCode.CapsLock, KeyCode.Numlock,
-        KeyCode.Escape, KeyCode.Backspace, KeyCode.Delete,
-        KeyCode.Return, KeyCode.KeypadEnter, KeyCode.Tab,
-        KeyCode.UpArrow, KeyCode.DownArrow, KeyCode.LeftArrow, KeyCode.RightArrow,
-        KeyCode.Insert, KeyCode.Home, KeyCode.End, KeyCode.PageUp, KeyCode.PageDown,
-        KeyCode.F1, KeyCode.F2, KeyCode.F3, KeyCode.F4, KeyCode.F5, KeyCode.F6,
-        KeyCode.F7, KeyCode.F8, KeyCode.F9, KeyCode.F10, KeyCode.F11, KeyCode.F12,
-        KeyCode.Print, KeyCode.ScrollLock, KeyCode.Pause,
-        KeyCode.Keypad0, KeyCode.Keypad1, KeyCode.Keypad2, KeyCode.Keypad3, KeyCode.Keypad4,
-        KeyCode.Keypad5, KeyCode.Keypad6, KeyCode.Keypad7, KeyCode.Keypad8, KeyCode.Keypad9,
-        KeyCode.KeypadPeriod, KeyCode.KeypadDivide, KeyCode.KeypadMinus, KeyCode.KeypadPlus,
-        KeyCode.KeypadMultiply,
-    };
-
-    // Letters / digits / space — KeyCode down/up for hold + modifier chords.
-    static readonly KeyCode[] LetterDigitSpaceKeyCodes =
-    {
-        KeyCode.A, KeyCode.B, KeyCode.C, KeyCode.D, KeyCode.E, KeyCode.F, KeyCode.G, KeyCode.H,
-        KeyCode.I, KeyCode.J, KeyCode.K, KeyCode.L, KeyCode.M, KeyCode.N, KeyCode.O, KeyCode.P,
-        KeyCode.Q, KeyCode.R, KeyCode.S, KeyCode.T, KeyCode.U, KeyCode.V, KeyCode.W, KeyCode.X,
-        KeyCode.Y, KeyCode.Z,
-        KeyCode.Alpha0, KeyCode.Alpha1, KeyCode.Alpha2, KeyCode.Alpha3, KeyCode.Alpha4,
-        KeyCode.Alpha5, KeyCode.Alpha6, KeyCode.Alpha7, KeyCode.Alpha8, KeyCode.Alpha9,
-        KeyCode.Space,
-    };
-
-    static bool IsUsShiftedDigitChar(char c) =>
-        "!@#$%^&*()".IndexOf(c) >= 0;
 
     void OnDestroy()
     {
@@ -938,7 +845,7 @@ public class QemuEmulator : MonoBehaviour
     /// Convert a printable character to a VNC/X11 keysym.
     /// Latin-1 chars map 1:1; common Unicode punctuation gets a Latin-1 stand-in where possible.
     /// </summary>
-    static int CharToVncKeysym(char c)
+    public static int CharToVncKeysym(char c)
     {
         if (c >= 0x20 && c <= 0xff)
             return c;
