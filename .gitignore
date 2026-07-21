@@ -3,6 +3,14 @@
 /docs/
 /docfx/api
 
+# Ignore qemu assets and testing stuff
+/Packages/org.plunderludics.unityqemu/qemu~/
+/Assets/Qemu/
+
+b.sh
+UnityAgentBridge/
+
+
 # Ignore bizhawk logs
 /BizHawkLogs/
 /Assets/StreamingAssets/Firmware/

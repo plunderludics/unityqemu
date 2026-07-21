@@ -10,7 +10,7 @@ using UnityEngine;
 /// QEMU Machine Protocol (QMP) client for sending commands to QEMU.
 /// Handles connection, handshake, and command execution.
 /// </summary>
-namespace UnityHawk.QEMU {
+namespace UnityQemu {
 public class QemuQmpClient : IDisposable
 {
     private TcpClient _tcpClient;
@@ -20,6 +20,9 @@ public class QemuQmpClient : IDisposable
     private bool _isConnected = false;
     private bool _capabilitiesNegotiated = false;
     private int _commandIdCounter = 1;
+
+    /// <summary>Log connect/handshake/command traffic to the console.</summary>
+    public bool Verbose { get; set; }
 
     /// <summary>
     /// Whether the client is connected to QEMU's QMP socket.
@@ -33,12 +36,10 @@ public class QemuQmpClient : IDisposable
     /// <param name="port">QMP port number</param>
     public async Task ConnectAsync(string host, int port)
     {
-        Debug.Log($"Connecting to QMP socket on {host}:{port}");
+        LogVerbose($"Connecting to QMP socket on {host}:{port}");
         try
         {
-            Debug.Log($"Creating TCP client");
             _tcpClient = new TcpClient();
-            Debug.Log($"Connecting to Tcp client on {host}:{port}");
             await _tcpClient.ConnectAsync(host, port);
             _stream = _tcpClient.GetStream();
             _reader = new StreamReader(_stream, Encoding.UTF8);
@@ -46,18 +47,14 @@ public class QemuQmpClient : IDisposable
             _isConnected = true;
 
             // QEMU sends a greeting message immediately upon connection
-            // We need to read it and then send qmp_capabilities
-            Debug.Log($"Reading QMP greeting");
             string greeting = await _reader.ReadLineAsync();
-            Debug.Log($"QMP greeting: {greeting}");
+            LogVerbose($"QMP greeting: {greeting}");
 
-            // Parse greeting to verify it's QMP
             if (!string.IsNullOrEmpty(greeting))
             {
                 JObject greetingObj = JObject.Parse(greeting);
                 if (greetingObj["QMP"] != null)
                 {
-                    // Send qmp_capabilities to complete handshake
                     await NegotiateCapabilitiesAsync();
                 }
                 else
@@ -74,9 +71,6 @@ public class QemuQmpClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// Negotiate QMP capabilities (required handshake step).
-    /// </summary>
     private async Task NegotiateCapabilitiesAsync()
     {
         var response = await ExecuteCommandAsync("qmp_capabilities");
@@ -84,7 +78,7 @@ public class QemuQmpClient : IDisposable
         if (response["return"] != null)
         {
             _capabilitiesNegotiated = true;
-            Debug.Log("QMP capabilities negotiated successfully");
+            LogVerbose("QMP capabilities negotiated successfully");
         }
         else if (response["error"] != null)
         {
@@ -95,9 +89,6 @@ public class QemuQmpClient : IDisposable
     /// <summary>
     /// Execute a QMP command and return the response.
     /// </summary>
-    /// <param name="command">QMP command name (e.g., "stop", "cont", "query-status")</param>
-    /// <param name="arguments">Optional command arguments as a JObject</param>
-    /// <returns>JSON response as JObject</returns>
     async Task<JObject> ExecuteCommandAsync(string command, JObject arguments)
     {
         if (!IsConnected)
@@ -112,7 +103,6 @@ public class QemuQmpClient : IDisposable
 
         int commandId = _commandIdCounter++;
         
-        // Build command JSON
         JObject commandObj = new JObject
         {
             ["execute"] = command,
@@ -125,48 +115,69 @@ public class QemuQmpClient : IDisposable
         }
 
         string commandJson = commandObj.ToString(Newtonsoft.Json.Formatting.None);
-        Debug.Log($"Sending QMP command: {commandJson}");
+        LogVerbose($"Sending QMP command: {commandJson}");
         await _writer.WriteLineAsync(commandJson);
-        Debug.Log($"QMP command sent: {commandJson}");
 
-        // Read response
-        string responseLine = await _reader.ReadLineAsync();
-        if (string.IsNullOrEmpty(responseLine))
+        // Skip async event messages until we get the matching command reply.
+        while (true)
         {
-            throw new Exception("Empty response from QMP");
+            string responseLine = await _reader.ReadLineAsync();
+            if (string.IsNullOrEmpty(responseLine))
+            {
+                throw new Exception("Empty response from QMP");
+            }
+
+            JObject response = JObject.Parse(responseLine);
+
+            if (response["event"] != null)
+            {
+                LogVerbose($"QMP event: {responseLine}");
+                continue;
+            }
+
+            LogVerbose($"QMP response: {responseLine}");
+
+            if (response["error"] != null)
+            {
+                JToken error = response["error"];
+                string errorClass = error["class"]?.ToString() ?? "Unknown";
+                string errorDesc = error["desc"]?.ToString() ?? "Unknown error";
+                throw new Exception($"QMP command failed: {errorClass} - {errorDesc}");
+            }
+
+            if (response["id"] != null && response["id"].Value<int>() != commandId)
+            {
+                LogVerbose($"QMP response ID mismatch: expected {commandId}, got {response["id"].Value<int>()}");
+                continue;
+            }
+
+            return response;
         }
+    }
 
-        Debug.Log($"QMP response: {responseLine}");
-
-        JObject response = JObject.Parse(responseLine);
-
-        // Check for error
-        if (response["error"] != null)
-        {
-            JToken error = response["error"];
-            string errorClass = error["class"]?.ToString() ?? "Unknown";
-            string errorDesc = error["desc"]?.ToString() ?? "Unknown error";
-            throw new Exception($"QMP command failed: {errorClass} - {errorDesc}");
-        }
-
-        // Verify command ID matches
-        if (response["id"] != null && response["id"].Value<int>() != commandId)
-        {
-            Debug.LogWarning($"QMP response ID mismatch: expected {commandId}, got {response["id"].Value<int>()}");
-        }
-
-        return response;
+    /// <summary>
+    /// Run a Human Monitor Protocol (HMP) command via QMP passthrough.
+    /// </summary>
+    public async Task<string> RunHumanMonitorCommandAsync(string commandLine)
+    {
+        var args = new JObject { ["command-line"] = commandLine };
+        JObject response = await ExecuteCommandAsync("human-monitor-command", args);
+        return response["return"]?.ToString() ?? "";
     }
 
     /// <summary>
     /// Execute a QMP command with arguments as a JSON string.
     /// </summary>
-    /// <param name="command">QMP command name</param>
-    /// <param name="argumentsJson">JSON string containing the arguments object, or null/empty for no arguments</param>
     public async Task<JObject> ExecuteCommandAsync(string command, string argumentsJson = null)
     {
         JObject arguments = string.IsNullOrEmpty(argumentsJson) ? null : JObject.Parse(argumentsJson);
         return await ExecuteCommandAsync(command, arguments);
+    }
+
+    void LogVerbose(string message)
+    {
+        if (Verbose)
+            Debug.Log(message);
     }
 
     public void Dispose()

@@ -1,13 +1,21 @@
 {
   "dependencies": {
-    "com.unity.ai.navigation": "1.1.5",
-    "com.unity.inputsystem": "1.14.0",
-    "com.unity.test-framework": "1.1.33",
-    "com.unity.postprocessing": "3.4.0",
+    "com.codewriter.triinspector": "1.15.1",
+    "com.gurngroup.unityagentbridge": "file:../../../agent-api-demo/Packages/com.gurngroup.unityagentbridge",
+    "com.singularitygroup.hotreload": "git+https://gitlab.hotreload.net/root/hot-reload-releases.git#1.13.11",
+    "com.unity.ai.navigation": "2.0.13",
+    "com.unity.inputsystem": "1.19.0",
+    "com.unity.multiplayer.center": "1.0.1",
+    "com.unity.postprocessing": "3.5.4",
+    "com.unity.test-framework": "1.6.0",
+    "com.unity.ugui": "2.0.0",
+    "com.unity.modules.accessibility": "1.0.0",
+    "com.unity.modules.adaptiveperformance": "1.0.0",
     "com.unity.modules.animation": "1.0.0",
     "com.unity.modules.audio": "1.0.0",
     "com.unity.modules.imgui": "1.0.0",
-    "com.codewriter.triinspector": "1.15.1"
+    "com.unity.modules.ui": "1.0.0",
+    "com.unity.modules.vectorgraphics": "1.0.0"
   },
   "scopedRegistries": [
     {

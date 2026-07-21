@@ -8,7 +8,7 @@ using System.Diagnostics;
 /// <summary>
 /// VNC client wrapper using RemoteViewing library for QEMU
 /// </summary>
-namespace UnityHawk.QEMU {
+namespace UnityQemu {
 public class QemuVncClient : IDisposable
 {
     private string _host;
@@ -205,7 +205,7 @@ public class QemuVncClient : IDisposable
 
     public void Dispose()
     {
-        UnityEngine.Debug.LogWarning("Disposing VNC client");
+        UnityEngine.Debug.Log("Disposing VNC client");
         _connected = false;
         
         if (_vncClient != null)
