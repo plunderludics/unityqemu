@@ -44,3 +44,7 @@
 
 
 # For ms office 2000: https://archive.org/details/en_office2000_standard
+
+# Internet connection (win xp)
+ -netdev user,id=net0
+-device rtl8139,netdev=net0

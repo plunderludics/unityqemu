@@ -11,7 +11,10 @@ Run QEMU guests inside Unity (VNC framebuffer, QMP control, GDB memory access).
 
 ## Usage
 
-Add a `VirtualMachine` component, set `diskImagePath` to a qcow2 under your project (prefer a `~`-suffixed folder so Unity does not import live disks), and press Play / enable edit-mode run.
+Add a `VirtualMachine` component and assign a `DiskAsset` to `diskAsset` for a
+fresh boot, or a `.uqsnap` (`SnapshotAsset`) to `bootSnapshot` to resume saved
+state. Setting a boot snapshot fills in (and locks) the disk field from the
+snapshot's backing disk. Then press Play or enable edit-mode run.
 
 ### Input
 

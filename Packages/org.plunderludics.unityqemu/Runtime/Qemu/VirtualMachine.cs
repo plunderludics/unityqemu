@@ -16,6 +16,7 @@ using TriInspector;
 
 namespace UnityQemu {
 [ExecuteAlways]
+[DeclareFoldoutGroup("Advanced", Expanded = false)]
 public class VirtualMachine : MonoBehaviour
 {
     Process _qemuProcess;
@@ -27,9 +28,9 @@ public class VirtualMachine : MonoBehaviour
     /// <summary>Active work overlay path when using <see cref="diskAsset"/> + ephemeral overlay.</summary>
     string _workOverlayPath;
 
-    /// <summary>If set, <c>loadvm</c> this tag after QMP connects (D2 durable snapshot restore).</summary>
+    /// <summary>If set, <c>loadvm</c> this tag after QMP connects (durable snapshot restore).</summary>
     string _pendingLoadVmTag;
-    
+
     [ShowInInspector] bool VncConnected => _vncClient != null && _vncClient.IsConnected;
     [ShowInInspector] bool VncInternalClientConnected => _vncClient != null && _vncClient.IsInternalClientConnected;
     [ShowInInspector] public bool GdbConnected => _gdbClient != null && _gdbClient.IsConnected;
@@ -51,18 +52,25 @@ public class VirtualMachine : MonoBehaviour
     [Tooltip("Run QEMU and stream the VNC texture while the editor is not in Play mode")]
     public bool runInEditMode = false;
 
-    [Tooltip("Hard disk image path (project-relative, e.g. Assets/qemu~/winXP/o1.qcow2). Ignored when diskAsset is set.")]
-    public string diskImagePath = "";
+    [Header("Disk")]
+    [Tooltip(
+        "Disk to boot from. When a Boot Snapshot is set, this shows that snapshot's backing disk " +
+        "and cannot be changed until the snapshot is cleared.")]
+    [DisableIf(nameof(HasBootSnapshot))]
+    [OnValueChanged(nameof(OnDiskAssetChanged))]
+    public DiskAsset diskAsset;
 
-    [Header("D2 disk / snapshots")]
-    [Tooltip("Immutable base disk asset. When set, QEMU boots an ephemeral work overlay under Library/UnityQemu/work/.")]
-    public QemuDiskAsset diskAsset;
+    [Tooltip(
+        "Optional .uqsnap to resume on start. Sets Disk to the snapshot's backing disk and locks it. " +
+        "Clear to boot the disk from a fresh work overlay instead.")]
+    [OnValueChanged(nameof(OnBootSnapshotChanged))]
+    public SnapshotAsset bootSnapshot;
 
-    [Tooltip("When using diskAsset, create/replace a work overlay so the base qcow2 is never written.")]
+    [Group("Advanced")]
+    [Tooltip(
+        "Keep the assigned disk immutable by writing into a Library/ work overlay. " +
+        "Leave on unless you intentionally want QEMU to write the Disk Asset file.")]
     public bool useEphemeralWorkOverlay = true;
-
-    [Tooltip("Optional durable snapshot to restore after boot (loadvm __unityqemu_state).")]
-    public QemuSnapshotAsset bootSnapshot;
 
     [Tooltip("CD-ROM images — drag .iso assets here (each becomes -drive media=cdrom).")]
     public UnityEngine.Object[] cdroms;
@@ -72,8 +80,6 @@ public class VirtualMachine : MonoBehaviour
         "Drag a folder → fat:floppy:rw (vvfat; ~1.44MB); " +
         "or drag a .img/.ima. Index 0 = A:, 1 = B:, …")]
     public UnityEngine.Object[] floppies;
-
-    public string saveStateName = "";
 
     [SerializeField] private int vncPort = 5900;
     [SerializeField] private int qmpPort = 4444;
@@ -91,59 +97,75 @@ public class VirtualMachine : MonoBehaviour
     "; // VNC display + disk/cd/floppy args get added automatically
     // TODO: move necessary+common args into separate fields
 
+    bool HasBootSnapshot => bootSnapshot != null;
+
+    void OnBootSnapshotChanged()
+    {
+        if (bootSnapshot != null && bootSnapshot.backingDisk != null)
+            diskAsset = bootSnapshot.backingDisk;
+    }
+
+    void OnDiskAssetChanged()
+    {
+        // Disk is editable only when no boot snapshot is set; keep that invariant if both change.
+        if (bootSnapshot != null && diskAsset != bootSnapshot.backingDisk)
+            bootSnapshot = null;
+    }
+
     bool ShouldRun => Application.isPlaying || runInEditMode;
     bool IsRunning => _qemuProcess != null && !_qemuProcess.HasExited;
 
-    /// <summary>Resolve a project-relative or absolute path for QEMU.</summary>
-    static string ResolveProjectPath(string path)
-    {
-        if (string.IsNullOrEmpty(path))
-            return null;
-        if (Path.IsPathRooted(path))
-            return path;
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "..", path));
-    }
-
     string ResolveDiskImagePath()
     {
-        if (diskAsset != null && useEphemeralWorkOverlay)
+        // Boot snapshot wins when set; Disk Asset is kept in sync for inspector display.
+        if (bootSnapshot != null)
+            return EnsureWorkOverlayForBoot();
+
+        if (diskAsset == null)
+            return null;
+
+        DiskOverlay.EnsureBackingChain(diskAsset);
+        if (useEphemeralWorkOverlay)
         {
             string work = EnsureWorkOverlayForBoot();
             if (!string.IsNullOrEmpty(work))
                 return work;
         }
 
-        if (diskAsset != null)
-        {
-            string basePath = diskAsset.GetQcow2FilesystemPath();
-            if (!string.IsNullOrEmpty(basePath))
-                return basePath;
-        }
-
-        return ResolveProjectPath(diskImagePath);
+        return diskAsset.GetQcow2FilesystemPath();
     }
 
-    /// <summary>Current -hda path (work overlay or legacy diskImagePath).</summary>
+    /// <summary>Current -hda path (work overlay or configured disk).</summary>
     public string ActiveDiskPath =>
         !string.IsNullOrEmpty(_workOverlayPath) ? _workOverlayPath : ResolveDiskImagePath();
 
     public string WorkOverlayPath => _workOverlayPath;
 
-    public QemuDiskAsset ActiveDiskAsset => diskAsset;
+    /// <summary>The disk directly below the active work image (base disk or snapshot backing).</summary>
+    public DiskAsset ActiveDiskAsset =>
+        bootSnapshot != null ? bootSnapshot.backingDisk : diskAsset;
 
     /// <summary>
-    /// Ensure a work overlay exists for <see cref="diskAsset"/>. Used at boot and by durable snapshot save/load.
+    /// Ensure a work overlay exists for the configured disk or snapshot.
     /// </summary>
     public string EnsureWorkOverlayForBoot()
     {
+        if (bootSnapshot != null)
+        {
+            if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
+                PrepareBootFromSnapshot(bootSnapshot);
+            return _workOverlayPath;
+        }
+
         if (diskAsset == null)
             return null;
 
+        DiskOverlay.EnsureBackingChain(diskAsset);
         string basePath = diskAsset.GetQcow2FilesystemPath();
         if (string.IsNullOrEmpty(basePath) || !File.Exists(basePath))
         {
             UnityEngine.Debug.LogError(
-                $"QemuDiskAsset '{diskAsset.name}' has no readable qcow2 at '{basePath}'");
+                $"DiskAsset '{diskAsset.name}' has no readable qcow2 at '{basePath}'");
             return null;
         }
 
@@ -152,33 +174,35 @@ public class VirtualMachine : MonoBehaviour
         if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
         {
             string sessionId = $"{gameObject.name}-{GetInstanceID()}";
-            _workOverlayPath = QemuDiskOverlay.CreateWorkOverlay(basePath, sessionId);
-            UnityEngine.Debug.Log($"D2 work overlay: {_workOverlayPath} (base={basePath})");
+            _workOverlayPath = DiskOverlay.CreateWorkOverlay(basePath, sessionId);
+            UnityEngine.Debug.Log($"Work overlay: {_workOverlayPath} (base={basePath})");
         }
 
         return _workOverlayPath;
     }
 
     /// <summary>
-    /// Replace the work overlay with a copy of a durable snapshot image and request loadvm after next start.
-    /// Call while QEMU is stopped.
+    /// Replace the work image with a byte-copy of a durable <c>.uqsnap</c> and request loadvm after next start.
+    /// This is a full copy (not a thin overlay on the snapshot), so the embedded savevm tag stays in the
+    /// top writable layer. Call while QEMU is stopped.
     /// </summary>
-    public void PrepareBootFromSnapshot(QemuSnapshotAsset snapshot)
+    public void PrepareBootFromSnapshot(SnapshotAsset snapshot)
     {
         if (snapshot == null)
             throw new ArgumentNullException(nameof(snapshot));
-        if (snapshot.disk != null)
-            diskAsset = snapshot.disk;
 
         string imagePath = snapshot.GetImageFilesystemPath();
         if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
-            throw new FileNotFoundException("Snapshot image qcow2 not found", imagePath);
+            throw new FileNotFoundException("Snapshot .uqsnap not found", imagePath);
 
+        DiskOverlay.EnsureSnapshotBacking(snapshot);
         string sessionId = $"{gameObject.name}-{GetInstanceID()}";
-        _workOverlayPath = QemuDiskOverlay.ReplaceWorkOverlayFromCopy(imagePath, sessionId);
-        _pendingLoadVmTag = QemuDiskOverlay.DurableSaveVmTag;
+        _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(imagePath, sessionId);
+        _pendingLoadVmTag = DiskOverlay.DurableSaveVmTag;
         bootSnapshot = snapshot;
-        UnityEngine.Debug.Log($"D2 prepared boot from snapshot '{snapshot.name}' → {_workOverlayPath}");
+        diskAsset = snapshot.backingDisk;
+        UnityEngine.Debug.Log(
+            $"Prepared boot from snapshot '{snapshot.name}' → {_workOverlayPath}");
     }
 
     /// <summary>Queue a loadvm tag for the next successful QMP connect (cleared after attempt).</summary>
@@ -336,6 +360,9 @@ public class VirtualMachine : MonoBehaviour
 
     void OnValidate()
     {
+        // Keep Disk Asset reflecting the boot snapshot's backing disk for inspector clarity.
+        if (bootSnapshot != null && bootSnapshot.backingDisk != null)
+            diskAsset = bootSnapshot.backingDisk;
 #if UNITY_EDITOR
         // Defer so we don't start processes during the OnValidate call stack.
         EditorApplication.delayCall -= OnValidateDeferred;
@@ -486,9 +513,7 @@ public class VirtualMachine : MonoBehaviour
             string loadTag = _pendingLoadVmTag;
             _pendingLoadVmTag = null;
             if (string.IsNullOrEmpty(loadTag) && bootSnapshot != null)
-                loadTag = QemuDiskOverlay.DurableSaveVmTag;
-            if (string.IsNullOrEmpty(loadTag))
-                loadTag = saveStateName;
+                loadTag = DiskOverlay.DurableSaveVmTag;
 
             if (!string.IsNullOrEmpty(loadTag))
             {

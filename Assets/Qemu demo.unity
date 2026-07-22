@@ -313,10 +313,11 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
-  diskImagePath: Assets/qemu~/disk/win2000/o4.qcow2
+  diskAsset: {fileID: 0}
+  useEphemeralWorkOverlay: 1
+  bootSnapshot: {fileID: 0}
   cdroms: []
   floppies: []
-  saveStateName: 
   vncPort: 5901
   qmpPort: 4445
   gdbPort: 1234
@@ -400,17 +401,18 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 342ef9f6392686042b69667bd374eb45, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  enableQmp: 0
+  enableQmp: 1
   enableGdb: 1
   verboseQmp: 0
   verboseGdb: 0
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
-  diskImagePath: Assets/qemu~/disk/win95/o1.qcow2
+  diskAsset: {fileID: 0}
+  useEphemeralWorkOverlay: 1
+  bootSnapshot: {fileID: 0}
   cdroms: []
   floppies: []
-  saveStateName: 
   vncPort: 5900
   qmpPort: 4444
   gdbPort: 1234
@@ -560,6 +562,7 @@ GameObject:
   - component: {fileID: 1795018732}
   - component: {fileID: 1795018733}
   - component: {fileID: 1795018734}
+  - component: {fileID: 1795018735}
   m_Layer: 0
   m_Name: WinXP
   m_TagString: Untagged
@@ -585,14 +588,15 @@ MonoBehaviour:
   verboseGdb: 0
   showGui: 1
   inputProvider: {fileID: 0}
-  runInEditMode: 0
-  diskImagePath: Assets/qemu~/disk/winXP/o1.qcow2
+  runInEditMode: 1
+  diskAsset: {fileID: 0}
+  useEphemeralWorkOverlay: 1
+  bootSnapshot: {fileID: -6750239444755058063, guid: 5ab4d9ba577e39543a9c7170bca765c8, type: 3}
   cdroms: []
   floppies: []
-  saveStateName: Desktop
-  vncPort: 5900
-  qmpPort: 4444
-  gdbPort: 1234
+  vncPort: 5901
+  qmpPort: 4445
+  gdbPort: 1235
   gdbPhysicalMemory: 1
   outputTexture: {fileID: 8400000, guid: 3010e189faec4e44ebbe420ee3a23d53, type: 2}
   qemuArgs: "    -m 256\n    -vga cirrus\r\n    -device ac97,audiodev=snd0\r\n   
@@ -627,7 +631,7 @@ MonoBehaviour:
   virtualMachine: {fileID: 1795018730}
   refreshOnReady: 1
   snapshots:
-  - name: Desktop
+  - name: __unityqemu_state
 --- !u!114 &1795018733
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -658,10 +662,24 @@ MonoBehaviour:
   virtualMachine: {fileID: 1795018730}
   systemScanMaxMiB: 64
   guestRamMiB: 256
-  systemEprocessPhysical: 0
+  systemEprocessPhysical: 29149696
   processNameFilter: 
-  activeProcess: "(none \u2014 click Regions on a process)"
-  regionSummary: 
+  activeProcess: 'winmine.exe (PID 212) [saved map]'
+  regionSummary: "winmine.exe (PID 212) [saved] \u2014 340 ranges, 2268 KiB\r\n 
+    0x0E47A000 + 0x1000 (4 KiB)\r\n  0x0E3BB000 + 0x1000 (4 KiB)\r\n  0x0E54D000
+    + 0x2000 (8 KiB)\r\n  0x0E550000 + 0x1000 (4 KiB)\r\n  0x0E391000 + 0x1000 (4
+    KiB)\r\n  0x0E2E6000 + 0x1000 (4 KiB)\r\n  0x0E5B5000 + 0x1000 (4 KiB)\r\n  0x0E38C000
+    + 0x1000 (4 KiB)\r\n  0x0E47E000 + 0x1000 (4 KiB)\r\n  0x0A2ED000 + 0x2000 (8
+    KiB)\r\n  0x0E229000 + 0x1000 (4 KiB)\r\n  0x0E2AA000 + 0x1000 (4 KiB)\r\n  0x0E583000
+    + 0x1000 (4 KiB)\r\n  0x0E304000 + 0x1000 (4 KiB)\r\n  0x0E307000 + 0x1000 (4
+    KiB)\r\n  0x0E3D7000 + 0x1000 (4 KiB)\r\n  0x0E493000 + 0x1000 (4 KiB)\r\n  0x0E59E000
+    + 0x1000 (4 KiB)\r\n  0x0E7A1000 + 0x1000 (4 KiB)\r\n  0x0E562000 + 0x1000 (4
+    KiB)\r\n  0x0E663000 + 0x1000 (4 KiB)\r\n  0x0E5A4000 + 0x1000 (4 KiB)\r\n  0x0E385000
+    + 0x1000 (4 KiB)\r\n  0x0E3C6000 + 0x1000 (4 KiB)\r\n  0x0E388000 + 0x1000 (4
+    KiB)\r\n  0x0E4AC000 + 0x1000 (4 KiB)\r\n  0x0E4AF000 + 0x1000 (4 KiB)\r\n  0x0353C000
+    + 0x2000 (8 KiB)\r\n  0x0353E000 + 0x1000 (4 KiB)\r\n  0x0353F000 + 0x1000 (4
+    KiB)\r\n  0x037C0000 + 0x1000 (4 KiB)\r\n  0x035C1000 + 0x1000 (4 KiB)\r\n  ...
+    +308 more\r\n"
   processes: []
   memoryMapAsset: {fileID: 11400000, guid: 2cc2462e400dda944933e0514ed84b91, type: 2}
   scanScope: 0
@@ -670,10 +688,26 @@ MonoBehaviour:
   valueSize: 4
   littleEndian: 1
   searchValue: 0
+  manualAddress: 
   pokeValue: 0
   autoRefreshCandidates: 1
   autoRefreshInterval: 0.5
   candidates: []
+--- !u!114 &1795018735
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1795018729}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fb89e5398eb0458fad90c1d1ed58f510, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: UnityQemu::UnityQemu.DurableSnapshotUI
+  virtualMachine: {fileID: 1795018730}
+  newSnapshotNote: 
+  targetSnapshot: {fileID: -6750239444755058063, guid: 5ab4d9ba577e39543a9c7170bca765c8, type: 3}
 --- !u!1 &2024899171
 GameObject:
   m_ObjectHideFlags: 0

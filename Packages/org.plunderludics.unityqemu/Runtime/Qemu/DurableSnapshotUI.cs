@@ -10,67 +10,37 @@ using UnityEditor;
 
 namespace UnityQemu {
 /// <summary>
-/// Prototype UI for D2 durable snapshots: savevm into the work overlay, copy to Assets, load via restart + loadvm.
+/// Inspector UI for durable snapshots: savevm into the work image, copy to a <c>.uqsnap</c> asset,
+/// load via copy → Library work image + loadvm.
 /// </summary>
 [ExecuteAlways]
+[DeclareHorizontalGroup("target/actions")]
+[DeclareFoldoutGroup("Debug", Expanded = false)]
 public class DurableSnapshotUI : MonoBehaviour
 {
+    const string DefaultSnapshotOutputFolder = "Assets/Qemu/Snapshots";
+    const string DefaultNewSnapshotName = "snap1";
+
     [FormerlySerializedAs("qemu")]
+    [PropertyOrder(0)]
     public VirtualMachine virtualMachine;
 
-    [Tooltip("Folder under Assets where new snapshot .qcow2 + .asset pairs are written")]
-    public string snapshotOutputFolder = "Assets/Qemu/Snapshots";
-
-    [Tooltip("Name for the next Save (file stem). Spaces become underscores in the qcow2 filename.")]
-    public string newSnapshotName = "snap1";
-
-    [Tooltip("Optional note stored on the QemuSnapshotAsset")]
-    [TextArea(2, 4)]
-    public string newSnapshotNote = "";
-
-    [Tooltip("Existing snapshot to load / overwrite")]
-    public QemuSnapshotAsset targetSnapshot;
-
-    [ShowInInspector, ReadOnly]
-    string status = "Idle";
+    [Tooltip("Existing snapshot to load or overwrite")]
+    [PropertyOrder(1)]
+    public SnapshotAsset targetSnapshot;
 
 #if UNITY_EDITOR
-    [ShowInInspector, ReadOnly]
-    bool Ready => virtualMachine != null && virtualMachine.QmpConnected;
-
-    [ShowInInspector, ReadOnly]
-    string WorkOverlay => virtualMachine != null ? virtualMachine.WorkOverlayPath : "";
-
     void OnEnable()
     {
         if (virtualMachine == null)
             virtualMachine = GetComponent<VirtualMachine>();
     }
 
-    [Button("Save durable snapshot")]
-    [EnableIf(nameof(Ready))]
-    public async void SaveDurableSnapshotButton()
-    {
-        try
-        {
-            status = "Saving…";
-            var asset = await SaveDurableSnapshotAsync(newSnapshotName, newSnapshotNote, overwrite: targetSnapshot);
-            if (asset != null)
-            {
-                targetSnapshot = asset;
-                status = $"Saved '{asset.name}'";
-            }
-        }
-        catch (Exception e)
-        {
-            status = $"Save failed: {e.Message}";
-            Debug.LogException(e);
-        }
-    }
-
-    [Button("Load durable snapshot")]
+    [PropertyOrder(2)]
+    [Group("target/actions")]
+    [Button("Load")]
     [EnableIf(nameof(HasTargetSnapshot))]
-    public async void LoadDurableSnapshotButton()
+    public async void LoadSnapshotButton()
     {
         try
         {
@@ -85,103 +55,219 @@ public class DurableSnapshotUI : MonoBehaviour
         }
     }
 
-    bool HasTargetSnapshot => targetSnapshot != null && virtualMachine != null;
+    [PropertyOrder(2)]
+    [Group("target/actions")]
+    [Button("Overwrite")]
+    [EnableIf(nameof(CanOverwrite))]
+    public async void OverwriteTargetSnapshotButton()
+    {
+        try
+        {
+            string existing = targetSnapshot.GetImageFilesystemPath();
+            if (string.IsNullOrEmpty(existing))
+                throw new InvalidOperationException(
+                    $"Target snapshot '{targetSnapshot.name}' has no .uqsnap file on disk");
+
+            status = $"Overwriting '{targetSnapshot.name}'…";
+            var asset = await SaveDurableSnapshotAsync(MakeProjectRelative(existing));
+            if (asset != null)
+            {
+                targetSnapshot = asset;
+                status = $"Overwrote '{asset.name}'";
+            }
+        }
+        catch (Exception e)
+        {
+            status = $"Overwrite failed: {e.Message}";
+            Debug.LogException(e);
+        }
+    }
+
+    [PropertyOrder(3)]
+    [Button("Save new snapshot…")]
+    [EnableIf(nameof(Ready))]
+    public async void SaveNewSnapshotButton()
+    {
+        EnsureSnapshotFolder(DefaultSnapshotOutputFolder);
+        string projectPath = EditorUtility.SaveFilePanelInProject(
+            "Save Snapshot",
+            DefaultNewSnapshotName,
+            "uqsnap",
+            "Choose where to save the snapshot",
+            DefaultSnapshotOutputFolder);
+        if (string.IsNullOrEmpty(projectPath))
+            return;
+
+        try
+        {
+            status = "Saving…";
+            var asset = await SaveDurableSnapshotAsync(projectPath);
+            if (asset != null)
+            {
+                targetSnapshot = asset;
+                status = $"Saved '{asset.name}'";
+            }
+        }
+        catch (Exception e)
+        {
+            status = $"Save failed: {e.Message}";
+            Debug.LogException(e);
+        }
+    }
 
     /// <summary>
-    /// Pause → savevm → stop QEMU → copy work overlay into Assets → create/update QemuSnapshotAsset → restart.
-    /// Stops the process before copy for Windows file-lock safety.
+    /// Instantly re-load the durable state already in the current work image (no process
+    /// restart). Works after any durable save or load this session — both leave the
+    /// savevm tag in the open work qcow2.
     /// </summary>
-    public async Task<QemuSnapshotAsset> SaveDurableSnapshotAsync(
-        string snapshotName,
-        string note,
-        QemuSnapshotAsset overwrite = null)
+    [PropertyOrder(4)]
+    [Button("Reload last saved state")]
+    [EnableIf(nameof(Ready))]
+    public async void ReloadDurableStateButton()
+    {
+        try
+        {
+            status = "Reloading…";
+            string result = await virtualMachine.RunHumanMonitorCommandAsync(
+                $"loadvm {DiskOverlay.DurableSaveVmTag}");
+            // HMP reports loadvm failures as text output (e.g. missing tag on a fresh boot).
+            if (!string.IsNullOrWhiteSpace(result))
+                throw new InvalidOperationException(result.Trim());
+            status = "Reloaded last saved state";
+        }
+        catch (Exception e)
+        {
+            status = $"Reload failed: {e.Message}";
+            Debug.LogException(e);
+        }
+    }
+
+    bool CanOverwrite => Ready && targetSnapshot != null;
+    bool HasTargetSnapshot => targetSnapshot != null && virtualMachine != null;
+    bool Ready => virtualMachine != null && virtualMachine.QmpConnected;
+
+    [PropertyOrder(100)]
+    [Group("Debug")]
+    [ShowInInspector, ReadOnly]
+    string status = "Idle";
+
+    [PropertyOrder(101)]
+    [Group("Debug")]
+    [ShowInInspector, ReadOnly]
+    bool QmpReady => Ready;
+
+    [PropertyOrder(102)]
+    [Group("Debug")]
+    [ShowInInspector, ReadOnly]
+    string WorkOverlay => virtualMachine != null ? virtualMachine.WorkOverlayPath : "";
+
+    /// <summary>
+    /// Pause → savevm → copy work image to a <c>.uqsnap</c> asset → resume.
+    /// Prefers copying while QEMU stays paused (true pause/resume). If Windows locks the
+    /// work file, falls back to stop → copy → restart + loadvm.
+    /// </summary>
+    public async Task<SnapshotAsset> SaveDurableSnapshotAsync(string uqsnapProjectPath)
     {
         if (virtualMachine == null)
             throw new InvalidOperationException("No VirtualMachine assigned");
         if (!virtualMachine.QmpConnected)
             throw new InvalidOperationException("QMP not connected");
         if (virtualMachine.ActiveDiskAsset == null)
-            throw new InvalidOperationException("Assign virtualMachine.diskAsset (D2 base disk) before durable save");
+            throw new InvalidOperationException(
+                "The active disk has no underlying DiskAsset; configure a disk or valid snapshot first");
+        if (string.IsNullOrWhiteSpace(uqsnapProjectPath))
+            throw new ArgumentException("No output path given", nameof(uqsnapProjectPath));
 
         string workPath = virtualMachine.WorkOverlayPath;
         if (string.IsNullOrEmpty(workPath) || !File.Exists(workPath))
-            throw new InvalidOperationException("No work overlay — boot with diskAsset + useEphemeralWorkOverlay first");
+            throw new InvalidOperationException(
+                "No work image — boot with a Disk Asset (work overlay on) or a Boot Snapshot first");
 
-        string stem = string.IsNullOrWhiteSpace(snapshotName) ? "snap" : snapshotName.Trim();
-        string fileStem = SanitizeFileStem(stem);
+        DiskAsset backingDisk = virtualMachine.ActiveDiskAsset;
+
+        string uqsnapFull = Path.GetFullPath(Path.Combine(Application.dataPath, "..", uqsnapProjectPath));
 
         await virtualMachine.PauseAsync();
+        bool qemuStillRunning = true;
         try
         {
-            await virtualMachine.RunHumanMonitorCommandAsync($"savevm {QemuDiskOverlay.DurableSaveVmTag}");
-        }
-        finally
-        {
-            // Always stop before copying on Windows (open qcow2 may be locked even when paused).
-            await virtualMachine.StopGuestProcessAsync();
-        }
+            await virtualMachine.RunHumanMonitorCommandAsync($"savevm {DiskOverlay.DurableSaveVmTag}");
 
-        EnsureSnapshotFolder(snapshotOutputFolder);
-
-        string qcow2ProjectPath;
-        string assetProjectPath;
-        QemuSnapshotAsset snapAsset;
-
-        if (overwrite != null)
-        {
-            snapAsset = overwrite;
-            string existingImage = overwrite.GetImageFilesystemPath();
-            if (string.IsNullOrEmpty(existingImage))
+            try
             {
-                qcow2ProjectPath = $"{snapshotOutputFolder.TrimEnd('/')}/{fileStem}.qcow2";
-                assetProjectPath = AssetDatabase.GetAssetPath(overwrite);
+                DiskOverlay.EnsureBackingMatches(
+                    workPath, backingDisk.GetQcow2FilesystemPath());
+                DiskOverlay.CopyAtomic(workPath, uqsnapFull);
             }
-            else
+            catch (Exception e)
             {
-                qcow2ProjectPath = MakeProjectRelative(existingImage);
-                assetProjectPath = AssetDatabase.GetAssetPath(overwrite);
+                // Common on Windows: QEMU keeps the qcow2 open exclusively even while paused.
+                Debug.LogWarning(
+                    $"Could not copy work image while QEMU is running ({e.Message}). " +
+                    "Stopping QEMU to copy, then restarting into the saved state.");
+                await virtualMachine.StopGuestProcessAsync();
+                qemuStillRunning = false;
+                DiskOverlay.EnsureBackingMatches(
+                    workPath, backingDisk.GetQcow2FilesystemPath());
+                DiskOverlay.CopyAtomic(workPath, uqsnapFull);
             }
+        }
+        catch
+        {
+            if (qemuStillRunning)
+            {
+                try { await virtualMachine.ResumeAsync(); }
+                catch (Exception resumeError)
+                {
+                    Debug.LogWarning($"Failed to resume after save error: {resumeError.Message}");
+                }
+            }
+            throw;
+        }
+
+        AssetDatabase.ImportAsset(uqsnapProjectPath, ImportAssetOptions.ForceUpdate);
+        AssetImporter importer = AssetImporter.GetAtPath(uqsnapProjectPath);
+        if (importer == null)
+            throw new Exception($"No importer found for '{uqsnapProjectPath}'");
+
+        var serializedImporter = new SerializedObject(importer);
+        SerializedProperty backingProperty = serializedImporter.FindProperty("backingDisk");
+        SerializedProperty createdAtProperty = serializedImporter.FindProperty("createdAt");
+        if (backingProperty == null)
+            throw new Exception(
+                $"The uqsnap importer for '{uqsnapProjectPath}' has no backingDisk property");
+
+        string createdAt = DateTime.UtcNow.ToString("o");
+        backingProperty.objectReferenceValue = backingDisk;
+        if (createdAtProperty != null)
+            createdAtProperty.stringValue = createdAt;
+        serializedImporter.ApplyModifiedPropertiesWithoutUndo();
+        importer.SaveAndReimport();
+
+        var snapAsset = AssetDatabase.LoadAssetAtPath<SnapshotAsset>(uqsnapProjectPath);
+        if (snapAsset == null)
+            throw new Exception(
+                $"uqsnap imported but no SnapshotAsset at '{uqsnapProjectPath}' — is UqsnapImporter present?");
+
+        Debug.Log($"Durable snapshot saved: {uqsnapProjectPath}");
+
+        if (qemuStillRunning)
+        {
+            // Guest is already at the savevm point — just unpause.
+            await virtualMachine.ResumeAsync();
         }
         else
         {
-            qcow2ProjectPath = AssetDatabase.GenerateUniqueAssetPath(
-                $"{snapshotOutputFolder.TrimEnd('/')}/{fileStem}.qcow2");
-            assetProjectPath = Path.ChangeExtension(qcow2ProjectPath, ".asset").Replace('\\', '/');
-            snapAsset = null;
+            // Restarted after a locked-file fallback; reload the tag we just wrote into the work image.
+            virtualMachine.RequestLoadVmOnReady(DiskOverlay.DurableSaveVmTag);
+            await virtualMachine.StartGuestProcessAsync();
         }
 
-        string qcow2Full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", qcow2ProjectPath));
-        QemuDiskOverlay.CopyAtomic(workPath, qcow2Full);
-
-        AssetDatabase.ImportAsset(qcow2ProjectPath, ImportAssetOptions.ForceUpdate);
-        var imageDisk = AssetDatabase.LoadAssetAtPath<QemuDiskAsset>(qcow2ProjectPath);
-        if (imageDisk == null)
-            throw new Exception(
-                $"qcow2 imported but no QemuDiskAsset at '{qcow2ProjectPath}' — is Qcow2Importer present?");
-
-        if (snapAsset == null)
-        {
-            snapAsset = ScriptableObject.CreateInstance<QemuSnapshotAsset>();
-            AssetDatabase.CreateAsset(snapAsset, assetProjectPath);
-        }
-
-        snapAsset.disk = virtualMachine.ActiveDiskAsset;
-        snapAsset.image = imageDisk;
-        snapAsset.note = note ?? "";
-        snapAsset.StampCreatedNow();
-        EditorUtility.SetDirty(snapAsset);
-        AssetDatabase.SaveAssets();
-        AssetDatabase.Refresh();
-
-        Debug.Log($"D2 durable snapshot saved: {assetProjectPath} (image={qcow2ProjectPath})");
-
-        // Resume session on the same work overlay (still contains the savevm tag).
-        await virtualMachine.StartGuestProcessAsync();
         return snapAsset;
     }
 
-    /// <summary>Stop QEMU, copy snapshot image → work overlay, restart, loadvm.</summary>
-    public async Task LoadDurableSnapshotAsync(QemuSnapshotAsset snapshot)
+    /// <summary>Stop QEMU, copy .uqsnap → work image, restart, loadvm.</summary>
+    public async Task LoadDurableSnapshotAsync(SnapshotAsset snapshot)
     {
         if (virtualMachine == null)
             throw new InvalidOperationException("No VirtualMachine assigned");
@@ -210,13 +296,6 @@ public class DurableSnapshotUI : MonoBehaviour
         }
     }
 
-    static string SanitizeFileStem(string name)
-    {
-        foreach (char c in Path.GetInvalidFileNameChars())
-            name = name.Replace(c, '_');
-        return name.Replace(' ', '_');
-    }
-
     static string MakeProjectRelative(string fullPath)
     {
         string root = Path.GetFullPath(Path.Combine(Application.dataPath, ".."))
@@ -226,6 +305,12 @@ public class DurableSnapshotUI : MonoBehaviour
             return fullPath.Substring(root.Length).Replace('\\', '/');
         return fullPath.Replace('\\', '/');
     }
+#else
+    // Stubs so the component still serializes cleanly in player builds.
+    [PropertyOrder(100)]
+    [Group("Debug")]
+    [ShowInInspector, ReadOnly]
+    string status = "Idle";
 #endif
 }
 }

@@ -4,7 +4,7 @@
 
 # Ignore qemu assets and testing stuff
 /Packages/org.plunderludics.unityqemu/qemu~/
-/Assets/qemu~/
+/Assets/qemu/
 
 b.sh
 UnityAgentBridge/

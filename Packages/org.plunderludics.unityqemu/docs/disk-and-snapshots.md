@@ -225,17 +225,17 @@ Pair **Approach D2** with a thin Unity asset wrapper so users interact with Scri
 
 ```mermaid
 flowchart TD
-  qcowImport[".qcow2 dropped in Assets"] --> diskAsset["QemuDiskAsset"]
+  qcowImport[".qcow2 dropped in Assets"] --> diskAsset["DiskAsset"]
   diskAsset --> baseStore["Immutable base on disk"]
   diskAsset --> workOverlay["Ephemeral work overlay in Library/"]
   snapSave["Save Snapshot"] --> savevm["savevm then copy work qcow2"]
   savevm --> snapFile["Immutable snapshot.qcow2"]
-  snapFile --> snapAsset["QemuSnapshotAsset"]
+  snapFile --> snapAsset["SnapshotAsset"]
   snapLoad["Load Snapshot"] --> workOverlay
   workOverlay --> virtualMachine["VirtualMachine boots overlay"]
 ```
 
-### QemuDiskAsset
+### DiskAsset
 
 ScriptableObject created by a custom `.qcow2` importer (or "Create from file…" menu).
 
@@ -247,14 +247,14 @@ ScriptableObject created by a custom `.qcow2` importer (or "Create from file…"
 
 The `.qcow2` file under Assets is a **handle only** — on first import, the importer copies or references the base and ensures it is never written to at runtime.
 
-### QemuSnapshotAsset
+### SnapshotAsset
 
 ScriptableObject referencing one durable snapshot qcow2 (D2).
 
 | Field | Purpose |
 |---|---|
 | `snapshotPath` | Path to the immutable snapshot overlay copy |
-| `parentDisk` | Which `QemuDiskAsset` / base this snapshot depends on |
+| `parentDisk` | Which `DiskAsset` / base this snapshot depends on |
 | `createdAt` | Timestamp |
 | `note` | User annotation |
 
@@ -265,9 +265,9 @@ Drag onto `VirtualMachine` or pick from a snapshot list to load.
 ```
 Assets/
   Qemu Disks/
-    Windows 95.asset          ← QemuDiskAsset (tiny, Unity-managed)
+    Windows 95.asset          ← DiskAsset (tiny, Unity-managed)
     Snapshots/
-      Level 3.asset           ← QemuSnapshotAsset
+      Level 3.asset           ← SnapshotAsset
       Boss Fight.asset
 
 Library/UnityQemu/
@@ -384,15 +384,15 @@ Do **not** implement yet — notes only. Revisit when ready to build Phase 1.
 | One file ≈ one snapshot | Snapshot qcow2 copy embeds `savevm` state |
 | Survive corruption | Durable snapshots are immutable copies; work is disposable |
 | Avoid broken migrate | Uses only `savevm`/`loadvm` |
-| Unity drag-and-drop | `QemuDiskAsset` / `QemuSnapshotAsset` are tiny ScriptableObjects |
+| Unity drag-and-drop | `DiskAsset` / `SnapshotAsset` are tiny ScriptableObjects |
 | Shared bases | Multiple VMs / overlays can read the same immutable base |
 
 ### Implementation phases (future work — not started)
 
-1. **Phase 1 — Disk asset wrapper:** `QemuDiskAsset`, custom importer, auto work-overlay in `Library/`, wire into [VirtualMachine.cs](../Runtime/Qemu/VirtualMachine.cs).
+1. **Phase 1 — Disk asset wrapper:** `DiskAsset`, custom importer, auto work-overlay in `Library/`, wire into [VirtualMachine.cs](../Runtime/Qemu/VirtualMachine.cs).
 2. **Phase 2 — Durable save:** Pause → `savevm` → atomic copy of work overlay to snapshot path.
 3. **Phase 3 — Durable load:** Copy snapshot → work overlay → restart VM → `loadvm`.
-4. **Phase 4 — Snapshot asset + UI:** `QemuSnapshotAsset`, inspector list, replace or augment [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
+4. **Phase 4 — Snapshot asset + UI:** `SnapshotAsset`, inspector list, replace or augment [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
 5. **Phase 5 — Polish:** Quick slots, flatten-on-export, multi-disk, size optimization.
 6. **Optional later:** Re-test Approach D (`migrate`) on a newer QEMU; keep D2 as the default if migrate remains unreliable.
 

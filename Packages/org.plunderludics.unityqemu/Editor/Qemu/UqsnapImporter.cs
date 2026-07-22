@@ -5,14 +5,20 @@ using UnityEngine;
 
 namespace UnityQemu.Editor {
 /// <summary>
-/// Imports <c>.qcow2</c> as a <see cref="DiskAsset"/> so disks/snapshots appear as native Unity assets.
-/// The binary stays on disk; QEMU must not write imported files (use ephemeral work overlays).
+/// Imports <c>.uqsnap</c> (qcow2 bytes with an embedded savevm tag) as a <see cref="SnapshotAsset"/>.
+/// QEMU must not write these files — load always copies into a Library work image.
 /// </summary>
-[ScriptedImporter(1, "qcow2")]
-public class Qcow2Importer : ScriptedImporter
+[ScriptedImporter(1, "uqsnap")]
+public class UqsnapImporter : ScriptedImporter
 {
-    [Tooltip("Disk referenced by this qcow2's backing-file header. Used to repair the path after assets move.")]
+    [Tooltip("Disk referenced by this snapshot's qcow2 backing-file header.")]
     public DiskAsset backingDisk;
+
+    [TextArea(2, 4)]
+    public string note;
+
+    [Tooltip("ISO-8601 timestamp when the snapshot was created")]
+    public string createdAt;
 
     public override void OnImportAsset(AssetImportContext ctx)
     {
@@ -28,26 +34,28 @@ public class Qcow2Importer : ScriptedImporter
                 if (!string.IsNullOrEmpty(backingPath) && resolvedBacking == null)
                 {
                     ctx.LogImportWarning(
-                        $"qcow2 backing file '{backingPath}' has no DiskAsset yet; " +
+                        $"uqsnap backing file '{backingPath}' has no DiskAsset yet; " +
                         "reimport after its asset exists");
                 }
             }
             catch (System.Exception e)
             {
-                ctx.LogImportWarning($"Could not inspect qcow2 backing metadata: {e.Message}");
+                ctx.LogImportWarning($"Could not inspect uqsnap backing metadata: {e.Message}");
             }
         }
+
         if (backingDisk == null && resolvedBacking != null)
             SchedulePersistInferredBacking(ctx.assetPath, resolvedBacking);
 
-        var disk = ScriptableObject.CreateInstance<DiskAsset>();
-        disk.projectRelativeQcow2Path = ctx.assetPath.Replace('\\', '/');
-        disk.backingDisk = resolvedBacking;
-        disk.label = Path.GetFileNameWithoutExtension(ctx.assetPath);
-        disk.name = disk.label;
+        var snap = ScriptableObject.CreateInstance<SnapshotAsset>();
+        snap.projectRelativeUqsnapPath = ctx.assetPath.Replace('\\', '/');
+        snap.backingDisk = resolvedBacking;
+        snap.note = note ?? "";
+        snap.createdAt = createdAt ?? "";
+        snap.name = Path.GetFileNameWithoutExtension(ctx.assetPath);
 
-        ctx.AddObjectToAsset("main", disk);
-        ctx.SetMainObject(disk);
+        ctx.AddObjectToAsset("main", snap);
+        ctx.SetMainObject(snap);
     }
 
     static void SchedulePersistInferredBacking(string imageAssetPath, DiskAsset inferredBacking)
@@ -58,7 +66,7 @@ public class Qcow2Importer : ScriptedImporter
 
         EditorApplication.delayCall += () =>
         {
-            var importer = AssetImporter.GetAtPath(imageAssetPath) as Qcow2Importer;
+            var importer = AssetImporter.GetAtPath(imageAssetPath) as UqsnapImporter;
             DiskAsset backing =
                 AssetDatabase.LoadAssetAtPath<DiskAsset>(backingAssetPath);
             if (importer == null || backing == null || importer.backingDisk != null)
