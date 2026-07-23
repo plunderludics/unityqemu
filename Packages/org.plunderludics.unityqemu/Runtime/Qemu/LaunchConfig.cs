@@ -16,7 +16,7 @@ public class LaunchConfig
     public const string DefaultExtraQemuArgs = @"
     -cpu pentium
     -vga cirrus
-    -audiodev dsound,id=snd0
+    -audiodev sdl,id=snd0
     -device sb16,audiodev=snd0
     -netdev user,id=net0
     -device rtl8139,netdev=net0

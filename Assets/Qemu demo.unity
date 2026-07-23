@@ -572,6 +572,7 @@ GameObject:
   - component: {fileID: 1795018733}
   - component: {fileID: 1795018734}
   - component: {fileID: 1795018735}
+  - component: {fileID: 1795018736}
   m_Layer: 0
   m_Name: WinXP
   m_TagString: Untagged
@@ -598,16 +599,15 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
-  diskAsset: {fileID: -6750239444755058063, guid: 5ab4d9ba577e39543a9c7170bca765c8, type: 3}
-  autoLoadVmState: 0
+  diskAsset: {fileID: -6750239444755058063, guid: c614a2475974a0346a2b8a471561f58c, type: 3}
+  autoLoadVmState: 1
   overrideSnapshotLaunchConfig: 1
   launchConfig:
-    memoryMb: 1024
+    memoryMb: 256
     extraQemuArgs: "-cpu pentium3\r\n    -vga cirrus\r\n    -device sb16,audiodev=snd0\r\n   
-      -audiodev dsound,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
+      -audiodev sdl,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
       -usb -device usb-tablet"
-    cdroms:
-    - {fileID: -6750239444755058063, guid: 71454ca1b28241446987fe2fbeddc8c9, type: 3}
+    cdroms: []
     floppies: []
     hostFolders: []
     smbShareFolder: {fileID: 0}
@@ -706,7 +706,23 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: UnityQemu::UnityQemu.DurableSnapshotUI
   virtualMachine: {fileID: 1795018730}
-  currentSnapshot: {fileID: -6750239444755058063, guid: 5ab4d9ba577e39543a9c7170bca765c8, type: 3}
+  currentSnapshot: {fileID: -6750239444755058063, guid: c614a2475974a0346a2b8a471561f58c, type: 3}
+--- !u!114 &1795018736
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1795018729}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a1b2c3d4e5f6789012345678abcdef01, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: UnityQemu::UnityQemu.PeripheralsUI
+  virtualMachine: {fileID: 1795018730}
+  cdromDevice: unityqemu-cd0
+  floppyDevice: 
+  alsoAddToLaunchConfig: 1
 --- !u!1 &2024899171
 GameObject:
   m_ObjectHideFlags: 0

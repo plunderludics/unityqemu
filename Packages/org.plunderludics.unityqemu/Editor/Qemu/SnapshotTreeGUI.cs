@@ -44,7 +44,7 @@ public static class SnapshotTreeGUI
 
             EditorGUILayout.Space(2);
             EditorGUILayout.LabelField(
-                "▣ disk   ○ snapshot   ★ this asset — click: select, double-click: reveal in Project.",
+                "▣ disk   ○ snapshot   ★ this asset — click: select, right-click: Project menu.",
                 EditorStyles.miniLabel);
         }
         EditorGUILayout.Space(4);
@@ -68,8 +68,7 @@ public static class SnapshotTreeGUI
             isLast: isLast,
             ancestorLast: ancestorLast,
             selected: node == focus,
-            onClick: () => Select(node),
-            onDoubleClick: () => SelectInProjectWindow(node));
+            asset: node);
 
         List<DiskAsset> children = DiskAsset.GetChildDisks(node);
         for (int i = 0; i < children.Count; i++)
@@ -91,8 +90,7 @@ public static class SnapshotTreeGUI
         bool isLast,
         List<bool> ancestorLast,
         bool selected,
-        System.Action onClick,
-        System.Action onDoubleClick = null)
+        DiskAsset asset)
     {
         Rect row = GUILayoutUtility.GetRect(0, RowHeight, GUILayout.ExpandWidth(true));
         bool hover = !selected && row.Contains(Event.current.mousePosition);
@@ -160,18 +158,15 @@ public static class SnapshotTreeGUI
         var labelRect = new Rect(x, row.y, Mathf.Max(40, row.xMax - x - rightPad), row.height);
         EditorGUIUtility.AddCursorRect(labelRect, MouseCursor.Link);
 
-        // Handle double-click before GUI.Button so clickCount is still available.
         Event e = Event.current;
-        if (e.type == EventType.MouseDown && e.button == 0 &&
-            labelRect.Contains(e.mousePosition) && e.clickCount >= 2)
+        if (e.type == EventType.ContextClick && labelRect.Contains(e.mousePosition))
         {
-            onDoubleClick?.Invoke();
+            ShowNodeContextMenu(asset);
             e.Use();
-            GUIUtility.ExitGUI();
         }
 
         if (GUI.Button(labelRect, new GUIContent($"{marker}  {label}", tooltip), style))
-            onClick?.Invoke();
+            Select(asset);
 
         var sizeRect = new Rect(row.xMax - KindBadgeWidth - SizeBadgeWidth - 4, row.y, SizeBadgeWidth, row.height);
         var kindRect = new Rect(row.xMax - KindBadgeWidth - 2, row.y, KindBadgeWidth, row.height);
@@ -218,14 +213,24 @@ public static class SnapshotTreeGUI
         Selection.activeObject = obj;
     }
 
-    /// <summary>Select the asset and reveal it in the Project window.</summary>
-    static void SelectInProjectWindow(Object obj)
+    static void ShowNodeContextMenu(DiskAsset asset)
     {
-        if (obj == null)
+        if (asset == null)
             return;
-        Selection.activeObject = obj;
+
+        var menu = new GenericMenu();
+        menu.AddItem(new GUIContent("Select in Project"), false, () => RevealInProjectWindow(asset));
+        menu.AddItem(new GUIContent("Select"), false, () => Select(asset));
+        menu.ShowAsContext();
+    }
+
+    static void RevealInProjectWindow(DiskAsset asset)
+    {
+        if (asset == null)
+            return;
+        Selection.activeObject = asset;
         EditorUtility.FocusProjectWindow();
-        EditorGUIUtility.PingObject(obj);
+        EditorGUIUtility.PingObject(asset);
     }
 
     static Rect Pad(Rect r, float pad) =>

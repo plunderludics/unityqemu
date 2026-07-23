@@ -10,7 +10,14 @@ public class DiskAssetEditor : UnityEditor.Editor
         var disk = (DiskAsset)target;
 
         DrawKindHeader(disk);
+
+        // Importer-backed DiskAssets are drawn with GUI.enabled=false (read-only asset).
+        // Re-enable for the tree so click / context-menu still work.
+        bool prevEnabled = GUI.enabled;
+        GUI.enabled = true;
         SnapshotTreeGUI.Draw(disk);
+        GUI.enabled = prevEnabled;
+
         DrawDefaultInspector();
     }
 

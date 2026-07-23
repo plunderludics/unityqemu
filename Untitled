@@ -1,0 +1,2 @@
+$QEMU/qemu-system-i386.exe -m 256 -cpu pentium3 -vga cirrus \
+  -hda Library/UnityQemu/d4-test/work.qcow2 -monitor stdio
