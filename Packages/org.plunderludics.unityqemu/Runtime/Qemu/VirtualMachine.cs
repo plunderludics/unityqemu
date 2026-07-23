@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Globalization;
 using System.Threading;
@@ -28,6 +29,12 @@ public class VirtualMachine : MonoBehaviour
     /// <summary>Active work overlay path when using <see cref="diskAsset"/> + ephemeral overlay.</summary>
     string _workOverlayPath;
 
+    /// <summary>
+    /// Set by <see cref="PrepareBootFromDisk"/>: the next start must boot the prepared work
+    /// image instead of minting a fresh one. Consumed by StartQemuAsync.
+    /// </summary>
+    bool _workPreparedForNextStart;
+
     /// <summary>If set, <c>loadvm</c> this tag after QMP connects (durable snapshot restore).</summary>
     string _pendingLoadVmTag;
 
@@ -43,6 +50,7 @@ public class VirtualMachine : MonoBehaviour
     public bool verboseQmp = false;
     [Tooltip("Log GDB attach/interrupt/packet chatter")]
     public bool verboseGdb = false;
+    [Tooltip("Also open QEMU's native SDL window (independent of snapshot launch config).")]
     public bool showGui = false;
 
     [Header("Input")]
@@ -54,17 +62,28 @@ public class VirtualMachine : MonoBehaviour
 
     [Header("Disk")]
     [Tooltip(
-        "Disk to boot from. When a Boot Snapshot is set, this shows that snapshot's backing disk " +
-        "and cannot be changed until the snapshot is cleared.")]
-    [DisableIf(nameof(HasBootSnapshot))]
+        "Image to boot: a plain .qcow2 DiskAsset (fresh overlay) or a .uqsnap DiskAsset " +
+        "(byte-copy + loadvm when Auto Load Vm State is on).")]
     [OnValueChanged(nameof(OnDiskAssetChanged))]
     public DiskAsset diskAsset;
 
+    [ShowIf(nameof(HasUqsnapInDiskSlot))]
+    [Tooltip("When on (default), copy the .uqsnap and loadvm its embedded savevm tag on start.")]
+    public bool autoLoadVmState = true;
+
+    [ShowIf(nameof(HasUqsnapInDiskSlot))]
     [Tooltip(
-        "Optional .uqsnap to resume on start. Sets Disk to the snapshot's backing disk and locks it. " +
-        "Clear to boot the disk from a fresh work overlay instead.")]
-    [OnValueChanged(nameof(OnBootSnapshotChanged))]
-    public SnapshotAsset bootSnapshot;
+        "When off (default), launch with extra QEMU args / CD / host folders from the disk's uqsnap metadata. " +
+        "Turn on to edit and use the Launch Config below instead.")]
+    [OnValueChanged(nameof(OnOverrideSnapshotLaunchConfigChanged))]
+    public bool overrideSnapshotLaunchConfig;
+
+    // Nested serializable foldout. Disabled when a uqsnap owns launch config.
+    [DisableIf(nameof(ShowLockedSnapshotLaunchConfig))]
+    [Tooltip(
+        "Extra QEMU args and removable media. " +
+        "With a .uqsnap and Override off, shows the snapshot's config (read-only).")]
+    public LaunchConfig launchConfig = LaunchConfig.CreateDefault();
 
     [Group("Advanced")]
     [Tooltip(
@@ -72,44 +91,122 @@ public class VirtualMachine : MonoBehaviour
         "Leave on unless you intentionally want QEMU to write the Disk Asset file.")]
     public bool useEphemeralWorkOverlay = true;
 
-    [Tooltip("CD-ROM images — drag .iso assets here (each becomes -drive media=cdrom).")]
-    public UnityEngine.Object[] cdroms;
-
-    [Tooltip(
-        "Floppy sources for quick guest file drop-in. " +
-        "Drag a folder → fat:floppy:rw (vvfat; ~1.44MB); " +
-        "or drag a .img/.ima. Index 0 = A:, 1 = B:, …")]
-    public UnityEngine.Object[] floppies;
-
     [SerializeField] private int vncPort = 5900;
     [SerializeField] private int qmpPort = 4444;
     [SerializeField] private int gdbPort = 1234;
     [SerializeField] private bool gdbPhysicalMemory = true;
     [SerializeField] private RenderTexture outputTexture; // This is kind of unnecessary should just use _vncClient.Texture directly, ideally..
 
-    [TextArea(3, 10)]
-    public string qemuArgs = @"
-    -m 64
-    -cpu pentium
-    -vga cirrus
-    -device sb16,audiodev=snd0
-    -audiodev dsound,id=snd0
-    "; // VNC display + disk/cd/floppy args get added automatically
-    // TODO: move necessary+common args into separate fields
+    /// <summary>True when <see cref="diskAsset"/> is a .uqsnap (has <c>uqsnapMetadata</c>).</summary>
+    public bool HasUqsnapInDiskSlot => diskAsset != null && diskAsset.HasVmState;
 
-    bool HasBootSnapshot => bootSnapshot != null;
+    bool HasVmState => HasUqsnapInDiskSlot;
+    bool ShowLockedSnapshotLaunchConfig => HasUqsnapInDiskSlot && !overrideSnapshotLaunchConfig;
 
-    void OnBootSnapshotChanged()
+    /// <summary>
+    /// Launch config stored on the boot .uqsnap, when it owns config (no override); else null.
+    /// </summary>
+    LaunchConfig SnapshotOwnedLaunchConfig =>
+        HasVmState && !overrideSnapshotLaunchConfig ? diskAsset.uqsnapMetadata?.launchConfig : null;
+
+    /// <summary>
+    /// Launch config used for CD/floppy/host-folder/SMB when a uqsnap owns config; otherwise local.
+    /// Extra args may still fall back via <see cref="EffectiveExtraQemuArgs"/> if the snapshot has none.
+    /// </summary>
+    public LaunchConfig EffectiveLaunchConfig => SnapshotOwnedLaunchConfig ?? launchConfig;
+
+    /// <summary>
+    /// Extra args actually passed to QEMU: uqsnap-stored when booting a snapshot without override
+    /// (when the snapshot has args); otherwise the local <see cref="launchConfig"/>.
+    /// </summary>
+    public string EffectiveExtraQemuArgs
     {
-        if (bootSnapshot != null && bootSnapshot.backingDisk != null)
-            diskAsset = bootSnapshot.backingDisk;
+        get
+        {
+            string snapArgs = SnapshotOwnedLaunchConfig?.extraQemuArgs;
+            if (!string.IsNullOrWhiteSpace(snapArgs))
+                return snapArgs;
+            return launchConfig?.extraQemuArgs ?? "";
+        }
+    }
+
+    public CdRomAsset[] EffectiveCdroms => EffectiveLaunchConfig?.cdroms;
+    public UnityEngine.Object[] EffectiveFloppies => EffectiveLaunchConfig?.floppies;
+    public UnityEngine.Object[] EffectiveHostFolders => EffectiveLaunchConfig?.hostFolders;
+
+    /// <summary>Project folder for QEMU user-net SMB, or null when unset.</summary>
+    public UnityEngine.Object EffectiveSmbShareFolder => EffectiveLaunchConfig?.smbShareFolder;
+
+    /// <summary>
+    /// Append media to the launch config that durable save will persist
+    /// (<see cref="EffectiveLaunchConfig"/>): the uqsnap's in-memory metadata when locked,
+    /// otherwise the local <see cref="launchConfig"/>. The inspector field is kept in sync.
+    /// </summary>
+    bool AddToEffectiveLaunchConfig(Func<LaunchConfig, bool> append)
+    {
+        LaunchConfig target;
+        if (HasVmState && !overrideSnapshotLaunchConfig)
+        {
+            if (diskAsset.uqsnapMetadata == null)
+                diskAsset.uqsnapMetadata = UqsnapMetadata.CreateEmpty();
+            if (diskAsset.uqsnapMetadata.launchConfig == null)
+                diskAsset.uqsnapMetadata.launchConfig = LaunchConfig.CreateDefault();
+            target = diskAsset.uqsnapMetadata.launchConfig;
+        }
+        else
+        {
+            if (launchConfig == null)
+                launchConfig = LaunchConfig.CreateDefault();
+            target = launchConfig;
+        }
+
+        if (!append(target))
+            return false;
+
+        // Keep the inspector field in sync when we wrote snapshot metadata.
+        if (launchConfig == null)
+            launchConfig = LaunchConfig.CreateDefault();
+        if (!ReferenceEquals(launchConfig, target))
+            launchConfig.CopyFrom(target);
+
+#if UNITY_EDITOR
+        if (!ReferenceEquals(launchConfig, target))
+            UnityEditor.EditorUtility.SetDirty(diskAsset);
+        UnityEditor.EditorUtility.SetDirty(this);
+#endif
+        return true;
+    }
+
+    public bool AddCdRomToEffectiveLaunchConfig(CdRomAsset asset) =>
+        asset != null && AddToEffectiveLaunchConfig(cfg => cfg.AddCdRom(asset));
+
+    public bool AddHostFolderToEffectiveLaunchConfig(UnityEngine.Object folder) =>
+        folder != null && AddToEffectiveLaunchConfig(cfg => cfg.AddHostFolder(folder));
+
+    public bool AddFloppyToEffectiveLaunchConfig(UnityEngine.Object source) =>
+        source != null && AddToEffectiveLaunchConfig(cfg => cfg.AddFloppy(source));
+
+    void OnOverrideSnapshotLaunchConfigChanged()
+    {
+        if (!HasVmState)
+            return;
+        SyncLaunchConfigFromDiskMetadata();
+    }
+
+    void SyncLaunchConfigFromDiskMetadata()
+    {
+        if (!HasVmState)
+            return;
+        if (launchConfig == null)
+            launchConfig = LaunchConfig.CreateDefault();
+        launchConfig.CopyFrom(
+            diskAsset.uqsnapMetadata.launchConfig ?? LaunchConfig.CreateDefault());
     }
 
     void OnDiskAssetChanged()
     {
-        // Disk is editable only when no boot snapshot is set; keep that invariant if both change.
-        if (bootSnapshot != null && diskAsset != bootSnapshot.backingDisk)
-            bootSnapshot = null;
+        if (HasVmState && !overrideSnapshotLaunchConfig)
+            SyncLaunchConfigFromDiskMetadata();
     }
 
     bool ShouldRun => Application.isPlaying || runInEditMode;
@@ -117,14 +214,13 @@ public class VirtualMachine : MonoBehaviour
 
     string ResolveDiskImagePath()
     {
-        // Boot snapshot wins when set; Disk Asset is kept in sync for inspector display.
-        if (bootSnapshot != null)
-            return EnsureWorkOverlayForBoot();
-
         if (diskAsset == null)
             return null;
 
         DiskOverlay.EnsureBackingChain(diskAsset);
+        if (ShouldByteCopyBoot)
+            return EnsureWorkOverlayForBoot();
+
         if (useEphemeralWorkOverlay)
         {
             string work = EnsureWorkOverlayForBoot();
@@ -135,46 +231,167 @@ public class VirtualMachine : MonoBehaviour
         return diskAsset.GetQcow2FilesystemPath();
     }
 
+    /// <summary>
+    /// .uqsnap images always byte-copy into the work file (never a thin overlay on the
+    /// .uqsnap). <see cref="autoLoadVmState"/> only controls whether loadvm runs after boot.
+    /// </summary>
+    bool ShouldByteCopyBoot => HasVmState;
+
     /// <summary>Current -hda path (work overlay or configured disk).</summary>
     public string ActiveDiskPath =>
         !string.IsNullOrEmpty(_workOverlayPath) ? _workOverlayPath : ResolveDiskImagePath();
 
     public string WorkOverlayPath => _workOverlayPath;
 
-    /// <summary>The disk directly below the active work image (base disk or snapshot backing).</summary>
-    public DiskAsset ActiveDiskAsset =>
-        bootSnapshot != null ? bootSnapshot.backingDisk : diskAsset;
+    /// <summary>The configured boot image (plain disk or .uqsnap).</summary>
+    public DiskAsset ActiveDiskAsset => diskAsset;
 
     /// <summary>
-    /// Ensure a work overlay exists for the configured disk or snapshot.
+    /// Canonical backing path for a correctly prepared work image:
+    /// byte-copied .uqsnap → its <see cref="DiskAsset.backingDisk"/>;
+    /// thin overlay → the boot disk itself.
+    /// </summary>
+    public string ExpectedWorkBackingFilesystemPath
+    {
+        get
+        {
+            if (diskAsset == null)
+                return null;
+            if (ShouldByteCopyBoot)
+            {
+                return diskAsset.backingDisk != null
+                    ? diskAsset.backingDisk.GetQcow2FilesystemPath()
+                    : null;
+            }
+            return diskAsset.GetQcow2FilesystemPath();
+        }
+    }
+
+    string WorkSessionId => $"{gameObject.name}-{GetInstanceID()}";
+
+    /// <summary>Filesystem path to the bundled qemu-system-i386 binary.</summary>
+    public static string ResolveQemuExecutablePath()
+    {
+        string qemuExe = Path.Combine(
+            "Packages", "org.plunderludics.unityqemu", "qemu~", "qemu-system-i386.exe");
+        return Path.GetFullPath(qemuExe);
+    }
+
+    /// <summary>First line of <c>qemu-system-… --version</c>, or empty on failure.</summary>
+    public static string QueryBundledQemuVersion()
+    {
+        try
+        {
+            string exe = ResolveQemuExecutablePath();
+            if (!File.Exists(exe))
+                return "";
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = "--version",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            using (var p = Process.Start(psi))
+            {
+                if (p == null)
+                    return "";
+                string stdout = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(5000);
+                if (string.IsNullOrWhiteSpace(stdout))
+                    return "";
+                string line = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0];
+                return line.Trim();
+            }
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"Could not query QEMU version: {e.Message}");
+            return "";
+        }
+    }
+
+#if UNITY_EDITOR
+    /// <summary>UnityQemu package version from <c>package.json</c>, or empty.</summary>
+    public static string QueryUnityQemuPackageVersion()
+    {
+        try
+        {
+            string path = Path.GetFullPath(Path.Combine(
+                "Packages", "org.plunderludics.unityqemu", "package.json"));
+            if (!File.Exists(path))
+                return "";
+            var jo = JObject.Parse(File.ReadAllText(path));
+            return jo["version"]?.Value<string>() ?? "";
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"Could not read UnityQemu package version: {e.Message}");
+            return "";
+        }
+    }
+#else
+    public static string QueryUnityQemuPackageVersion() => "";
+#endif
+
+    void WarnIfSnapshotLaunchMetadataMismatched()
+    {
+        if (!HasVmState || overrideSnapshotLaunchConfig)
+            return;
+
+        UqsnapMetadata meta = diskAsset.uqsnapMetadata;
+        string snapArgs = meta?.launchConfig != null ? meta.launchConfig.extraQemuArgs : null;
+        if (string.IsNullOrWhiteSpace(snapArgs))
+        {
+            UnityEngine.Debug.LogWarning(
+                $"Disk '{diskAsset.name}' has no stored extra QEMU args — " +
+                "using the VirtualMachine Launch Config. Re-save the snapshot to record args.");
+            return;
+        }
+
+        string currentQemu = QueryBundledQemuVersion();
+        if (!string.IsNullOrEmpty(meta.qemuVersion) &&
+            !string.IsNullOrEmpty(currentQemu) &&
+            !string.Equals(meta.qemuVersion, currentQemu, StringComparison.Ordinal))
+        {
+            UnityEngine.Debug.LogWarning(
+                $"Disk '{diskAsset.name}' was saved with QEMU '{meta.qemuVersion}', " +
+                $"but this project has '{currentQemu}'. loadvm may fail if the versions are incompatible.");
+        }
+    }
+
+    /// <summary>
+    /// Ensure a work image exists for the configured disk (.uqsnap → byte-copy; else thin overlay).
     /// </summary>
     public string EnsureWorkOverlayForBoot()
     {
-        if (bootSnapshot != null)
-        {
-            if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
-                PrepareBootFromSnapshot(bootSnapshot);
-            return _workOverlayPath;
-        }
-
         if (diskAsset == null)
             return null;
+
+        if (ShouldByteCopyBoot)
+        {
+            if (!IsValidByteCopyWorkImage())
+                PrepareBootFromDisk(diskAsset, loadVmState: autoLoadVmState);
+            else
+                RepairWorkBackingHeader();
+            return _workOverlayPath;
+        }
 
         DiskOverlay.EnsureBackingChain(diskAsset);
         string basePath = diskAsset.GetQcow2FilesystemPath();
         if (string.IsNullOrEmpty(basePath) || !File.Exists(basePath))
         {
             UnityEngine.Debug.LogError(
-                $"DiskAsset '{diskAsset.name}' has no readable qcow2 at '{basePath}'");
+                $"DiskAsset '{diskAsset.name}' has no readable image at '{basePath}'");
             return null;
         }
 
-        // Keep a stable per-component session file so Restart reuses the same work disk
-        // unless durable load replaced it.
-        if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
+        if (!IsValidThinWorkOverlay(basePath))
         {
-            string sessionId = $"{gameObject.name}-{GetInstanceID()}";
-            _workOverlayPath = DiskOverlay.CreateWorkOverlay(basePath, sessionId);
+            _workOverlayPath = DiskOverlay.CreateWorkOverlay(basePath, WorkSessionId);
             UnityEngine.Debug.Log($"Work overlay: {_workOverlayPath} (base={basePath})");
         }
 
@@ -182,27 +399,117 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
-    /// Replace the work image with a byte-copy of a durable <c>.uqsnap</c> and request loadvm after next start.
-    /// This is a full copy (not a thin overlay on the snapshot), so the embedded savevm tag stays in the
-    /// top writable layer. Call while QEMU is stopped.
+    /// Thin work overlay must back onto the boot disk. Reject leftover work from a prior
+    /// .uqsnap session (byte-copy that backs onto a different parent) so switching back to
+    /// a plain base doesn't keep showing that child's guest disk.
     /// </summary>
-    public void PrepareBootFromSnapshot(SnapshotAsset snapshot)
+    bool IsValidThinWorkOverlay(string expectedBasePath)
     {
-        if (snapshot == null)
-            throw new ArgumentNullException(nameof(snapshot));
+        if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
+            return false;
+        if (string.IsNullOrEmpty(expectedBasePath))
+            return false;
 
-        string imagePath = snapshot.GetImageFilesystemPath();
+        try
+        {
+            string workBacking = DiskOverlay.GetBackingPath(_workOverlayPath);
+            if (DiskOverlay.PathsEqual(workBacking, expectedBasePath))
+                return true;
+
+            UnityEngine.Debug.Log(
+                $"UnityQemu: discarding work image (backs onto '{workBacking ?? "<none>"}', " +
+                $"expected thin overlay on '{expectedBasePath}').");
+            return false;
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu: could not inspect work overlay; recreating. {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when the work file is a byte-copy of the boot .uqsnap: it must back onto
+    /// <see cref="DiskAsset.backingDisk"/>, not onto the boot .uqsnap itself (thin overlay).
+    /// </summary>
+    bool IsValidByteCopyWorkImage()
+    {
+        if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
+            return false;
+
+        string expectedParent = ExpectedWorkBackingFilesystemPath;
+        if (string.IsNullOrEmpty(expectedParent))
+            return false;
+
+        try
+        {
+            string workBacking = DiskOverlay.GetBackingPath(_workOverlayPath);
+            if (DiskOverlay.PathsEqual(workBacking, expectedParent))
+                return true;
+
+            string bootPath = diskAsset.GetQcow2FilesystemPath();
+            if (DiskOverlay.PathsEqual(workBacking, bootPath))
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"UnityQemu: work image is a thin overlay on '{diskAsset.name}'. " +
+                    "Replacing with a byte-copy.");
+            }
+            return false;
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu: could not inspect work overlay; recreating. {e.Message}");
+            return false;
+        }
+    }
+
+    void RepairWorkBackingHeader()
+    {
+        string expected = ExpectedWorkBackingFilesystemPath;
+        if (string.IsNullOrEmpty(expected) || !File.Exists(expected))
+            return;
+        try
+        {
+            DiskOverlay.EnsureBackingMatches(_workOverlayPath, expected);
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu: could not repair work backing header: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replace the work image with a byte-copy of <paramref name="disk"/> and optionally request
+    /// loadvm after next start. Call while QEMU is stopped.
+    /// </summary>
+    public void PrepareBootFromDisk(DiskAsset disk, bool loadVmState = true)
+    {
+        if (disk == null)
+            throw new ArgumentNullException(nameof(disk));
+
+        string imagePath = disk.GetQcow2FilesystemPath();
         if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
-            throw new FileNotFoundException("Snapshot .uqsnap not found", imagePath);
+            throw new FileNotFoundException("Disk image not found", imagePath);
 
-        DiskOverlay.EnsureSnapshotBacking(snapshot);
-        string sessionId = $"{gameObject.name}-{GetInstanceID()}";
-        _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(imagePath, sessionId);
-        _pendingLoadVmTag = DiskOverlay.DurableSaveVmTag;
-        bootSnapshot = snapshot;
-        diskAsset = snapshot.backingDisk;
+        DiskOverlay.EnsureBackingChain(disk);
+        string expectedBacking = disk.backingDisk != null
+            ? disk.backingDisk.GetQcow2FilesystemPath()
+            : null;
+        _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(
+            imagePath, WorkSessionId, expectedBacking);
+        _workPreparedForNextStart = true;
+        _pendingLoadVmTag = loadVmState && disk.HasVmState
+            ? DiskOverlay.DurableSaveVmTag
+            : null;
+        diskAsset = disk;
+        if (disk.HasVmState && !overrideSnapshotLaunchConfig)
+            SyncLaunchConfigFromDiskMetadata();
         UnityEngine.Debug.Log(
-            $"Prepared boot from snapshot '{snapshot.name}' → {_workOverlayPath}");
+            $"Prepared boot from '{disk.name}' → {_workOverlayPath}" +
+            (_pendingLoadVmTag != null ? $" (loadvm {_pendingLoadVmTag})" : ""));
     }
 
     /// <summary>Queue a loadvm tag for the next successful QMP connect (cleared after attempt).</summary>
@@ -223,7 +530,8 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
-    /// Folder → <c>fat:floppy:rw:...</c>; otherwise filesystem path to the asset.
+    /// Folder → <c>fat:floppy:ro:...</c> (must be ro — drive is readonly for savevm);
+    /// otherwise filesystem path to the asset.
     /// </summary>
     static string ResolveFloppyFileSpec(UnityEngine.Object source)
     {
@@ -239,44 +547,242 @@ public class VirtualMachine : MonoBehaviour
 
         string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
         if (AssetDatabase.IsValidFolder(assetPath))
-            return $"fat:floppy:rw:{full.Replace('\\', '/')}";
+            return $"fat:floppy:ro:{full.Replace('\\', '/')}";
 
         return full;
     }
 
-    static void AppendCdromArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources)
+    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources)
     {
-        if (sources == null)
-            return;
-        foreach (var source in sources)
+        int index = 0;
+        if (sources != null)
         {
-            string path = ResolveObjectFilesystemPath(source);
-            if (string.IsNullOrEmpty(path))
-                continue;
+            foreach (var source in sources)
+            {
+                string fileSpec = ResolveFloppyFileSpec(source);
+                if (string.IsNullOrEmpty(fileSpec))
+                    continue;
+                // Must use if=floppy (A:/B:), not if=ide — IDE index 0 is already -hda.
+                // readonly so savevm/loadvm are not blocked by raw/vvfat.
+                args.Add("-drive");
+                args.Add($"file={fileSpec},if=floppy,index={index},format=raw,readonly=on");
+                index++;
+            }
+        }
+
+        // No launch-config floppy: reserve an empty tray so PeripheralsUI can hotplug via
+        // HMP `change`. null-co (1.44MB of zeros) satisfies QEMU 10's file= requirement;
+        // readonly so savevm/loadvm work.
+        if (index == 0)
+        {
             args.Add("-drive");
-            args.Add($"file={path},media=cdrom");
+            args.Add(
+                $"id={EmptyFloppyDriveId},if=floppy,index=0,format=raw,readonly=on," +
+                "file.driver=null-co,file.size=1474560");
         }
     }
 
-    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources)
+    /// <summary>
+    /// Folder → <c>fat:rw:...</c> vvfat disk (large FAT volume). Non-folders are ignored.
+    /// </summary>
+    static string ResolveHostFolderFileSpec(UnityEngine.Object source)
+    {
+        if (source == null)
+            return null;
+
+        string assetPath = AssetDatabase.GetAssetPath(source);
+        if (string.IsNullOrEmpty(assetPath))
+        {
+            UnityEngine.Debug.LogWarning($"Host folder '{source.name}' has no asset path.");
+            return null;
+        }
+
+        if (!AssetDatabase.IsValidFolder(assetPath))
+        {
+            UnityEngine.Debug.LogWarning(
+                $"Host folder entry '{assetPath}' is not a folder — drag a project folder for vvfat.");
+            return null;
+        }
+
+        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
+        return $"fat:rw:{full.Replace('\\', '/')}";
+    }
+
+    /// <summary>
+    /// Attach host folders as extra IDE disks (vvfat). Skips index 0 (-hda) and any
+    /// indices already taken by CD-ROMs.
+    /// </summary>
+    static void AppendHostFolderArgs(
+        System.Collections.Generic.IList<string> args,
+        UnityEngine.Object[] sources,
+        System.Collections.Generic.HashSet<int> usedIdeIndices)
     {
         if (sources == null)
             return;
-        int index = 0;
+
+        // Prefer leftover classic IDE units, then higher indices if QEMU exposes them.
+        int[] ideIndices = { 1, 3, 2, 4, 5 };
+        int attached = 0;
         foreach (var source in sources)
         {
-            string fileSpec = ResolveFloppyFileSpec(source);
+            string fileSpec = ResolveHostFolderFileSpec(source);
             if (string.IsNullOrEmpty(fileSpec))
                 continue;
+
+            int index = -1;
+            foreach (int candidate in ideIndices)
+            {
+                if (usedIdeIndices != null && usedIdeIndices.Contains(candidate))
+                    continue;
+                index = candidate;
+                break;
+            }
+
+            if (index < 0)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "UnityQemu: no free IDE index left for host folder " +
+                    $"'{source.name}' (CDs/disk already occupy the bus).");
+                continue;
+            }
+
+            usedIdeIndices?.Add(index);
             args.Add("-drive");
-            args.Add($"file={fileSpec},if=ide,index={index},format=raw,media=disk");
-            index++;
+            args.Add($"file={fileSpec},if=ide,index={index},format=raw");
+            attached++;
+        }
+
+        if (sources.Length > 0 && attached == 0)
+        {
+            UnityEngine.Debug.LogWarning(
+                "UnityQemu: no host folders attached — IDE slots exhausted by disk/CDs.");
         }
     }
 #else
-    static void AppendCdromArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources) { }
     static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources) { }
+    static void AppendHostFolderArgs(
+        System.Collections.Generic.IList<string> args,
+        UnityEngine.Object[] sources,
+        System.Collections.Generic.HashSet<int> usedIdeIndices) { }
+
+    static string InjectSmbShareIntoExtraArgs(string extraArgs, UnityEngine.Object smbFolder) =>
+        extraArgs ?? "";
 #endif
+
+#if UNITY_EDITOR
+    /// <summary>
+    /// Inject <c>smb=</c> into an existing <c>-netdev user,...</c> line, or append a user netdev.
+    /// Guest maps <c>\\10.0.2.4\qemu</c>.
+    /// </summary>
+    static string InjectSmbShareIntoExtraArgs(string extraArgs, UnityEngine.Object smbFolder)
+    {
+        if (smbFolder == null)
+            return extraArgs ?? "";
+
+        string assetPath = AssetDatabase.GetAssetPath(smbFolder);
+        if (string.IsNullOrEmpty(assetPath) || !AssetDatabase.IsValidFolder(assetPath))
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu SMB share '{smbFolder.name}' must be a project folder.");
+            return extraArgs ?? "";
+        }
+
+        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath))
+            .Replace('\\', '/');
+        if (full.IndexOfAny(new[] { ' ', '\t' }) >= 0)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu SMB path has spaces ('{full}'); QEMU arg splitting may break. " +
+                "Use a folder path without spaces.");
+        }
+
+        string extra = extraArgs ?? "";
+        var netdevUser = new Regex(@"-netdev\s+(user,[^\s\r\n]+)", RegexOptions.IgnoreCase);
+        Match m = netdevUser.Match(extra);
+        if (m.Success)
+        {
+            string opts = m.Groups[1].Value;
+            if (opts.IndexOf("smb=", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                opts = Regex.Replace(
+                    opts, @"smb=[^,]*", "smb=" + full, RegexOptions.IgnoreCase);
+            }
+            else
+            {
+                opts += ",smb=" + full;
+            }
+
+            return extra.Substring(0, m.Groups[1].Index) +
+                   opts +
+                   extra.Substring(m.Groups[1].Index + m.Groups[1].Length);
+        }
+
+        UnityEngine.Debug.LogWarning(
+            "UnityQemu: SMB share set but Extra Qemu Args has no '-netdev user,...'. " +
+            "Appending user netdev + rtl8139.");
+        return extra.TrimEnd() +
+               $"\n-netdev user,id=net0,smb={full}\n-device rtl8139,netdev=net0\n";
+    }
+#endif
+
+    static void AppendCdromArgs(
+        System.Collections.Generic.IList<string> args,
+        CdRomAsset[] sources,
+        System.Collections.Generic.HashSet<int> usedIdeIndices)
+    {
+        // Classic IDE: 0 = -hda. CDs prefer secondary channel (2, 3), then primary slave (1).
+        int[] ideIndices = { 2, 3, 1 };
+        int added = 0;
+        foreach (var source in sources ?? Array.Empty<CdRomAsset>())
+        {
+            if (source == null)
+                continue;
+            string path = source.GetIsoFilesystemPath();
+            if (string.IsNullOrEmpty(path))
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"CdRomAsset '{source.name}' has no readable ISO path");
+                continue;
+            }
+            if (!File.Exists(path))
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"CdRomAsset '{source.name}' ISO missing at '{path}'");
+                continue;
+            }
+            if (added >= ideIndices.Length)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "UnityQemu: at most 3 IDE CD drives (indices 2, 3, 1) with -hda on 0; " +
+                    $"skipping '{source.name}'.");
+                break;
+            }
+
+            int index = ideIndices[added];
+            usedIdeIndices?.Add(index);
+            args.Add("-drive");
+            args.Add(
+                $"id=unityqemu-cd{added},file={path},if=ide,index={index}," +
+                "media=cdrom,readonly=on");
+            added++;
+        }
+
+        // No launch-config CD: reserve an empty tray so PeripheralsUI can hotplug via
+        // HMP `change` without a restart.
+        if (added == 0)
+        {
+            usedIdeIndices?.Add(ideIndices[0]);
+            args.Add("-drive");
+            args.Add($"id={EmptyCdromDriveId},if=ide,index={ideIndices[0]},media=cdrom,readonly=on");
+        }
+    }
+
+    /// <summary>Block-device id of the empty CD tray reserved when launch config has no ISOs.
+    /// (Also the id of the first launch-config CD.)</summary>
+    public const string EmptyCdromDriveId = "unityqemu-cd0";
+
+    /// <summary>Block-device id of the empty floppy tray reserved when launch config has no floppies.</summary>
+    public const string EmptyFloppyDriveId = "unityqemu-fd0";
 
     /// <summary>
     /// Fired on the main thread after QEMU has started and VNC/QMP/GDB setup has finished
@@ -334,18 +840,31 @@ public class VirtualMachine : MonoBehaviour
         catch (Exception e) { UnityEngine.Debug.LogWarning($"Resume guest: {e.Message}"); }
     }
 
+    [Button("Reboot guest")]
+    [EnableIf(nameof(QmpConnected))]
+    [Tooltip(
+        "Hard-reset the guest via QMP system_reset (keeps the QEMU process). " +
+        "Does not loadvm — boots from the current disk/work image.")]
+    public async void RebootGuest()
+    {
+        try { await RebootAsync(); }
+        catch (Exception e) { UnityEngine.Debug.LogWarning($"Reboot guest: {e.Message}"); }
+    }
+
     bool CanPauseResume => QmpConnected || GdbConnected;
 
     void OnEnable()
     {
+        if (ShowLockedSnapshotLaunchConfig)
+            SyncLaunchConfigFromDiskMetadata();
 #if UNITY_EDITOR
-        // Avoid starting during the play-mode transition.
+        // Always drive edit-mode ticks while enabled; only skip auto-start during transitions.
+        EditorApplication.update -= EditorTick;
+        EditorApplication.update += EditorTick;
         if (EditorApplication.isPlayingOrWillChangePlaymode && !Application.isPlaying)
             return;
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
-        EditorApplication.update -= EditorTick;
-        EditorApplication.update += EditorTick;
 #endif
         TryAutoStart();
     }
@@ -360,9 +879,6 @@ public class VirtualMachine : MonoBehaviour
 
     void OnValidate()
     {
-        // Keep Disk Asset reflecting the boot snapshot's backing disk for inspector clarity.
-        if (bootSnapshot != null && bootSnapshot.backingDisk != null)
-            diskAsset = bootSnapshot.backingDisk;
 #if UNITY_EDITOR
         // Defer so we don't start processes during the OnValidate call stack.
         EditorApplication.delayCall -= OnValidateDeferred;
@@ -391,11 +907,11 @@ public class VirtualMachine : MonoBehaviour
 
     void EditorTick()
     {
-        // ExecuteAlways Update is sparse in edit mode; drive texture blit every editor tick.
-        if (!Application.isPlaying && runInEditMode && enabled && gameObject.activeInHierarchy)
-        {
-            Tick();
-        }
+        if (Application.isPlaying || !runInEditMode || !enabled || !gameObject.activeInHierarchy)
+            return;
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            return;
+        Tick();
     }
 #endif
 
@@ -424,15 +940,31 @@ public class VirtualMachine : MonoBehaviour
         {
             await StopQemuAsync();
         }
+
+        // Reclaim work images left behind by previous editor sessions (session ids embed
+        // instance ids, which change across restarts). Locked files (running QEMU) are skipped.
+        CleanupOrphanedWorkOverlays();
         // Use Path.Combine to take advantage of unity's dark magic (somehow redirects to the actual package location in packagecache if needed)
-        var qemuExe = Path.Combine("Packages", "org.plunderludics.unityqemu", "qemu~", "qemu-system-i386.exe");
-        qemuExe = Path.GetFullPath(qemuExe);
+        var qemuExe = ResolveQemuExecutablePath();
         // UnityEngine.Debug.Log($"QEMU executable: {qemuExe}");
+
+        WarnIfSnapshotLaunchMetadataMismatched();
 
         var process = new Process();
         process.StartInfo.FileName = qemuExe;
 
-        foreach (var arg in qemuArgs.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+        // Memory from effective launch config; extra args via EffectiveExtraQemuArgs so an
+        // empty uqsnap extraQemuArgs still falls back to the VM Launch Config (incl. sb16).
+        int memoryMb = EffectiveLaunchConfig?.ResolvedMemoryMb ?? LaunchConfig.DefaultMemoryMb;
+        string argsToUse = LaunchConfig.StripMemoryArgs(EffectiveExtraQemuArgs);
+
+        argsToUse = InjectSmbShareIntoExtraArgs(argsToUse, EffectiveSmbShareFolder);
+
+        process.StartInfo.ArgumentList.Add("-m");
+        process.StartInfo.ArgumentList.Add(memoryMb.ToString());
+
+        foreach (var arg in argsToUse.Split(
+                     new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
         {
             process.StartInfo.ArgumentList.Add(arg);
         }
@@ -443,15 +975,25 @@ public class VirtualMachine : MonoBehaviour
             process.StartInfo.ArgumentList.Add("sdl");
         }
 
+        // Every start boots a freshly minted work image (thin overlay or .uqsnap byte-copy).
+        // Exception: a boot prepared by the save/load pipeline (PrepareBootFromDisk) — that
+        // work file must be used as-is. Discarding the path forces recreation in
+        // EnsureWorkOverlayForBoot.
+        if (!_workPreparedForNextStart)
+            _workOverlayPath = null;
         string hdaPath = ResolveDiskImagePath();
+        _workPreparedForNextStart = false;
         if (!string.IsNullOrEmpty(hdaPath))
         {
             process.StartInfo.ArgumentList.Add("-hda");
             process.StartInfo.ArgumentList.Add(hdaPath);
         }
 
-        AppendCdromArgs(process.StartInfo.ArgumentList, cdroms);
-        AppendFloppyArgs(process.StartInfo.ArgumentList, floppies);
+        // IDE index 0 is -hda; CDs and host folders share the remaining units.
+        var usedIdeIndices = new System.Collections.Generic.HashSet<int> { 0 };
+        AppendCdromArgs(process.StartInfo.ArgumentList, EffectiveCdroms, usedIdeIndices);
+        AppendFloppyArgs(process.StartInfo.ArgumentList, EffectiveFloppies);
+        AppendHostFolderArgs(process.StartInfo.ArgumentList, EffectiveHostFolders, usedIdeIndices);
 
         // Add VNC display - :0 means display 0, which is port 5900
         // Format: -display vnc=:0
@@ -512,7 +1054,7 @@ public class VirtualMachine : MonoBehaviour
 
             string loadTag = _pendingLoadVmTag;
             _pendingLoadVmTag = null;
-            if (string.IsNullOrEmpty(loadTag) && bootSnapshot != null)
+            if (string.IsNullOrEmpty(loadTag) && HasVmState && autoLoadVmState)
                 loadTag = DiskOverlay.DurableSaveVmTag;
 
             if (!string.IsNullOrEmpty(loadTag))
@@ -563,7 +1105,9 @@ public class VirtualMachine : MonoBehaviour
             inputProvider = gameObject.AddComponent<BasicInputProvider>();
     }
 
-    void Update() {
+    void Update()
+    {
+        // Play mode: normal player loop. Edit mode relies on EditorTick (Update is sparse).
         if (Application.isPlaying)
             Tick();
     }
@@ -575,18 +1119,53 @@ public class VirtualMachine : MonoBehaviour
 
         _vncClient.Update();
 
-        if (_vncClient.Texture != null && outputTexture != null)
+        Texture2D src = _vncClient.Texture;
+        if (src != null)
         {
-            Graphics.Blit(_vncClient.Texture, outputTexture);
+            EnsureOutputTexture(src.width, src.height);
+            if (outputTexture != null)
+            {
+                Graphics.Blit(src, outputTexture);
 #if UNITY_EDITOR
-            if (!Application.isPlaying)
-                UnityEditor.EditorApplication.QueuePlayerLoopUpdate();
+                if (!Application.isPlaying)
+                {
+                    // Keep Scene/Game views and RT previews refreshing while QEMU runs in edit mode.
+                    EditorApplication.QueuePlayerLoopUpdate();
+                    SceneView.RepaintAll();
+                }
 #endif
+            }
         }
 
         // Unity Input is unreliable outside play mode.
         if (Application.isPlaying)
             inputProvider?.ProcessInput(this);
+    }
+
+    void EnsureOutputTexture(int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+            return;
+
+        if (outputTexture == null)
+        {
+            outputTexture = new RenderTexture(width, height, 0);
+            outputTexture.name = "QEMU Output";
+            outputTexture.Create();
+            return;
+        }
+
+        if (outputTexture.width == width && outputTexture.height == height)
+        {
+            if (!outputTexture.IsCreated())
+                outputTexture.Create();
+            return;
+        }
+
+        outputTexture.Release();
+        outputTexture.width = width;
+        outputTexture.height = height;
+        outputTexture.Create();
     }
 
     // x and y are pixel coordinates from top-left, in actual display resolution (or does the VNC framebuffer have different resolution?)
@@ -624,16 +1203,40 @@ public class VirtualMachine : MonoBehaviour
     {
         // Fire-and-forget sync stop on destroy (can't await here reliably).
         StopQemu();
+        // Session is over — reclaim the work image (these can be GBs). StopQemu waits up
+        // to 3s for exit; if the file is somehow still locked, the delete silently fails
+        // and the orphan sweep at the next start picks it up.
+        DiskOverlay.TryDeleteWorkFile(_workOverlayPath);
+        _workOverlayPath = null;
+    }
+
+    /// <summary>
+    /// Delete work images that belong to no VirtualMachine currently loaded (any scene,
+    /// active or not). Live VMs' files are kept even while stopped — a prepared boot
+    /// (save/load pipeline) must survive until StartQemuAsync consumes it.
+    /// </summary>
+    static void CleanupOrphanedWorkOverlays()
+    {
+        try
+        {
+            var activeSessionIds = new System.Collections.Generic.List<string>();
+            foreach (var vm in FindObjectsByType<VirtualMachine>(
+                         FindObjectsInactive.Include, FindObjectsSortMode.None))
+            {
+                activeSessionIds.Add(vm.WorkSessionId);
+            }
+            DiskOverlay.CleanupOrphanedWorkFiles(activeSessionIds);
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"UnityQemu: work-image cleanup failed: {e.Message}");
+        }
     }
 
     Task ConnectVncAsync()
     {
         _vncClient = new VncClient();
-        if (outputTexture == null)
-        {
-            outputTexture = new RenderTexture(640, 480, 0);
-            outputTexture.name = "QEMU Output";
-        }
+        EnsureOutputTexture(640, 480);
         return ConnectVncCoreAsync(_vncClient, vncPort - 5900);
     }
 
@@ -696,6 +1299,80 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
+    /// Removable / CD-like block device names from QMP <c>query-block</c>
+    /// (for HMP <c>change</c> / <c>eject</c>).
+    /// </summary>
+    public Task<string[]> QueryCdromDeviceNamesAsync() =>
+        QueryBlockDeviceNamesAsync(
+            include: (device, removable) =>
+                removable ||
+                string.Equals(device, EmptyCdromDriveId, StringComparison.OrdinalIgnoreCase) ||
+                device.IndexOf("cd", StringComparison.OrdinalIgnoreCase) >= 0,
+            score: device =>
+            {
+                if (string.Equals(device, EmptyCdromDriveId, StringComparison.OrdinalIgnoreCase))
+                    return 0;
+                return device.IndexOf("cd", StringComparison.OrdinalIgnoreCase) >= 0 ? 1 : 2;
+            });
+
+    /// <summary>
+    /// Floppy block device names from QMP <c>query-block</c>
+    /// (for HMP <c>change</c> / <c>eject</c>).
+    /// </summary>
+    public Task<string[]> QueryFloppyDeviceNamesAsync() =>
+        QueryBlockDeviceNamesAsync(
+            include: (device, removable) =>
+                string.Equals(device, EmptyFloppyDriveId, StringComparison.OrdinalIgnoreCase) ||
+                device.IndexOf("floppy", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                device.StartsWith("fd", StringComparison.OrdinalIgnoreCase),
+            score: device =>
+            {
+                if (string.Equals(device, EmptyFloppyDriveId, StringComparison.OrdinalIgnoreCase))
+                    return 0;
+                return device.IndexOf("floppy", StringComparison.OrdinalIgnoreCase) >= 0 ? 1 : 2;
+            });
+
+    /// <summary>
+    /// Filtered device names from QMP <c>query-block</c>, best match first.
+    /// </summary>
+    async Task<string[]> QueryBlockDeviceNamesAsync(
+        Func<string, bool, bool> include, Func<string, int> score)
+    {
+        if (_qmpClient == null || !_qmpClient.IsConnected)
+        {
+            throw new InvalidOperationException("QMP not connected (is enableQmp on, and is QEMU running?)");
+        }
+
+        JObject response = await _qmpClient.ExecuteCommandAsync("query-block");
+        JArray arr = response["return"] as JArray;
+        if (arr == null)
+            return Array.Empty<string>();
+
+        var names = new System.Collections.Generic.List<string>();
+        foreach (JToken entry in arr)
+        {
+            string device = entry["device"]?.Value<string>();
+            if (string.IsNullOrEmpty(device))
+                continue;
+
+            bool removable = entry["removable"]?.Value<bool>() ?? false;
+            if (!include(device, removable))
+                continue;
+
+            if (!names.Contains(device))
+                names.Add(device);
+        }
+
+        names.Sort((a, b) =>
+        {
+            int cmp = score(a).CompareTo(score(b));
+            return cmp != 0 ? cmp : string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+        });
+
+        return names.ToArray();
+    }
+
+    /// <summary>
     /// Guest RAM size in bytes from QMP <c>query-memory-size-summary</c>
     /// (<c>base-memory</c> + optional <c>plugged-memory</c>).
     /// </summary>
@@ -741,6 +1418,16 @@ public class VirtualMachine : MonoBehaviour
         else
             throw new InvalidOperationException("Neither QMP nor GDB connected");
 
+        _gdbClient?.NotifyRunningExternally();
+    }
+
+    /// <summary>
+    /// Hard-reset the guest without killing QEMU (QMP <c>system_reset</c>).
+    /// Does not <c>loadvm</c> — the guest reboots from the current disk/work image.
+    /// </summary>
+    public async Task RebootAsync()
+    {
+        await RunQmpAsync("system_reset");
         _gdbClient?.NotifyRunningExternally();
     }
 

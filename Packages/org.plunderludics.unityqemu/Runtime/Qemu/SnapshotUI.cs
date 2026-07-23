@@ -4,7 +4,6 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using TriInspector;
 using UnityEngine;
-using UnityEngine.Serialization;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -16,7 +15,6 @@ namespace UnityQemu {
 [ExecuteAlways]
 public class SnapshotUI : MonoBehaviour
 {
-    [FormerlySerializedAs("qemu")]
     public VirtualMachine virtualMachine;
 
     [Tooltip("Refresh the snapshot list when the QEMU emulator finishes starting")]

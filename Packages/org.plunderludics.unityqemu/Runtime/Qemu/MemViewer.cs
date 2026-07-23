@@ -1,5 +1,4 @@
 using UnityEngine;
-using UnityEngine.Serialization;
 using System.Text;
 using TriInspector;
 
@@ -10,7 +9,6 @@ namespace UnityQemu {
 [ExecuteAlways]
 public class MemViewer : MonoBehaviour
 {
-    [FormerlySerializedAs("qemu")]
     public VirtualMachine virtualMachine;
     public long startAddress = 0x0;
     public int length = 256;

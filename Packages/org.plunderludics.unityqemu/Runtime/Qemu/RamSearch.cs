@@ -6,7 +6,6 @@ using System.Linq;
 using System.Text;
 using TriInspector;
 using UnityEngine;
-using UnityEngine.Serialization;
 using UnityQemu;
 using Debug = UnityEngine.Debug;
 #if UNITY_EDITOR
@@ -33,7 +32,6 @@ public enum GuestMemoryScanScope { ActiveProcess, FullPhysicalRam }
 [DeclareHorizontalGroup("RAM search/candidates/maintain")]
 public class RamSearch : MonoBehaviour
 {
-    [FormerlySerializedAs("qemu")]
     public VirtualMachine virtualMachine;
 
     // --- Processes group ---

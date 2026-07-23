@@ -230,58 +230,37 @@ flowchart TD
   diskAsset --> workOverlay["Ephemeral work overlay in Library/"]
   snapSave["Save Snapshot"] --> savevm["savevm then copy work qcow2"]
   savevm --> snapFile["Immutable snapshot.qcow2"]
-  snapFile --> snapAsset["SnapshotAsset"]
+  snapFile --> snapAsset["DiskAsset + uqsnapMetadata"]
   snapLoad["Load Snapshot"] --> workOverlay
   workOverlay --> virtualMachine["VirtualMachine boots overlay"]
 ```
 
 ### DiskAsset
 
-ScriptableObject created by a custom `.qcow2` importer (or "Create from file…" menu).
+Main object of the custom `.qcow2` / `.uqsnap` importer (or "Create from file…" menu).
 
 | Field | Purpose |
 |---|---|
-| `basePath` | Absolute or project-relative path to immutable base qcow2 |
-| `label` | Display name (e.g. "Windows 95") |
-| `recommendedRamMiB` | Hint for `VirtualMachine` args |
+| `projectRelativeQcow2Path` | Path to the immutable image under Assets |
+| `backingDisk` | Immediate parent `DiskAsset` (qcow2 backing file) |
+| `uqsnapMetadata` / `hasUqsnapMetadata` | Set for `.uqsnap` (savevm + launch config); flag clear for plain disks |
+| `label` / `note` | Display name and freeform annotation |
 
-The `.qcow2` file under Assets is a **handle only** — on first import, the importer copies or references the base and ensures it is never written to at runtime.
-
-### SnapshotAsset
-
-ScriptableObject referencing one durable snapshot qcow2 (D2).
-
-| Field | Purpose |
-|---|---|
-| `snapshotPath` | Path to the immutable snapshot overlay copy |
-| `parentDisk` | Which `DiskAsset` / base this snapshot depends on |
-| `createdAt` | Timestamp |
-| `note` | User annotation |
-
-Drag onto `VirtualMachine` or pick from a snapshot list to load.
+The image under Assets is **immutable** — QEMU only writes ephemeral Library work images.
 
 ### Runtime layout (D2)
 
 ```
 Assets/
-  Qemu Disks/
-    Windows 95.asset          ← DiskAsset (tiny, Unity-managed)
-    Snapshots/
-      Level 3.asset           ← SnapshotAsset
-      Boss Fight.asset
+  qemu/disk/win95.qcow2           ← DiskAsset (uqsnapMetadata = null)
+  qemu/Snapshots/level-3.uqsnap   ← DiskAsset (uqsnapMetadata set)
 
 Library/UnityQemu/
-  bases/
-    win95.qcow2               ← immutable; read-only; may be shared by many VMs
   work/
-    win95-session-A.qcow2     ← ephemeral overlay for one VirtualMachine
-    win95-session-B.qcow2     ← another VM can share the same base concurrently
-  snapshots/
-    level-3.qcow2             ← durable copy with embedded savevm tag
-    boss-fight.qcow2
+    …-session.qcow2               ← ephemeral work image for one VirtualMachine
 ```
 
-Unity watches only the `.asset` files. All mutable and large data lives under `Library/`, which is already gitignored and not reimported.
+Mutable session data lives under `Library/`, which is gitignored and not reimported.
 
 ### Snapshot file format (D2 draft)
 
@@ -384,7 +363,7 @@ Do **not** implement yet — notes only. Revisit when ready to build Phase 1.
 | One file ≈ one snapshot | Snapshot qcow2 copy embeds `savevm` state |
 | Survive corruption | Durable snapshots are immutable copies; work is disposable |
 | Avoid broken migrate | Uses only `savevm`/`loadvm` |
-| Unity drag-and-drop | `DiskAsset` / `SnapshotAsset` are tiny ScriptableObjects |
+| Unity drag-and-drop | `DiskAsset` (plain or `.uqsnap`) is a thin ScriptableObject |
 | Shared bases | Multiple VMs / overlays can read the same immutable base |
 
 ### Implementation phases (future work — not started)
@@ -392,7 +371,7 @@ Do **not** implement yet — notes only. Revisit when ready to build Phase 1.
 1. **Phase 1 — Disk asset wrapper:** `DiskAsset`, custom importer, auto work-overlay in `Library/`, wire into [VirtualMachine.cs](../Runtime/Qemu/VirtualMachine.cs).
 2. **Phase 2 — Durable save:** Pause → `savevm` → atomic copy of work overlay to snapshot path.
 3. **Phase 3 — Durable load:** Copy snapshot → work overlay → restart VM → `loadvm`.
-4. **Phase 4 — Snapshot asset + UI:** `SnapshotAsset`, inspector list, replace or augment [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
+4. **Phase 4 — Snapshot UI:** durable save/load via [DurableSnapshotUI.cs](../Runtime/Qemu/DurableSnapshotUI.cs); keep HMP list in [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
 5. **Phase 5 — Polish:** Quick slots, flatten-on-export, multi-disk, size optimization.
 6. **Optional later:** Re-test Approach D (`migrate`) on a newer QEMU; keep D2 as the default if migrate remains unreliable.
 

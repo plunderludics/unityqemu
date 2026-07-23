@@ -2,7 +2,6 @@ using System;
 using System.Threading.Tasks;
 using TriInspector;
 using UnityEngine;
-using UnityEngine.Serialization;
 
 namespace UnityQemu {
 /// <summary>
@@ -11,7 +10,6 @@ namespace UnityQemu {
 [ExecuteAlways]
 public class MonitorUI : MonoBehaviour
 {
-    [FormerlySerializedAs("qemu")]
     public VirtualMachine virtualMachine;
 
 #if UNITY_EDITOR

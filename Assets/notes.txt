@@ -48,3 +48,17 @@
 # Internet connection (win xp)
  -netdev user,id=net0
 -device rtl8139,netdev=net0
+
+# For better mouse tracking:
+    -usb -device usb-tablet
+
+# Grow a durable snapshot's virtual disk (QEMU must be stopped). Guest still needs
+# GParted (or similar) afterward to expand the NTFS partition into the new space.
+# Example — Halo.uqsnap → 4 GiB (only that tip; base/other snaps unchanged):
+# qemu-img.exe resize Assets/qemu/Snapshots/Halo.uqsnap 4G
+# Then reload that .uqsnap so the Library work copy is re-copied from the grown image.
+
+# New large empty overlay on base (not via Desktop):
+# qemu-img.exe create -f qcow2 -b ../disk/winXP/winxp.qcow2 -F qcow2 Assets/qemu/Snapshots/winxp-8gb.uqsnap
+# qemu-img.exe resize Assets/qemu/Snapshots/winxp-8gb.uqsnap 8G
+# Chain: winxp.qcow2 <- winxp-8gb.uqsnap (thin). Then GParted to grow C:.

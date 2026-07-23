@@ -2,14 +2,21 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
 
 namespace UnityQemu {
 /// <summary>
-/// Helpers for ephemeral work overlays and atomic qcow2 copies.
+/// Ephemeral work images and qcow2 helpers for the D2 snapshot model.
+/// <list type="bullet">
+/// <item>Assets images are immutable; only <see cref="WorkDirectory"/> files are written by QEMU.</item>
+/// <item>.uqsnap boot = byte-copy into work (never a thin overlay on the .uqsnap).</item>
+/// <item>Relative backing is OK for siblings under Assets/; work images always use absolute backing.</item>
+/// </list>
 /// </summary>
 public static class DiskOverlay
 {
@@ -25,6 +32,16 @@ public static class DiskOverlay
             Directory.CreateDirectory(dir);
             return dir;
         }
+    }
+
+    public static bool IsUnderWorkDirectory(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+        string workDir = Path.GetFullPath(WorkDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        return Path.GetFullPath(path).StartsWith(workDir, StringComparison.OrdinalIgnoreCase);
     }
 
     public static string GetQemuImgPath()
@@ -45,9 +62,8 @@ public static class DiskOverlay
         if (string.IsNullOrEmpty(overlayPath))
             throw new ArgumentException("overlayPath required");
 
-        string qemuImg = GetQemuImgPath();
-        if (!File.Exists(qemuImg))
-            throw new FileNotFoundException("qemu-img not found", qemuImg);
+        if (!File.Exists(GetQemuImgPath()))
+            throw new FileNotFoundException("qemu-img not found", GetQemuImgPath());
 
         string overlayDir = Path.GetDirectoryName(overlayPath);
         if (!string.IsNullOrEmpty(overlayDir))
@@ -56,45 +72,113 @@ public static class DiskOverlay
         if (File.Exists(overlayPath))
             File.Delete(overlayPath);
 
-        // Prefer a relative backing path so the pair stays movable when kept together.
-        string backing = MakeRelativePath(overlayDir ?? ".", baseQcow2Path);
-        if (string.IsNullOrEmpty(backing) || backing.Contains(".."))
-            backing = Path.GetFullPath(baseQcow2Path);
-
-        // qemu-img on Windows accepts forward slashes.
-        backing = backing.Replace('\\', '/');
-
+        string backing = PreferBackingFileArgument(overlayPath, baseQcow2Path);
         RunQemuImg("create", "-f", "qcow2", "-b", backing, "-F", "qcow2", overlayPath);
     }
 
     /// <summary>
-    /// Create a fresh work overlay under Library/UnityQemu/work for the given session id.
+    /// Create a fresh thin work overlay under Library/UnityQemu/work for the given session id.
     /// </summary>
     public static string CreateWorkOverlay(string baseQcow2Path, string sessionId)
     {
-        if (string.IsNullOrEmpty(sessionId))
-            sessionId = Guid.NewGuid().ToString("N");
-        string safe = SanitizeFileName(sessionId);
-        string overlayPath = Path.Combine(WorkDirectory, $"{safe}.qcow2");
+        string overlayPath = WorkOverlayPathForSession(sessionId);
         CreateOverlay(baseQcow2Path, overlayPath);
         return overlayPath;
     }
 
     /// <summary>
-    /// Replace work overlay contents with a copy of an existing qcow2 (e.g. durable snapshot image).
+    /// Replace the work image with a byte-copy of <paramref name="sourceQcow2Path"/>.
+    /// If <paramref name="expectedBackingPath"/> is set, rewrite the header afterward so a
+    /// same-folder relative backing from Assets/ still resolves from the work directory.
     /// </summary>
-    public static string ReplaceWorkOverlayFromCopy(string sourceQcow2Path, string sessionId)
+    public static string ReplaceWorkOverlayFromCopy(
+        string sourceQcow2Path,
+        string sessionId,
+        string expectedBackingPath = null)
     {
         if (string.IsNullOrEmpty(sourceQcow2Path) || !File.Exists(sourceQcow2Path))
             throw new FileNotFoundException("Source qcow2 not found", sourceQcow2Path);
 
+        string overlayPath = WorkOverlayPathForSession(sessionId);
+        CopyAtomic(sourceQcow2Path, overlayPath);
+
+        if (!string.IsNullOrEmpty(expectedBackingPath))
+            EnsureBackingMatches(overlayPath, expectedBackingPath);
+
+        return overlayPath;
+    }
+
+    static string WorkOverlayPathForSession(string sessionId)
+    {
         if (string.IsNullOrEmpty(sessionId))
             sessionId = Guid.NewGuid().ToString("N");
-        string safe = SanitizeFileName(sessionId);
-        string overlayPath = Path.Combine(WorkDirectory, $"{safe}.qcow2");
         Directory.CreateDirectory(WorkDirectory);
-        CopyAtomic(sourceQcow2Path, overlayPath);
-        return overlayPath;
+        return Path.Combine(WorkDirectory, $"{SanitizeFileName(sessionId)}.qcow2");
+    }
+
+    /// <summary>
+    /// Best-effort delete of a work image and its <c>.tmp</c> leftover.
+    /// No-op for paths outside the work directory.
+    /// </summary>
+    public static void TryDeleteWorkFile(string path)
+    {
+        if (!IsUnderWorkDirectory(path))
+            return;
+        TryDeleteFile(path);
+        TryDeleteFile(path + ".tmp");
+    }
+
+    /// <summary>
+    /// Delete work images (and .tmp leftovers) that belong to none of the given live
+    /// sessions — e.g. files from previous editor sessions, whose instance-id-based names
+    /// no longer match any VirtualMachine. Files still open in a running QEMU fail the
+    /// delete and are skipped; they get another chance on the next sweep.
+    /// </summary>
+    public static void CleanupOrphanedWorkFiles(IEnumerable<string> activeSessionIds)
+    {
+        var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (activeSessionIds != null)
+        {
+            foreach (string id in activeSessionIds)
+            {
+                if (!string.IsNullOrEmpty(id))
+                    keep.Add(Path.GetFileName(WorkOverlayPathForSession(id)));
+            }
+        }
+
+        foreach (string file in Directory.GetFiles(WorkDirectory))
+        {
+            string name = Path.GetFileName(file);
+            bool isTmp = name.EndsWith(".qcow2.tmp", StringComparison.OrdinalIgnoreCase);
+            if (!isTmp && !name.EndsWith(".qcow2", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string qcow2Name = isTmp ? name.Substring(0, name.Length - ".tmp".Length) : name;
+            if (keep.Contains(qcow2Name))
+                continue;
+
+            if (TryDeleteFile(file))
+                UnityEngine.Debug.Log($"UnityQemu: deleted orphaned work image {name}");
+        }
+    }
+
+    static bool TryDeleteFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return false;
+            File.Delete(path);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false; // still open (running QEMU) — retried on a later sweep
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Copy file via temp + rename so readers never see a partial destination.</summary>
@@ -123,27 +207,6 @@ public static class DiskOverlay
     public static void EnsureBackingChain(DiskAsset disk)
     {
         EnsureBackingChain(disk, new HashSet<DiskAsset>());
-    }
-
-    /// <summary>
-    /// Validate/repair a .uqsnap's backing header against <see cref="SnapshotAsset.backingDisk"/>,
-    /// then walk that disk's chain.
-    /// </summary>
-    public static void EnsureSnapshotBacking(SnapshotAsset snapshot)
-    {
-        if (snapshot == null)
-            throw new ArgumentNullException(nameof(snapshot));
-        if (snapshot.backingDisk == null)
-        {
-            string message =
-                $"UnityQemu snapshot '{snapshot.name}' has no backingDisk reference";
-            Debug.LogWarning(message);
-            throw new InvalidOperationException(message);
-        }
-
-        string imagePath = snapshot.GetImageFilesystemPath();
-        EnsureBackingChain(snapshot.backingDisk);
-        EnsureBackingMatches(imagePath, snapshot.backingDisk.GetQcow2FilesystemPath());
     }
 
     static void EnsureBackingChain(DiskAsset disk, HashSet<DiskAsset> visited)
@@ -209,64 +272,107 @@ public static class DiskOverlay
             disk.backingDisk.GetQcow2FilesystemPath());
     }
 
-    /// <summary>Repair an overlay's qcow2 backing path from its Unity asset reference.</summary>
+    /// <summary>
+    /// Header-only repair so <paramref name="overlayPath"/> names
+    /// <paramref name="expectedBackingPath"/> (junctions / relative→absolute after work copy).
+    /// </summary>
     public static void EnsureBackingMatches(string overlayPath, string expectedBackingPath)
     {
         if (string.IsNullOrEmpty(overlayPath) || !File.Exists(overlayPath))
-        {
-            Debug.LogWarning($"UnityQemu cannot validate missing overlay qcow2 '{overlayPath}'");
             throw new FileNotFoundException("Overlay qcow2 not found", overlayPath);
-        }
         if (string.IsNullOrEmpty(expectedBackingPath) || !File.Exists(expectedBackingPath))
-        {
-            Debug.LogWarning(
-                $"UnityQemu cannot validate '{overlayPath}': expected backing qcow2 " +
-                $"was not found at '{expectedBackingPath}'");
             throw new FileNotFoundException("Expected backing qcow2 not found", expectedBackingPath);
-        }
 
         overlayPath = Path.GetFullPath(overlayPath);
         expectedBackingPath = Path.GetFullPath(expectedBackingPath);
-        string actualBackingPath;
-        try
-        {
-            actualBackingPath = GetBackingPath(overlayPath);
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning(
-                $"UnityQemu could not inspect backing path for '{overlayPath}'. " +
-                $"The image was not started. {e.Message}");
-            throw;
-        }
+
+        string actualBackingPath = GetBackingPath(overlayPath);
         if (PathsEqual(actualBackingPath, expectedBackingPath))
             return;
 
         Debug.LogWarning(
             $"UnityQemu backing path mismatch for '{overlayPath}'. " +
-            $"qcow2 header='{actualBackingPath ?? "<none>"}', Unity asset='{expectedBackingPath}'. " +
-            "Attempting qemu-img rebase -u repair.");
+            $"qcow2 header='{actualBackingPath ?? "<none>"}', expected='{expectedBackingPath}'. " +
+            "Rewriting header with qemu-img rebase -u.");
 
-        try
+        RebaseOnto(overlayPath, expectedBackingPath, unsafeHeaderOnly: true);
+        string repaired = GetBackingPath(overlayPath);
+        if (!PathsEqual(repaired, expectedBackingPath))
+            throw new InvalidOperationException(
+                $"qemu-img rebase -u left backing as '{repaired ?? "<none>"}' " +
+                $"(expected '{expectedBackingPath}')");
+    }
+
+    /// <summary>
+    /// Content-aware rebase so <paramref name="overlayPath"/> backs onto
+    /// <paramref name="newBackingPath"/> with the same guest-visible bytes.
+    /// Requires the previous backing file to still exist. Preserves savevm tags when QEMU allows.
+    /// </summary>
+    public static void FlattenOnto(string overlayPath, string newBackingPath)
+    {
+        RebaseOnto(overlayPath, newBackingPath, unsafeHeaderOnly: false);
+        if (!HasInternalSnapshot(overlayPath, DurableSaveVmTag))
+        {
+            throw new InvalidOperationException(
+                $"Full rebase onto '{newBackingPath}' dropped the savevm tag '{DurableSaveVmTag}'.");
+        }
+        EnsureBackingMatches(overlayPath, newBackingPath);
+    }
+
+    /// <summary>
+    /// Change <paramref name="overlayPath"/>'s backing file.
+    /// Full rebase compares clusters; <paramref name="unsafeHeaderOnly"/> only rewrites the path.
+    /// QEMU must not have the image open.
+    /// </summary>
+    public static void RebaseOnto(
+        string overlayPath, string newBackingPath, bool unsafeHeaderOnly = false)
+    {
+        if (string.IsNullOrEmpty(overlayPath) || !File.Exists(overlayPath))
+            throw new FileNotFoundException("Overlay qcow2 not found", overlayPath);
+        if (string.IsNullOrEmpty(newBackingPath) || !File.Exists(newBackingPath))
+            throw new FileNotFoundException("New backing qcow2 not found", newBackingPath);
+
+        // Refuse obvious self-backing (full rebase stack-overflows on Windows).
+        if (PathsEqual(overlayPath, newBackingPath))
+            throw new InvalidOperationException(
+                $"Cannot rebase '{overlayPath}' onto itself.");
+
+        overlayPath = Path.GetFullPath(overlayPath);
+        string backingArg = PreferBackingFileArgument(overlayPath, newBackingPath);
+
+        if (unsafeHeaderOnly)
         {
             RunQemuImg(
                 "rebase", "-u", "-f", "qcow2",
-                "-b", expectedBackingPath, "-F", "qcow2", overlayPath);
-            string repairedBackingPath = GetBackingPath(overlayPath);
-            if (!PathsEqual(repairedBackingPath, expectedBackingPath))
-                throw new InvalidOperationException(
-                    $"qemu-img completed but backing path is still '{repairedBackingPath ?? "<none>"}'");
+                "-b", backingArg, "-F", "qcow2", overlayPath);
+            return;
         }
-        catch (Exception e)
-        {
-            Debug.LogWarning(
-                $"UnityQemu could not repair backing path for '{overlayPath}'. " +
-                $"The image was not started. {e.Message}");
-            throw;
-        }
+
+        RunQemuImg(
+            600_000,
+            "rebase", "-f", "qcow2",
+            "-b", backingArg, "-F", "qcow2", overlayPath);
     }
 
-    /// <summary>Return the fully resolved backing filename in a qcow2 header, or null for a base image.</summary>
+    /// <summary>True if <paramref name="imagePath"/> has an internal snapshot named <paramref name="tag"/>.</summary>
+    public static bool HasInternalSnapshot(string imagePath, string tag)
+    {
+        if (string.IsNullOrEmpty(imagePath) || string.IsNullOrEmpty(tag))
+            return false;
+        string json = RunQemuImg("info", "--output=json", imagePath);
+        var info = JObject.Parse(json);
+        var snapshots = info["snapshots"] as JArray;
+        if (snapshots == null)
+            return false;
+        foreach (var snap in snapshots)
+        {
+            if (string.Equals((string)snap["name"], tag, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Fully resolved backing filename, or null for a base image.</summary>
     public static string GetBackingPath(string imagePath)
     {
         string json = RunQemuImg("info", "--output=json", imagePath);
@@ -284,17 +390,129 @@ public static class DiskOverlay
         return Path.GetFullPath(Path.Combine(imageDir, backing));
     }
 
-    static bool PathsEqual(string a, string b)
+    /// <summary>
+    /// True if both paths name the same file, including Windows junctions
+    /// (volume serial + file index).
+    /// </summary>
+    public static bool PathsEqual(string a, string b)
     {
         if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
             return string.Equals(a, b, StringComparison.Ordinal);
-        return string.Equals(
-            Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-            Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-            StringComparison.OrdinalIgnoreCase);
+        string fa = NormalizePathForCompare(a);
+        string fb = NormalizePathForCompare(b);
+        if (string.Equals(fa, fb, StringComparison.OrdinalIgnoreCase))
+            return true;
+        return SameFilesystemObject(fa, fb);
     }
 
-    static string RunQemuImg(params string[] arguments)
+    static string NormalizePathForCompare(string path) =>
+        Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    /// <summary>
+    /// Backing argument for qemu-img: relative only when parent is a same-folder sibling
+    /// under Assets (junction-friendly). Always absolute for work images.
+    /// </summary>
+    static string PreferBackingFileArgument(string overlayPath, string backingPath)
+    {
+        overlayPath = Path.GetFullPath(overlayPath);
+        backingPath = Path.GetFullPath(backingPath);
+
+        if (IsUnderWorkDirectory(overlayPath))
+            return backingPath.Replace('\\', '/');
+
+        string overlayDir = Path.GetDirectoryName(overlayPath) ?? ".";
+        string backing = MakeRelativePath(overlayDir, backingPath);
+        if (string.IsNullOrEmpty(backing) || backing.Contains(".."))
+            backing = backingPath;
+        return backing.Replace('\\', '/');
+    }
+
+    static bool SameFilesystemObject(string pathA, string pathB)
+    {
+        if (!File.Exists(pathA) || !File.Exists(pathB))
+            return false;
+
+        if (Application.platform != RuntimePlatform.WindowsEditor &&
+            Application.platform != RuntimePlatform.WindowsPlayer)
+            return false;
+
+        try
+        {
+            return SameFileByWindowsFileId(pathA, pathB);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"UnityQemu: file-identity compare failed: {e.Message}");
+            return false;
+        }
+    }
+
+    static bool SameFileByWindowsFileId(string pathA, string pathB)
+    {
+        using (SafeFileHandle handleA = OpenForFileId(pathA))
+        using (SafeFileHandle handleB = OpenForFileId(pathB))
+        {
+            if (handleA.IsInvalid || handleB.IsInvalid)
+                return false;
+            if (!GetFileInformationByHandle(handleA, out BY_HANDLE_FILE_INFORMATION infoA))
+                return false;
+            if (!GetFileInformationByHandle(handleB, out BY_HANDLE_FILE_INFORMATION infoB))
+                return false;
+            return infoA.VolumeSerialNumber == infoB.VolumeSerialNumber &&
+                   infoA.FileIndexHigh == infoB.FileIndexHigh &&
+                   infoA.FileIndexLow == infoB.FileIndexLow;
+        }
+    }
+
+    static SafeFileHandle OpenForFileId(string path) =>
+        CreateFileW(
+            path,
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            0,
+            IntPtr.Zero);
+
+    const uint FileReadAttributes = 0x0080;
+    const uint FileShareRead = 0x0001;
+    const uint FileShareWrite = 0x0002;
+    const uint FileShareDelete = 0x0004;
+    const uint OpenExisting = 3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    static string RunQemuImg(params string[] arguments) =>
+        RunQemuImg(120_000, arguments);
+
+    static string RunQemuImg(int timeoutMs, params string[] arguments)
     {
         string qemuImg = GetQemuImgPath();
         var psi = new ProcessStartInfo
@@ -314,11 +532,19 @@ public static class DiskOverlay
                 throw new Exception("Failed to start qemu-img");
             string stdout = p.StandardOutput.ReadToEnd();
             string stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(120_000);
+            if (!p.WaitForExit(timeoutMs))
+            {
+                try { p.Kill(); } catch { /* ignore */ }
+                throw new TimeoutException(
+                    $"qemu-img timed out after {timeoutMs}ms: {string.Join(" ", arguments)}");
+            }
             if (p.ExitCode != 0)
             {
+                string exitHint = p.ExitCode < 0
+                    ? $"qemu-img crashed ({p.ExitCode} / 0x{(uint)p.ExitCode:X8})"
+                    : $"qemu-img failed ({p.ExitCode})";
                 throw new Exception(
-                    $"qemu-img failed ({p.ExitCode}): {string.Join(" ", arguments)}\n{stdout}\n{stderr}");
+                    $"{exitHint}: {string.Join(" ", arguments)}\n{stdout}\n{stderr}");
             }
             if (!string.IsNullOrWhiteSpace(stdout) &&
                 (arguments.Length == 0 || arguments[0] != "info"))
@@ -350,9 +576,8 @@ public static class DiskOverlay
                 from += Path.DirectorySeparatorChar;
             var fromUri = new Uri(from);
             var toUri = new Uri(Path.GetFullPath(toFile));
-            string rel = Uri.UnescapeDataString(fromUri.MakeRelativeUri(toUri).ToString())
+            return Uri.UnescapeDataString(fromUri.MakeRelativeUri(toUri).ToString())
                 .Replace('/', Path.DirectorySeparatorChar);
-            return rel;
         }
         catch
         {
