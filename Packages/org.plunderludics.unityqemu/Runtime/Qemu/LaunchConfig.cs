@@ -44,22 +44,20 @@ public class LaunchConfig
     public CdRomAsset[] cdroms;
 
     [Tooltip(
-        "Floppy sources for guest A:/B: (tiny ~1.44MB vvfat or .img, attached read-only " +
-        "so savevm/loadvm keep working). When empty, an empty A: tray is still reserved " +
-        "so PeripheralsUI can hot-insert without a restart. " +
+        "Floppy images or small folders for guest A:/B: (read-only). When empty, an empty " +
+        "A: tray is still reserved so you can insert media from Peripherals without a restart. " +
         "For larger or writable shares prefer Host Folders or SMB.")]
     public UnityEngine.Object[] floppies;
 
     [Tooltip(
-        "Host folders shared into the guest as extra IDE disks via QEMU vvfat " +
-        "(fat:rw:…). Snapshot of folder at boot/attach — not a live sync. " +
-        "Drag a project folder here.")]
-    [LabelText("Host Folders (vvfat)")]
+        "Host folders shared into the guest as extra disks. " +
+        "Contents are fixed at boot/attach (not a live sync). Drag a project folder here.")]
+    [LabelText("Host Folders")]
     public UnityEngine.Object[] hostFolders;
 
     [Tooltip(
-        "Project folder exported over QEMU user-mode SMB (live-ish network share). " +
-        "Requires -netdev user in Extra Qemu Args (default has it). " +
+        "Project folder shared over the guest network (SMB). " +
+        "Requires a user-mode network device in Extra Qemu Args (the default has one). " +
         "In the guest open \\\\10.0.2.4\\qemu")]
     [LabelText("SMB Share Folder")]
     public UnityEngine.Object smbShareFolder;

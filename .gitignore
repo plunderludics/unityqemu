@@ -6,6 +6,8 @@
 /Packages/org.plunderludics.unityqemu/qemu~/
 /Assets/qemu/
 
+# Ignore agent files
+.agent/
 b.sh
 UnityAgentBridge/
 

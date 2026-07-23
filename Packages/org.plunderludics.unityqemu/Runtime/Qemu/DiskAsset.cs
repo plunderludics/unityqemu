@@ -29,14 +29,38 @@ public class DiskAsset : ScriptableObject
     [Tooltip("Immediate backing image (qcow2 header). Empty for a standalone/base image.")]
     public DiskAsset backingDisk;
 
-    [Tooltip("True for .uqsnap durable snapshots (embedded savevm + launch metadata).")]
+    [Tooltip("True for durable snapshots (.uqsnap). Plain disks leave this clear.")]
     public bool hasUqsnapMetadata;
 
-    [Tooltip("savevm + launch metadata for durable snapshots. Meaningful only when hasUqsnapMetadata is set.")]
+    [Tooltip("Launch config and version metadata for durable snapshots. Used when hasUqsnapMetadata is set.")]
     public UqsnapMetadata uqsnapMetadata;
 
     /// <summary>True when this asset is a durable snapshot.</summary>
     public bool HasVmState => hasUqsnapMetadata;
+
+    /// <summary>Suffix appended to the .uqsnap path for the D4 compressed vmstate sidecar.</summary>
+    public const string VmStateSidecarSuffix = ".vmstate";
+
+    /// <summary>Filesystem path of the D4 vmstate sidecar (whether or not it exists).</summary>
+    public string GetVmStateSidecarPath()
+    {
+        string imagePath = GetQcow2FilesystemPath();
+        return string.IsNullOrEmpty(imagePath) ? null : imagePath + VmStateSidecarSuffix;
+    }
+
+    /// <summary>
+    /// True when a D4 vmstate sidecar exists on disk. D4 snapshots boot as a thin
+    /// overlay + incoming migration; sidecar-less .uqsnaps use the legacy
+    /// byte-copy + loadvm path (embedded savevm).
+    /// </summary>
+    public bool HasVmStateSidecar
+    {
+        get
+        {
+            string sidecar = GetVmStateSidecarPath();
+            return !string.IsNullOrEmpty(sidecar) && File.Exists(sidecar);
+        }
+    }
 
     /// <summary>Filesystem path to the immutable image bytes.</summary>
     public string GetQcow2FilesystemPath()

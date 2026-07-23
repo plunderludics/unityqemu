@@ -44,7 +44,7 @@ public static class SnapshotTreeGUI
 
             EditorGUILayout.Space(2);
             EditorGUILayout.LabelField(
-                "▣ disk   ○ snapshot   ★ this asset — click: select, right-click: Project menu.",
+                "▣ disk   ○ snapshot   ★ this asset — click to select, right-click for more.",
                 EditorStyles.miniLabel);
         }
         EditorGUILayout.Space(4);
@@ -63,7 +63,7 @@ public static class SnapshotTreeGUI
             kind: isSnap ? NodeKind.Snapshot : NodeKind.Disk,
             label: node.DisplayLabel,
             tooltip: AssetDatabase.GetAssetPath(node),
-            sizeLabel: FormatFileSize(node.GetQcow2FilesystemPath()),
+            sizeLabel: FormatNodeSize(node),
             depth: depth,
             isLast: isLast,
             ancestorLast: ancestorLast,
@@ -177,20 +177,24 @@ public static class SnapshotTreeGUI
             kind == NodeKind.Disk ? _diskKindBadge : _snapKindBadge);
     }
 
-    public static string FormatFileSize(string filesystemPath)
+    /// <summary>Image file size, plus the .vmstate sidecar's when the snapshot has one.</summary>
+    static string FormatNodeSize(DiskAsset node)
     {
-        if (string.IsNullOrEmpty(filesystemPath) || !File.Exists(filesystemPath))
+        string imagePath = node.GetQcow2FilesystemPath();
+        if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
             return "—";
-        long bytes;
         try
         {
-            bytes = new FileInfo(filesystemPath).Length;
+            long bytes = new FileInfo(imagePath).Length;
+            string sidecar = node.GetVmStateSidecarPath();
+            if (!string.IsNullOrEmpty(sidecar) && File.Exists(sidecar))
+                bytes += new FileInfo(sidecar).Length;
+            return FormatBytes(bytes);
         }
         catch
         {
             return "—";
         }
-        return FormatBytes(bytes);
     }
 
     static string FormatBytes(long bytes)

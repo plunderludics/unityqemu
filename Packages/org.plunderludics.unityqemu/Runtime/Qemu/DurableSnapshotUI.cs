@@ -10,10 +10,13 @@ using UnityEditor;
 
 namespace UnityQemu {
 /// <summary>
-/// Durable snapshots: savevm → copy work to <c>.uqsnap</c> (DiskAsset + uqsnapMetadata).
+/// Durable snapshots (D4): thin qcow2 disk diff (<c>.uqsnap</c>) + gzipped migration
+/// stream (<c>.uqsnap.vmstate</c>), written without restarting QEMU.
 /// <para>
 /// Save sibling / Overwrite → parent = current.backingDisk.
-/// Save child → parent = current (work may be flattened onto current first).
+/// Save child → parent = current.
+/// Legacy .uqsnaps (embedded savevm, no sidecar) still load via byte-copy + loadvm;
+/// re-saving one converts it to the D4 format.
 /// </para>
 /// </summary>
 [ExecuteAlways]
@@ -23,7 +26,7 @@ namespace UnityQemu {
 [DeclareFoldoutGroup("Debug", Expanded = false)]
 public class DurableSnapshotUI : MonoBehaviour
 {
-    const string DefaultSnapshotOutputFolder = "Assets/Qemu/Snapshots";
+    const string DefaultSnapshotOutputFolder = "Assets/qemu/Snapshots";
     const string DefaultNewSnapshotName = "snap1";
 
     [PropertyOrder(0)]
@@ -52,13 +55,13 @@ public class DurableSnapshotUI : MonoBehaviour
         get
         {
             const string baseText =
-                "Snapshot the UI is focused on. Follows VM Disk Asset when that changes or the VM becomes Ready " +
-                "(restart/start). Save child/sibling/overwrite also point it at the new .uqsnap.";
+                "Snapshot this UI is focused on. Follows the VM's Disk Asset when that changes " +
+                "or the VM finishes starting. Save child / sibling / overwrite also update it.";
             if (!CurrentSnapshotIsFrozen)
                 return baseText;
             return baseText +
-                   "\n\n❄ means frozen: other disks use this as their qcow2 parent. " +
-                   "Overwriting it can corrupt those children. Prefer Save sibling/child instead.";
+                   "\n\n❄ means other snapshots use this as their parent — overwriting it can " +
+                   "corrupt those children. Prefer Save sibling or Save child instead.";
         }
     }
 
@@ -120,8 +123,9 @@ public class DurableSnapshotUI : MonoBehaviour
 
     [PropertyOrder(2)]
     [Group("snapshot/actions")]
-    [Button("Reload")]
+    [Button("Reload state")]
     [EnableIf(nameof(Ready))]
+    [PropertyTooltip("Rewind to the last quick-save in this session (or to the moment the snapshot was loaded).")]
     public async void ReloadDurableStateButton()
     {
         try
@@ -131,7 +135,7 @@ public class DurableSnapshotUI : MonoBehaviour
                 $"loadvm {DiskOverlay.DurableSaveVmTag}");
             if (!string.IsNullOrWhiteSpace(result))
                 throw new InvalidOperationException(result.Trim());
-            status = "Reloaded last saved state";
+            status = "Reloaded session state";
         }
         catch (Exception e)
         {
@@ -158,7 +162,7 @@ public class DurableSnapshotUI : MonoBehaviour
                     "Overwrite frozen snapshot?",
                     $"'{currentSnapshot.name}' is frozen — {childNames.Length} disk(s) use it as their parent:\n\n" +
                     $"{childList}\n\n" +
-                    "Overwriting can corrupt those children (qcow2 assumes parents are immutable).\n\n" +
+                    "Overwriting can corrupt those children (parents must stay immutable).\n\n" +
                     "Prefer Save sibling / Save child instead. Overwrite anyway?",
                     "Overwrite anyway",
                     "Cancel");
@@ -212,7 +216,7 @@ public class DurableSnapshotUI : MonoBehaviour
             "Save Child Snapshot",
             DefaultNewSnapshotName,
             "uqsnap",
-            $"Child of '{parent.name}' (deltas on top of that image).",
+            $"Child of '{parent.name}' — stores only changes on top of that snapshot.",
             DefaultSnapshotOutputFolder);
         if (string.IsNullOrEmpty(projectPath))
             return;
@@ -277,13 +281,13 @@ public class DurableSnapshotUI : MonoBehaviour
     }
 
     [PropertyOrder(4)]
-    [Button("Load other state")]
+    [Button("Load snapshot…")]
     [EnableIf(nameof(HasVirtualMachine))]
     public async void LoadOtherStateButton()
     {
         EnsureSnapshotFolder(DefaultSnapshotOutputFolder);
         string absolutePath = EditorUtility.OpenFilePanel(
-            "Load other state",
+            "Load snapshot",
             Path.GetFullPath(Path.Combine(Application.dataPath, "..", DefaultSnapshotOutputFolder)),
             "uqsnap");
         if (string.IsNullOrEmpty(absolutePath))
@@ -296,11 +300,16 @@ public class DurableSnapshotUI : MonoBehaviour
             DiskAsset snapshot = DiskAsset.FindByFilesystemPath(absolutePath);
             if (snapshot == null || !snapshot.HasVmState)
                 throw new InvalidOperationException(
-                    $"No .uqsnap DiskAsset for '{absolutePath}' — is it imported in this project " +
-                    "(including via a junction under Assets/)?");
+                    $"No snapshot asset found for '{absolutePath}'. " +
+                    "Is the file imported in this project?");
 
             status = $"Loading '{snapshot.name}'…";
             await LoadDurableSnapshotAsync(snapshot);
+            if (!string.IsNullOrEmpty(virtualMachine.LastStateRestoreError))
+            {
+                status = $"Loaded '{snapshot.name}' (disk only — state restore failed)";
+                return;
+            }
             status = $"Loaded '{snapshot.name}'";
         }
         catch (Exception e)
@@ -310,7 +319,10 @@ public class DurableSnapshotUI : MonoBehaviour
         }
     }
 
-    bool CanOverwrite => currentSnapshot != null && currentSnapshot.HasVmState;
+    bool CanOverwrite =>
+        currentSnapshot != null &&
+        currentSnapshot.HasVmState &&
+        currentSnapshot.backingDisk != null;
     bool HasVirtualMachine => virtualMachine != null;
     bool Ready => virtualMachine != null && virtualMachine.QmpConnected;
     bool CanSaveChild => Ready && virtualMachine.diskAsset != null;
@@ -322,36 +334,44 @@ public class DurableSnapshotUI : MonoBehaviour
     [PropertyOrder(100)]
     [Group("Debug")]
     [ShowInInspector, ReadOnly]
+    [LabelText("Status")]
     string status = "Idle";
 
     [PropertyOrder(101)]
     [Group("Debug")]
     [ShowInInspector, ReadOnly]
+    [LabelText("Connected")]
     bool QmpReady => Ready;
 
     [PropertyOrder(102)]
     [Group("Debug")]
     [ShowInInspector, ReadOnly]
+    [LabelText("Work image")]
     string WorkOverlay => virtualMachine != null ? virtualMachine.WorkOverlayPath : "";
 
     [PropertyOrder(103)]
     [Group("Debug")]
     [ShowInInspector, ReadOnly]
+    [LabelText("Boot disk")]
     string BootDiskName =>
         virtualMachine != null && virtualMachine.diskAsset != null
             ? virtualMachine.diskAsset.name
             : "(none)";
 
     /// <summary>
-    /// Pause → savevm → ensure work backs onto <paramref name="immediateParent"/> →
-    /// copy to .uqsnap → header-only path fix → resume.
+    /// D4 durable save: capture state (pause → freeze work layer via live external
+    /// snapshot → quick-save → migrate RAM to a gzipped <c>.vmstate</c> sidecar → resume),
+    /// then write the disk diff offline with <c>qemu-img convert -B parent</c>.
+    /// QEMU keeps running; no restart (except when overwriting the currently booted
+    /// snapshot, whose file QEMU holds open as backing).
     /// <para>
     /// <b>Child vs sibling</b> is which parent you pass (unchanged from the D2 design):
     /// <list type="bullet">
     /// <item>Save sibling / Overwrite → <c>current.backingDisk</c> (same parent as current).</item>
-    /// <item>Save child → <c>current</c> itself (work is flattened onto current first).</item>
+    /// <item>Save child → <c>current</c> itself.</item>
     /// </list>
-    /// The shared pipeline never full-rebases the destination file.
+    /// <c>convert -B</c> computes the true content diff against the parent either way,
+    /// and also thins out legacy byte-copy boots (fat work images) automatically.
     /// </para>
     /// </summary>
     public async Task<DiskAsset> SaveDurableSnapshotAsync(
@@ -372,81 +392,44 @@ public class DurableSnapshotUI : MonoBehaviour
             throw new FileNotFoundException(
                 $"Parent '{immediateParent.name}' has no image file", parentPath);
 
-        string workPath = virtualMachine.WorkOverlayPath;
-        if (string.IsNullOrEmpty(workPath) || !File.Exists(workPath))
-            throw new InvalidOperationException(
-                "No work image — boot with a Disk Asset first");
-
         string uqsnapFull = Path.GetFullPath(
             Path.Combine(Application.dataPath, "..", uqsnapProjectPath));
+        string sidecarPath = uqsnapFull + DiskAsset.VmStateSidecarSuffix;
+        // Capture to a temp name; only swap it in after the disk diff is written, so a
+        // failed overwrite never leaves an existing snapshot with mismatched disk/state.
+        string sidecarTmp = sidecarPath + ".new";
 
-        await virtualMachine.PauseAsync();
+        status = "Capturing state…";
+        string frozenLayer = await virtualMachine.CaptureStateAsync(sidecarTmp);
+
+        status = "Writing disk diff…";
         bool qemuStillRunning = true;
         try
         {
-            await virtualMachine.RunHumanMonitorCommandAsync(
-                $"savevm {DiskOverlay.DurableSaveVmTag}");
-
-            // 1) Work must back onto immediateParent before copy.
-            //    Sibling/overwrite: usually already true (byte-copy → backingDisk).
-            //    Child: work typically → grandparent; FlattenOnto(current) here.
-            //    Thin-overlay leftover: work → .uqsnap being overwritten; flatten onto
-            //    backingDisk while that file still exists (never copy then rebase dest).
-            string workBacking = DiskOverlay.GetBackingPath(workPath);
-            if (!DiskOverlay.PathsEqual(workBacking, parentPath))
-            {
-                status = $"Rebasing work onto '{immediateParent.name}'…";
-                Debug.Log(
-                    $"UnityQemu: work backs onto '{workBacking}' but save parent is " +
-                    $"'{parentPath}'. Flattening work (not the destination) before copy.");
-                await virtualMachine.StopGuestProcessAsync();
-                qemuStillRunning = false;
-                DiskOverlay.FlattenOnto(workPath, parentPath);
-            }
-            else
-            {
-                DiskOverlay.EnsureBackingMatches(workPath, parentPath);
-            }
-
-            // 2) Copy work → durable path.
             try
             {
-                DiskOverlay.CopyAtomic(workPath, uqsnapFull);
+                DiskOverlay.ConvertThin(frozenLayer, parentPath, uqsnapFull);
             }
             catch (Exception e)
             {
+                // Overwrite of the currently booted snapshot: QEMU holds the destination
+                // open as a backing file, so the delete/rename fails. Stop, write, then
+                // restart into the new snapshot (fast: -incoming from the fresh sidecar).
                 Debug.LogWarning(
-                    $"Could not copy work image while QEMU is running ({e.Message}). " +
-                    "Stopping QEMU to copy, then restarting into the saved state.");
-                if (qemuStillRunning)
-                {
-                    await virtualMachine.StopGuestProcessAsync();
-                    qemuStillRunning = false;
-                }
-                DiskOverlay.EnsureBackingMatches(workPath, parentPath);
-                DiskOverlay.CopyAtomic(workPath, uqsnapFull);
+                    $"Could not write '{uqsnapFull}' while QEMU is running ({e.Message}). " +
+                    "Stopping QEMU to write, then restarting into the saved state.");
+                await virtualMachine.StopGuestProcessAsync();
+                qemuStillRunning = false;
+                DiskOverlay.ConvertThin(frozenLayer, parentPath, uqsnapFull);
             }
 
-            // 3) Destination: header-only repair only (relative names under Assets/).
-            string destBacking = DiskOverlay.GetBackingPath(uqsnapFull);
-            if (DiskOverlay.PathsEqual(destBacking, uqsnapFull))
-            {
-                throw new InvalidOperationException(
-                    $"Refusing self-backing durable at '{uqsnapFull}'. " +
-                    "Load the snapshot (byte-copy boot) and save again.");
-            }
-            DiskOverlay.EnsureBackingMatches(uqsnapFull, parentPath);
+            if (File.Exists(sidecarPath))
+                File.Delete(sidecarPath);
+            File.Move(sidecarTmp, sidecarPath);
         }
         catch
         {
-            if (qemuStillRunning)
-            {
-                try { await virtualMachine.ResumeAsync(); }
-                catch (Exception resumeError)
-                {
-                    Debug.LogWarning($"Failed to resume after save error: {resumeError.Message}");
-                }
-            }
+            try { if (File.Exists(sidecarTmp)) File.Delete(sidecarTmp); } catch { /* ignore */ }
             throw;
         }
 
@@ -530,25 +513,24 @@ public class DurableSnapshotUI : MonoBehaviour
             $"Durable snapshot saved: {uqsnapProjectPath} (backing={immediateParent.name}, " +
             $"memoryMb={toStore.memoryMb})");
 
-        if (qemuStillRunning)
+        if (!qemuStillRunning)
         {
-            // Guest still has the just-saved state in its work image; Current Snapshot is
-            // updated by the caller. Disk Asset stays until next Load/restart.
-            await virtualMachine.ResumeAsync();
-        }
-        else
-        {
-            // Child save (and other paths that stopped QEMU) flattened work onto the parent.
-            // Restart must boot the *new* .uqsnap — if we keep the old Disk Asset, boot logic
-            // sees work backing onto that asset and re-copies it, wiping the new state.
+            // Overwrite path stopped QEMU to replace the open backing file — restart
+            // into the just-saved snapshot (thin overlay + incoming state feed).
             virtualMachine.PrepareBootFromDisk(diskAsset, loadVmState: true);
             await virtualMachine.StartGuestProcessAsync();
         }
+        // Otherwise QEMU never stopped: the session continues on the new work layer,
+        // whose chain content-equals the new snapshot. Current Snapshot is updated by
+        // the caller; Disk Asset stays until the next Load/restart.
 
         return diskAsset;
     }
 
-    /// <summary>Stop QEMU, boot the .uqsnap DiskAsset (byte-copy + loadvm), restart.</summary>
+    /// <summary>
+    /// Stop QEMU and boot the .uqsnap DiskAsset: thin overlay + incoming state feed for
+    /// D4 snapshots, byte-copy + loadvm for legacy ones.
+    /// </summary>
     public async Task LoadDurableSnapshotAsync(DiskAsset snapshot)
     {
         if (virtualMachine == null)

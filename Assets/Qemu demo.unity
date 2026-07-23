@@ -599,15 +599,16 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
-  diskAsset: {fileID: -6750239444755058063, guid: c614a2475974a0346a2b8a471561f58c, type: 3}
+  diskAsset: {fileID: -6750239444755058063, guid: 4d9efcbd490c78e4497f65de67ec1d3c, type: 3}
   autoLoadVmState: 1
   overrideSnapshotLaunchConfig: 1
   launchConfig:
-    memoryMb: 256
+    memoryMb: 512
     extraQemuArgs: "-cpu pentium3\r\n    -vga cirrus\r\n    -device sb16,audiodev=snd0\r\n   
-      -audiodev sdl,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
+      -audiodev dsound,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
       -usb -device usb-tablet"
-    cdroms: []
+    cdroms:
+    - {fileID: -6750239444755058063, guid: e5718c623e7aba244b406dc870c060fc, type: 3}
     floppies: []
     hostFolders: []
     smbShareFolder: {fileID: 0}
@@ -706,7 +707,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: UnityQemu::UnityQemu.DurableSnapshotUI
   virtualMachine: {fileID: 1795018730}
-  currentSnapshot: {fileID: -6750239444755058063, guid: c614a2475974a0346a2b8a471561f58c, type: 3}
+  currentSnapshot: {fileID: -6750239444755058063, guid: 4d9efcbd490c78e4497f65de67ec1d3c, type: 3}
 --- !u!114 &1795018736
 MonoBehaviour:
   m_ObjectHideFlags: 0

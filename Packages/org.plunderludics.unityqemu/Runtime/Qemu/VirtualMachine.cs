@@ -35,8 +35,30 @@ public class VirtualMachine : MonoBehaviour
     /// </summary>
     bool _workPreparedForNextStart;
 
-    /// <summary>If set, <c>loadvm</c> this tag after QMP connects (durable snapshot restore).</summary>
+    /// <summary>If set, <c>loadvm</c> this tag after QMP connects (legacy durable snapshot restore).</summary>
     string _pendingLoadVmTag;
+
+    /// <summary>
+    /// If set, the next start launches with <c>-incoming tcp:</c> and this <c>.vmstate</c>
+    /// sidecar is streamed in after QMP connects (D4 durable snapshot restore).
+    /// </summary>
+    string _pendingIncomingStatePath;
+
+    /// <summary>Loopback port QEMU listens on for <c>-incoming</c> when a state feed is pending.</summary>
+    int _incomingPort;
+
+    /// <summary>
+    /// Work layers frozen by D4 saves this session (`blockdev-snapshot-sync` leaves the
+    /// old active layer behind as backing). Deleted with the session.
+    /// </summary>
+    readonly System.Collections.Generic.List<string> _sessionLayerPaths =
+        new System.Collections.Generic.List<string>();
+
+    /// <summary>Counter for naming extra work layers created by D4 saves.</summary>
+    int _workLayerCounter;
+
+    /// <summary>Block device name of the <c>-hda</c> drive on the pc machine type.</summary>
+    public const string HdaBlockDeviceName = "ide0-hd0";
 
     [ShowInInspector] bool VncConnected => _vncClient != null && _vncClient.IsConnected;
     [ShowInInspector] bool VncInternalClientConnected => _vncClient != null && _vncClient.IsInternalClientConnected;
@@ -62,19 +84,21 @@ public class VirtualMachine : MonoBehaviour
 
     [Header("Disk")]
     [Tooltip(
-        "Image to boot: a plain .qcow2 DiskAsset (fresh overlay) or a .uqsnap DiskAsset " +
-        "(byte-copy + loadvm when Auto Load Vm State is on).")]
+        "Image to boot: a plain disk (.qcow2, boots fresh) or a snapshot (.uqsnap, " +
+        "restores its saved machine state when Auto Load Vm State is on).")]
     [OnValueChanged(nameof(OnDiskAssetChanged))]
     public DiskAsset diskAsset;
 
     [ShowIf(nameof(HasUqsnapInDiskSlot))]
-    [Tooltip("When on (default), copy the .uqsnap and loadvm its embedded savevm tag on start.")]
+    [Tooltip(
+        "When on (default), restore the snapshot's saved machine state on start. " +
+        "Turn off to boot only its disk contents.")]
     public bool autoLoadVmState = true;
 
     [ShowIf(nameof(HasUqsnapInDiskSlot))]
     [Tooltip(
-        "When off (default), launch with extra QEMU args / CD / host folders from the disk's uqsnap metadata. " +
-        "Turn on to edit and use the Launch Config below instead.")]
+        "When off (default), launch with the memory / extra QEMU args / media that were " +
+        "saved with the snapshot. Turn on to edit and use the Launch Config below instead.")]
     [OnValueChanged(nameof(OnOverrideSnapshotLaunchConfigChanged))]
     public bool overrideSnapshotLaunchConfig;
 
@@ -212,6 +236,14 @@ public class VirtualMachine : MonoBehaviour
     bool ShouldRun => Application.isPlaying || runInEditMode;
     bool IsRunning => _qemuProcess != null && !_qemuProcess.HasExited;
 
+    /// <summary>
+    /// Error text from the most recent boot's state restore (legacy loadvm or incoming
+    /// migration), or null when it succeeded or no restore was requested. The boot
+    /// itself deliberately survives a failed restore (cold boot of the disk contents),
+    /// so tooling that needs the state — e.g. the legacy snapshot converter — checks this.
+    /// </summary>
+    public string LastStateRestoreError { get; private set; }
+
     string ResolveDiskImagePath()
     {
         if (diskAsset == null)
@@ -232,10 +264,12 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
-    /// .uqsnap images always byte-copy into the work file (never a thin overlay on the
-    /// .uqsnap). <see cref="autoLoadVmState"/> only controls whether loadvm runs after boot.
+    /// Legacy .uqsnap images (embedded savevm, no .vmstate sidecar) must byte-copy into
+    /// the work file so loadvm can reach the embedded state. D4 snapshots (sidecar
+    /// present) and plain disks boot as a thin overlay instead.
     /// </summary>
-    bool ShouldByteCopyBoot => HasVmState;
+    bool ShouldByteCopyBoot =>
+        HasVmState && diskAsset != null && !diskAsset.HasVmStateSidecar;
 
     /// <summary>Current -hda path (work overlay or configured disk).</summary>
     public string ActiveDiskPath =>
@@ -359,12 +393,14 @@ public class VirtualMachine : MonoBehaviour
         {
             UnityEngine.Debug.LogWarning(
                 $"Disk '{diskAsset.name}' was saved with QEMU '{meta.qemuVersion}', " +
-                $"but this project has '{currentQemu}'. loadvm may fail if the versions are incompatible.");
+                $"but this project has '{currentQemu}'. Restoring saved state may fail if " +
+                "the versions are incompatible.");
         }
     }
 
     /// <summary>
-    /// Ensure a work image exists for the configured disk (.uqsnap → byte-copy; else thin overlay).
+    /// Ensure a work image exists for the configured disk (thin overlay, or byte-copy for
+    /// legacy snapshots that still embed their state).
     /// </summary>
     public string EnsureWorkOverlayForBoot()
     {
@@ -482,8 +518,13 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
-    /// Replace the work image with a byte-copy of <paramref name="disk"/> and optionally request
-    /// loadvm after next start. Call while QEMU is stopped.
+    /// Prepare the work image for booting <paramref name="disk"/> and queue its state
+    /// restore for the next start. Call while QEMU is stopped.
+    /// <list type="bullet">
+    /// <item>Legacy .uqsnap (embedded savevm): byte-copy + loadvm after boot.</item>
+    /// <item>D4 .uqsnap (.vmstate sidecar): thin overlay + incoming migration feed.</item>
+    /// <item>Plain disk: thin overlay, no state.</item>
+    /// </list>
     /// </summary>
     public void PrepareBootFromDisk(DiskAsset disk, bool loadVmState = true)
     {
@@ -495,21 +536,48 @@ public class VirtualMachine : MonoBehaviour
             throw new FileNotFoundException("Disk image not found", imagePath);
 
         DiskOverlay.EnsureBackingChain(disk);
-        string expectedBacking = disk.backingDisk != null
-            ? disk.backingDisk.GetQcow2FilesystemPath()
-            : null;
-        _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(
-            imagePath, WorkSessionId, expectedBacking);
+        ResetSessionLayers();
+
+        bool legacySnapshot = disk.HasVmState && !disk.HasVmStateSidecar;
+        if (legacySnapshot)
+        {
+            string expectedBacking = disk.backingDisk != null
+                ? disk.backingDisk.GetQcow2FilesystemPath()
+                : null;
+            _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(
+                imagePath, WorkSessionId, expectedBacking);
+            _pendingLoadVmTag = loadVmState ? DiskOverlay.DurableSaveVmTag : null;
+            _pendingIncomingStatePath = null;
+        }
+        else
+        {
+            _workOverlayPath = DiskOverlay.CreateWorkOverlay(imagePath, WorkSessionId);
+            _pendingLoadVmTag = null;
+            _pendingIncomingStatePath = loadVmState && disk.HasVmStateSidecar
+                ? disk.GetVmStateSidecarPath()
+                : null;
+        }
+
         _workPreparedForNextStart = true;
-        _pendingLoadVmTag = loadVmState && disk.HasVmState
-            ? DiskOverlay.DurableSaveVmTag
-            : null;
         diskAsset = disk;
         if (disk.HasVmState && !overrideSnapshotLaunchConfig)
             SyncLaunchConfigFromDiskMetadata();
         UnityEngine.Debug.Log(
             $"Prepared boot from '{disk.name}' → {_workOverlayPath}" +
-            (_pendingLoadVmTag != null ? $" (loadvm {_pendingLoadVmTag})" : ""));
+            (_pendingLoadVmTag != null ? $" (loadvm {_pendingLoadVmTag})" : "") +
+            (_pendingIncomingStatePath != null ? $" (incoming {_pendingIncomingStatePath})" : ""));
+    }
+
+    /// <summary>
+    /// Delete extra work layers frozen by D4 saves and reset the layer counter.
+    /// Call only while QEMU is stopped (or on a fresh start after StopQemuAsync).
+    /// </summary>
+    void ResetSessionLayers()
+    {
+        foreach (string layer in _sessionLayerPaths)
+            DiskOverlay.TryDeleteWorkFile(layer);
+        _sessionLayerPaths.Clear();
+        _workLayerCounter = 0;
     }
 
     /// <summary>Queue a loadvm tag for the next successful QMP connect (cleared after attempt).</summary>
@@ -790,7 +858,13 @@ public class VirtualMachine : MonoBehaviour
     /// </summary>
     public event Action OnReady;
 
-
+    /// <summary>
+    /// Fired each tick after the guest framebuffer <see cref="Texture"/> is updated
+    /// (and the optional output RenderTexture blit), and before input is processed.
+    /// Subscribe to present or post-process the frame (e.g. chroma blit) so results are
+    /// ready for the same-frame input / hit-test path. Does not fire when no texture exists yet.
+    /// </summary>
+    public event Action OnTextureUpdated;
 
     public Texture2D Texture => _vncClient?.Texture;
 
@@ -843,8 +917,8 @@ public class VirtualMachine : MonoBehaviour
     [Button("Reboot guest")]
     [EnableIf(nameof(QmpConnected))]
     [Tooltip(
-        "Hard-reset the guest via QMP system_reset (keeps the QEMU process). " +
-        "Does not loadvm — boots from the current disk/work image.")]
+        "Hard-reset the guest (keeps the emulator process). " +
+        "Does not restore a saved snapshot — boots from the current disk.")]
     public async void RebootGuest()
     {
         try { await RebootAsync(); }
@@ -933,6 +1007,7 @@ public class VirtualMachine : MonoBehaviour
         if (_starting)
             return;
         _starting = true;
+        LastStateRestoreError = null;
         try
         {
         // Ensure a previous instance isn't still holding VNC/QMP/GDB ports.
@@ -979,14 +1054,53 @@ public class VirtualMachine : MonoBehaviour
         // Exception: a boot prepared by the save/load pipeline (PrepareBootFromDisk) — that
         // work file must be used as-is. Discarding the path forces recreation in
         // EnsureWorkOverlayForBoot.
-        if (!_workPreparedForNextStart)
+        bool preparedBoot = _workPreparedForNextStart;
+        if (!preparedBoot)
+        {
             _workOverlayPath = null;
+            _pendingLoadVmTag = null;
+            _pendingIncomingStatePath = null;
+            ResetSessionLayers();
+        }
         string hdaPath = ResolveDiskImagePath();
         _workPreparedForNextStart = false;
+        // Fresh start of a D4 snapshot: state comes from the .vmstate sidecar via -incoming.
+        // (ResolveDiskImagePath may itself have prepared a legacy loadvm boot instead.)
+        if (!preparedBoot && string.IsNullOrEmpty(_pendingIncomingStatePath) &&
+            string.IsNullOrEmpty(_pendingLoadVmTag) &&
+            HasVmState && autoLoadVmState && diskAsset.HasVmStateSidecar)
+        {
+            _pendingIncomingStatePath = diskAsset.GetVmStateSidecarPath();
+        }
         if (!string.IsNullOrEmpty(hdaPath))
         {
             process.StartInfo.ArgumentList.Add("-hda");
             process.StartInfo.ArgumentList.Add(hdaPath);
+        }
+
+        _incomingPort = 0;
+        if (!string.IsNullOrEmpty(_pendingIncomingStatePath))
+        {
+            if (!enableQmp)
+            {
+                // The state feed needs QMP (completion polling, quick-save, cont);
+                // launching -incoming without it would wait forever.
+                UnityEngine.Debug.LogWarning(
+                    "UnityQemu: snapshot state restore requires QMP (enableQmp) — booting cold.");
+                _pendingIncomingStatePath = null;
+            }
+            else if (File.Exists(_pendingIncomingStatePath))
+            {
+                _incomingPort = MigrationRelay.GetFreePort();
+                process.StartInfo.ArgumentList.Add("-incoming");
+                process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{_incomingPort}");
+            }
+            else
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"UnityQemu: vmstate sidecar missing at '{_pendingIncomingStatePath}' — booting cold.");
+                _pendingIncomingStatePath = null;
+            }
         }
 
         // IDE index 0 is -hda; CDs and host folders share the remaining units.
@@ -1052,14 +1166,28 @@ public class VirtualMachine : MonoBehaviour
             // Connect QMP client
             await ConnectQmpAsync();
 
-            string loadTag = _pendingLoadVmTag;
-            _pendingLoadVmTag = null;
-            if (string.IsNullOrEmpty(loadTag) && HasVmState && autoLoadVmState)
-                loadTag = DiskOverlay.DurableSaveVmTag;
-
-            if (!string.IsNullOrEmpty(loadTag))
+            string incomingStatePath = _pendingIncomingStatePath;
+            _pendingIncomingStatePath = null;
+            if (!string.IsNullOrEmpty(incomingStatePath))
             {
-                await LoadSaveStateAsync(loadTag);
+                // D4 restore: stream the sidecar into -incoming, quick-save, resume.
+                await FeedIncomingStateAsync(incomingStatePath);
+            }
+            else
+            {
+                // Legacy restore: loadvm the embedded savevm tag (byte-copied .uqsnap).
+                string loadTag = _pendingLoadVmTag;
+                _pendingLoadVmTag = null;
+                if (string.IsNullOrEmpty(loadTag) && HasVmState && autoLoadVmState &&
+                    !diskAsset.HasVmStateSidecar)
+                {
+                    loadTag = DiskOverlay.DurableSaveVmTag;
+                }
+
+                if (!string.IsNullOrEmpty(loadTag))
+                {
+                    await LoadSaveStateAsync(loadTag);
+                }
             }
         }
 
@@ -1135,6 +1263,9 @@ public class VirtualMachine : MonoBehaviour
                 }
 #endif
             }
+
+            // Present / post-process before input so same-frame hit tests see this tick's frame.
+            OnTextureUpdated?.Invoke();
         }
 
         // Unity Input is unreliable outside play mode.
@@ -1203,11 +1334,12 @@ public class VirtualMachine : MonoBehaviour
     {
         // Fire-and-forget sync stop on destroy (can't await here reliably).
         StopQemu();
-        // Session is over — reclaim the work image (these can be GBs). StopQemu waits up
-        // to 3s for exit; if the file is somehow still locked, the delete silently fails
+        // Session is over — reclaim the work images (these can be GBs). StopQemu waits up
+        // to 3s for exit; if a file is somehow still locked, the delete silently fails
         // and the orphan sweep at the next start picks it up.
         DiskOverlay.TryDeleteWorkFile(_workOverlayPath);
         _workOverlayPath = null;
+        ResetSessionLayers();
     }
 
     /// <summary>
@@ -1278,12 +1410,201 @@ public class VirtualMachine : MonoBehaviour
         try
         {
             string result = await RunHumanMonitorCommandAsync($"loadvm {tag}");
-            UnityEngine.Debug.Log(string.IsNullOrWhiteSpace(result) ? $"loadvm {tag} OK" : $"loadvm {tag}: {result}");
+            if (string.IsNullOrWhiteSpace(result))
+            {
+                UnityEngine.Debug.Log($"loadvm {tag} OK");
+            }
+            else
+            {
+                // HMP reports loadvm failures as output text, not an error response.
+                LastStateRestoreError = result.Trim();
+                UnityEngine.Debug.LogError($"loadvm {tag}: {result}");
+            }
         }
         catch (Exception e)
         {
+            LastStateRestoreError = e.Message;
             UnityEngine.Debug.LogError($"Failed to load save state '{tag}': {e.Message}");
         }
+    }
+
+    /// <summary>
+    /// D4 restore: stream a gzipped .vmstate sidecar into a QEMU launched with
+    /// <c>-incoming tcp:</c>, wait for the load, quick-save into the fresh work overlay
+    /// (so Reload with no prior quick-save rewinds to the just-loaded state), resume.
+    /// </summary>
+    async Task FeedIncomingStateAsync(string vmstatePath)
+    {
+        try
+        {
+            UnityEngine.Debug.Log($"Restoring vmstate from '{vmstatePath}' (port {_incomingPort})…");
+            await MigrationRelay.SendFromFileAsync(_incomingPort, vmstatePath);
+            await WaitForRunStateToLeaveAsync("inmigrate", TimeSpan.FromSeconds(60));
+
+            // Resume first: while paused after an incoming migration the block
+            // devices are still inactive, so savevm would be refused.
+            await RunQmpAsync("cont");
+
+            string quickSave = await RunHumanMonitorCommandAsync(
+                $"savevm {DiskOverlay.DurableSaveVmTag}");
+            if (!string.IsNullOrWhiteSpace(quickSave))
+                UnityEngine.Debug.LogWarning($"Post-restore quick-save: {quickSave.Trim()}");
+
+            UnityEngine.Debug.Log("vmstate restored");
+        }
+        catch (Exception e)
+        {
+            LastStateRestoreError = e.Message;
+            bool qemuDied = _qemuProcess == null || _qemuProcess.HasExited;
+            UnityEngine.Debug.LogError(
+                $"Failed to restore snapshot state from '{vmstatePath}': {e.Message}" +
+                (qemuDied
+                    ? "\nThe emulator exited while restoring saved state — usually the launch " +
+                      "config (memory, devices, media) no longer matches what was saved, " +
+                      "or the QEMU version differs. Turn off Auto Load Vm State to boot " +
+                      "only the disk contents."
+                    : ""));
+        }
+    }
+
+    /// <summary>Poll QMP <c>query-status</c> until the runstate is no longer <paramref name="state"/>.</summary>
+    async Task WaitForRunStateToLeaveAsync(string state, TimeSpan timeout)
+    {
+        var sw = Stopwatch.StartNew();
+        while (true)
+        {
+            JObject response = await _qmpClient.ExecuteCommandAsync("query-status");
+            string status = response["return"]?["status"]?.Value<string>();
+            if (!string.Equals(status, state, StringComparison.Ordinal))
+                return;
+            if (sw.Elapsed > timeout)
+                throw new TimeoutException(
+                    $"Guest still in runstate '{state}' after {timeout.TotalSeconds:F0}s");
+            await Task.Delay(200);
+        }
+    }
+
+    /// <summary>Poll QMP <c>query-migrate</c> until the outgoing migration completes.</summary>
+    async Task WaitForMigrationCompletionAsync(TimeSpan timeout)
+    {
+        var sw = Stopwatch.StartNew();
+        while (true)
+        {
+            JObject response = await _qmpClient.ExecuteCommandAsync("query-migrate");
+            string status = response["return"]?["status"]?.Value<string>();
+            if (string.Equals(status, "completed", StringComparison.Ordinal))
+                return;
+            if (string.Equals(status, "failed", StringComparison.Ordinal) ||
+                string.Equals(status, "cancelled", StringComparison.Ordinal))
+            {
+                string desc = response["return"]?["error-desc"]?.Value<string>() ?? "(no error-desc)";
+                throw new Exception($"Migration {status}: {desc}");
+            }
+            if (sw.Elapsed > timeout)
+                throw new TimeoutException(
+                    $"Outgoing migration not completed after {timeout.TotalSeconds:F0}s (status: {status})");
+            await Task.Delay(200);
+        }
+    }
+
+    /// <summary>
+    /// D4 durable save, QEMU side: pause → freeze the current work layer as the session's
+    /// disk delta (<c>blockdev-snapshot-sync</c>; a fresh layer becomes active) →
+    /// quick-save into the new layer (must precede migrate: the postmigrate runstate
+    /// refuses savevm) → migrate RAM/CPU out into a gzipped
+    /// <paramref name="vmstateOutputPath"/> → resume.
+    /// The migration runs over a pre-connected duplicated socket (<c>migrate fd:</c>);
+    /// see <see cref="MigrationRelay"/> for why <c>tcp:</c> can hang.
+    /// Returns the frozen layer path for the offline disk-diff step. QEMU keeps running.
+    /// </summary>
+    public async Task<string> CaptureStateAsync(string vmstateOutputPath)
+    {
+        if (_qmpClient == null || !_qmpClient.IsConnected)
+            throw new InvalidOperationException("QMP not connected");
+        if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
+            throw new InvalidOperationException("No work image — boot with a Disk Asset first");
+        if (string.IsNullOrWhiteSpace(vmstateOutputPath))
+            throw new ArgumentException("vmstate output path required", nameof(vmstateOutputPath));
+
+        string frozenLayer = _workOverlayPath;
+        string newLayer = DiskOverlay.WorkLayerPathForSession(WorkSessionId, ++_workLayerCounter);
+
+        await PauseAsync();
+        try
+        {
+            // Freeze the disk delta; guest writes continue in a fresh thin layer.
+            // Absolute path: QEMU records the backing reference verbatim and qcow2
+            // resolves relative paths against the overlay's own directory.
+            var snapshotArgs = new JObject
+            {
+                ["device"] = HdaBlockDeviceName,
+                ["snapshot-file"] = Path.GetFullPath(newLayer).Replace('\\', '/'),
+                ["format"] = "qcow2",
+            };
+            await _qmpClient.ExecuteCommandAsync(
+                "blockdev-snapshot-sync", snapshotArgs.ToString(Newtonsoft.Json.Formatting.None));
+            _sessionLayerPaths.Add(frozenLayer);
+            _workOverlayPath = newLayer;
+
+            string quickSave = await RunHumanMonitorCommandAsync(
+                $"savevm {DiskOverlay.DurableSaveVmTag}");
+            if (!string.IsNullOrWhiteSpace(quickSave))
+                UnityEngine.Debug.LogWarning($"Quick-save during capture: {quickSave.Trim()}");
+
+            using (var capture = MigrationRelay.OutgoingCapture.Create(_qemuProcess.Id))
+            {
+                var fdArgs = new JObject
+                {
+                    ["info"] = capture.ProtocolInfoBase64,
+                    ["fdname"] = capture.FdName,
+                };
+                await _qmpClient.ExecuteCommandAsync(
+                    "get-win32-socket", fdArgs.ToString(Newtonsoft.Json.Formatting.None));
+                capture.CloseQemuEnd();
+
+                Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath);
+                try
+                {
+                    await _qmpClient.ExecuteCommandAsync(
+                        "migrate", $"{{\"uri\":\"fd:{capture.FdName}\"}}");
+                    await WaitForMigrationCompletionAsync(TimeSpan.FromMinutes(2));
+                }
+                catch
+                {
+                    // Disposing the capture below aborts the reader; observe its
+                    // fault so Unity doesn't log an unobserved task exception.
+                    _ = receiveTask.ContinueWith(t => _ = t.Exception,
+                        TaskContinuationOptions.OnlyOnFaulted);
+                    throw;
+                }
+
+                // Ask QEMU to drop any lingering reference to the duplicated socket,
+                // then let the reader finish on EOF or silence.
+                try
+                {
+                    await _qmpClient.ExecuteCommandAsync(
+                        "closefd", $"{{\"fdname\":\"{capture.FdName}\"}}");
+                }
+                catch { /* already released by migrate */ }
+                capture.FinishAfterDrain();
+                long compressedBytes = await receiveTask;
+                UnityEngine.Debug.Log(
+                    $"vmstate captured: {vmstateOutputPath} " +
+                    $"({compressedBytes / (1024.0 * 1024.0):F1} MB compressed)");
+            }
+        }
+        finally
+        {
+            // cont is a valid transition out of postmigrate; also resumes after errors.
+            try { await ResumeAsync(); }
+            catch (Exception resumeError)
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"Failed to resume after state capture: {resumeError.Message}");
+            }
+        }
+
+        return frozenLayer;
     }
 
     /// <summary>

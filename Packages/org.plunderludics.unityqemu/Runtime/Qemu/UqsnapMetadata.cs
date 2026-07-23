@@ -3,7 +3,7 @@ using UnityEngine;
 
 namespace UnityQemu {
 /// <summary>
-/// Extra Unity-side data for durable <c>.uqsnap</c> images (embedded <c>savevm</c> + launch config).
+/// Extra Unity-side data for durable <c>.uqsnap</c> images (launch config + versions).
 /// Plain <c>.qcow2</c> disks leave <see cref="DiskAsset.hasUqsnapMetadata"/> false.
 /// User-facing annotations live on <see cref="DiskAsset.note"/>.
 /// </summary>

@@ -20,10 +20,10 @@ public class DiskAssetImporter : ScriptedImporter
     [Tooltip("Freeform annotation stored on the imported DiskAsset.")]
     public string note;
 
-    [Tooltip("True when this import is a durable .uqsnap (drives DiskAsset.HasVmState).")]
+    [Tooltip("True for durable snapshots (.uqsnap). Cleared automatically for plain disks.")]
     public bool hasUqsnapMetadata;
 
-    [Tooltip("Durable-snapshot metadata. Used when hasUqsnapMetadata is set; ignored for plain .qcow2.")]
+    [Tooltip("Launch config and version metadata for durable snapshots.")]
     public UqsnapMetadata uqsnapMetadata;
 
     public override void OnImportAsset(AssetImportContext ctx)

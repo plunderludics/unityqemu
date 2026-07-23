@@ -11,10 +11,10 @@ using Debug = UnityEngine.Debug;
 
 namespace UnityQemu {
 /// <summary>
-/// Ephemeral work images and qcow2 helpers for the D2 snapshot model.
+/// Ephemeral work images and qcow2 helpers for the snapshot model.
 /// <list type="bullet">
-/// <item>Assets images are immutable; only <see cref="WorkDirectory"/> files are written by QEMU.</item>
-/// <item>.uqsnap boot = byte-copy into work (never a thin overlay on the .uqsnap).</item>
+/// <item>Asset images are immutable; only <see cref="WorkDirectory"/> files are written by QEMU.</item>
+/// <item>Current-format snapshots boot as a thin overlay; legacy fat snapshots still byte-copy.</item>
 /// <item>Relative backing is OK for siblings under Assets/; work images always use absolute backing.</item>
 /// </list>
 /// </summary>
@@ -117,6 +117,19 @@ public static class DiskOverlay
     }
 
     /// <summary>
+    /// Path for the Nth extra work layer of a session (created by live external
+    /// snapshots during D4 saves). Shares the session prefix so the orphan sweep
+    /// treats the whole chain as one unit.
+    /// </summary>
+    public static string WorkLayerPathForSession(string sessionId, int layer)
+    {
+        if (string.IsNullOrEmpty(sessionId))
+            sessionId = Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(WorkDirectory);
+        return Path.Combine(WorkDirectory, $"{SanitizeFileName(sessionId)}_l{layer}.qcow2");
+    }
+
+    /// <summary>
     /// Best-effort delete of a work image and its <c>.tmp</c> leftover.
     /// No-op for paths outside the work directory.
     /// </summary>
@@ -136,13 +149,14 @@ public static class DiskOverlay
     /// </summary>
     public static void CleanupOrphanedWorkFiles(IEnumerable<string> activeSessionIds)
     {
-        var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Sessions own "{id}.qcow2" plus any "{id}_lN.qcow2" layer files (D4 saves).
+        var keepPrefixes = new List<string>();
         if (activeSessionIds != null)
         {
             foreach (string id in activeSessionIds)
             {
                 if (!string.IsNullOrEmpty(id))
-                    keep.Add(Path.GetFileName(WorkOverlayPathForSession(id)));
+                    keepPrefixes.Add(SanitizeFileName(id));
             }
         }
 
@@ -154,7 +168,18 @@ public static class DiskOverlay
                 continue;
 
             string qcow2Name = isTmp ? name.Substring(0, name.Length - ".tmp".Length) : name;
-            if (keep.Contains(qcow2Name))
+            string stem = qcow2Name.Substring(0, qcow2Name.Length - ".qcow2".Length);
+            bool kept = false;
+            foreach (string prefix in keepPrefixes)
+            {
+                if (string.Equals(stem, prefix, StringComparison.OrdinalIgnoreCase) ||
+                    stem.StartsWith(prefix + "_l", StringComparison.OrdinalIgnoreCase))
+                {
+                    kept = true;
+                    break;
+                }
+            }
+            if (kept)
                 continue;
 
             if (TryDeleteFile(file))
@@ -178,6 +203,47 @@ public static class DiskOverlay
         catch (UnauthorizedAccessException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Write a minimal thin overlay: guest-visible content of <paramref name="sourcePath"/>
+    /// (including its backing chain), stored as only the clusters that differ from
+    /// <paramref name="backingPath"/>. Drops internal snapshots (quick-save savevm blobs)
+    /// by construction — <c>qemu-img convert</c> reads active content only.
+    /// One command covers save-child, save-sibling/overwrite and legacy conversion;
+    /// only the backing choice differs. Safe while QEMU holds the source read-only
+    /// (<c>-U</c> shared open); temp + rename so readers never see a partial file.
+    /// </summary>
+    public static void ConvertThin(string sourcePath, string backingPath, string destPath)
+    {
+        if (string.IsNullOrEmpty(sourcePath) || !File.Exists(sourcePath))
+            throw new FileNotFoundException("Convert source qcow2 not found", sourcePath);
+        if (string.IsNullOrEmpty(backingPath) || !File.Exists(backingPath))
+            throw new FileNotFoundException("Convert backing qcow2 not found", backingPath);
+
+        string destDir = Path.GetDirectoryName(destPath);
+        if (!string.IsNullOrEmpty(destDir))
+            Directory.CreateDirectory(destDir);
+
+        string tmp = destPath + ".tmpconv";
+        if (File.Exists(tmp))
+            File.Delete(tmp);
+        try
+        {
+            RunQemuImg(
+                600_000,
+                "convert", "-U", "-O", "qcow2",
+                "-B", Path.GetFullPath(backingPath).Replace('\\', '/'), "-F", "qcow2",
+                sourcePath, tmp);
+            if (File.Exists(destPath))
+                File.Delete(destPath);
+            File.Move(tmp, destPath);
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+            throw;
         }
     }
 

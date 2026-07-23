@@ -25,9 +25,14 @@ public class DiskAssetEditor : UnityEditor.Editor
     {
         bool isSnap = disk.HasVmState;
         string title = isSnap ? "Snapshot" : "Disk";
-        string detail = isSnap
-            ? "Durable .uqsnap — embedded savevm + launch metadata."
-            : "Raw disk image — no uqsnapMetadata / savevm.";
+        string detail;
+        if (!isSnap)
+            detail = "Disk image — boots fresh, no saved machine state.";
+        else if (disk.HasVmStateSidecar)
+            detail = "Saved machine state plus disk changes since its parent.";
+        else
+            detail = "Older snapshot format. Save it again, or use " +
+                     "Tools → UnityQemu → Convert Legacy Snapshots, to upgrade.";
 
         var prev = GUI.backgroundColor;
         GUI.backgroundColor = isSnap
