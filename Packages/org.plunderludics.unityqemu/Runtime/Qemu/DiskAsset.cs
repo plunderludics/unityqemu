@@ -8,59 +8,22 @@ using UnityEditor;
 
 namespace UnityQemu {
 /// <summary>
-/// Immutable qcow2 image handle — main object of an imported <c>.qcow2</c> or <c>.uqsnap</c>.
+/// Immutable qcow2 image handle — main object of an imported <c>.qcow2</c>.
 /// Overlay parents are always another <see cref="DiskAsset"/> via <see cref="backingDisk"/>.
-/// Durable snapshots set <see cref="hasUqsnapMetadata"/>; plain disks leave it clear.
 /// QEMU must never write the asset file — only ephemeral Library work images.
+/// Machine state lives on <see cref="UqsnapAsset"/>, which references a disk tip.
 /// </summary>
+[Icon("Packages/org.plunderludics.unityqemu/Editor/Icons/DiskAssetIcon.png")]
 [CreateAssetMenu(fileName = "Disk", menuName = "UnityQemu/Disk Asset", order = 10)]
-public class DiskAsset : ScriptableObject
+public class DiskAsset : BootableAsset
 {
-    [Tooltip("Display name (defaults to asset name)")]
-    public string label;
-
-    [TextArea(2, 4)]
-    [Tooltip("Freeform annotation for this image.")]
-    public string note;
-
-    [Tooltip("Project-relative path to the image (e.g. Assets/Qemu/win95.qcow2 or …/snap.uqsnap).")]
+    [Tooltip("Project-relative path to the image (e.g. Assets/Qemu/win95.qcow2).")]
     public string projectRelativeQcow2Path;
 
     [Tooltip("Immediate backing image (qcow2 header). Empty for a standalone/base image.")]
     public DiskAsset backingDisk;
 
-    [Tooltip("True for durable snapshots (.uqsnap). Plain disks leave this clear.")]
-    public bool hasUqsnapMetadata;
-
-    [Tooltip("Launch config and version metadata for durable snapshots. Used when hasUqsnapMetadata is set.")]
-    public UqsnapMetadata uqsnapMetadata;
-
-    /// <summary>True when this asset is a durable snapshot.</summary>
-    public bool HasVmState => hasUqsnapMetadata;
-
-    /// <summary>Suffix appended to the .uqsnap path for the D4 compressed vmstate sidecar.</summary>
-    public const string VmStateSidecarSuffix = ".vmstate";
-
-    /// <summary>Filesystem path of the D4 vmstate sidecar (whether or not it exists).</summary>
-    public string GetVmStateSidecarPath()
-    {
-        string imagePath = GetQcow2FilesystemPath();
-        return string.IsNullOrEmpty(imagePath) ? null : imagePath + VmStateSidecarSuffix;
-    }
-
-    /// <summary>
-    /// True when a D4 vmstate sidecar exists on disk. D4 snapshots boot as a thin
-    /// overlay + incoming migration; sidecar-less .uqsnaps use the legacy
-    /// byte-copy + loadvm path (embedded savevm).
-    /// </summary>
-    public bool HasVmStateSidecar
-    {
-        get
-        {
-            string sidecar = GetVmStateSidecarPath();
-            return !string.IsNullOrEmpty(sidecar) && File.Exists(sidecar);
-        }
-    }
+    public override DiskAsset DiskTip => this;
 
     /// <summary>Filesystem path to the immutable image bytes.</summary>
     public string GetQcow2FilesystemPath()
@@ -88,34 +51,49 @@ public class DiskAsset : ScriptableObject
         return Path.GetFullPath(Path.Combine(Application.dataPath, "..", rel));
     }
 
-    public string DisplayLabel =>
-        !string.IsNullOrEmpty(label) ? label : name;
-
     public static bool IsQemuImageAssetPath(string assetPath)
     {
-        if (string.IsNullOrEmpty(assetPath))
-            return false;
-        return assetPath.EndsWith(".qcow2", StringComparison.OrdinalIgnoreCase) ||
-               assetPath.EndsWith(".uqsnap", StringComparison.OrdinalIgnoreCase);
+        return !string.IsNullOrEmpty(assetPath) &&
+               assetPath.EndsWith(".qcow2", StringComparison.OrdinalIgnoreCase);
     }
 
 #if UNITY_EDITOR
-    /// <summary>Disk assets that list <paramref name="parent"/> as <see cref="backingDisk"/>.</summary>
-    public static List<DiskAsset> GetChildDisks(DiskAsset parent)
+    /// <summary>
+    /// One project-wide scan: backing disk → child disks.
+    /// Prefer this for tree draws instead of repeated <see cref="GetChildDisks"/>.
+    /// </summary>
+    public static Dictionary<DiskAsset, List<DiskAsset>> BuildChildrenIndex()
     {
-        var children = new List<DiskAsset>();
-        if (parent == null)
-            return children;
+        var map = new Dictionary<DiskAsset, List<DiskAsset>>();
         foreach (string guid in AssetDatabase.FindAssets("t:DiskAsset"))
         {
             string assetPath = AssetDatabase.GUIDToAssetPath(guid);
             DiskAsset candidate = AssetDatabase.LoadAssetAtPath<DiskAsset>(assetPath);
-            if (candidate != null && candidate.backingDisk == parent)
-                children.Add(candidate);
+            if (candidate == null || candidate.backingDisk == null)
+                continue;
+            if (!map.TryGetValue(candidate.backingDisk, out var list))
+            {
+                list = new List<DiskAsset>();
+                map[candidate.backingDisk] = list;
+            }
+            list.Add(candidate);
         }
-        children.Sort((a, b) => string.Compare(
-            a.DisplayLabel, b.DisplayLabel, StringComparison.OrdinalIgnoreCase));
-        return children;
+        foreach (var list in map.Values)
+        {
+            list.Sort((a, b) => string.Compare(
+                a.DisplayLabel, b.DisplayLabel, StringComparison.OrdinalIgnoreCase));
+        }
+        return map;
+    }
+
+    /// <summary>Disk assets that list <paramref name="parent"/> as <see cref="backingDisk"/>.</summary>
+    public static List<DiskAsset> GetChildDisks(DiskAsset parent)
+    {
+        if (parent == null)
+            return new List<DiskAsset>();
+        if (BuildChildrenIndex().TryGetValue(parent, out var children))
+            return new List<DiskAsset>(children);
+        return new List<DiskAsset>();
     }
 
     public static bool HasChildDisks(DiskAsset parent) => GetChildDisks(parent).Count > 0;
@@ -129,10 +107,6 @@ public class DiskAsset : ScriptableObject
         return names;
     }
 
-    /// <summary>
-    /// Backing chain from ultimate base down to this disk (inclusive), root first.
-    /// Used for tree visualization only.
-    /// </summary>
     public List<DiskAsset> GetChainFromRoot()
     {
         var stack = new Stack<DiskAsset>();
@@ -152,11 +126,6 @@ public class DiskAsset : ScriptableObject
         return chain.Count > 0 ? chain[0] : this;
     }
 
-    /// <summary>
-    /// Find a DiskAsset whose image matches <paramref name="filesystemPath"/>.
-    /// Tries exact path, then remaps a foreign <c>…/Assets/…</c> absolute path into this project
-    /// (common when qcow2 headers retain paths from another checkout).
-    /// </summary>
     public static DiskAsset FindByFilesystemPath(string filesystemPath)
     {
         if (string.IsNullOrEmpty(filesystemPath))
@@ -171,7 +140,6 @@ public class DiskAsset : ScriptableObject
         if (direct != null)
             return direct;
 
-        // Stale absolute path from another project/machine: …/Assets/qemu/… → this project's Assets/…
         string remapped = RemapForeignAssetsPath(wanted, rootPrefix);
         if (!string.IsNullOrEmpty(remapped))
         {
@@ -189,7 +157,6 @@ public class DiskAsset : ScriptableObject
             string candidatePath = candidate.GetQcow2FilesystemPath();
             if (string.IsNullOrEmpty(candidatePath))
                 continue;
-            // PathsEqual also matches Windows junctions / same file via different roots.
             if (DiskOverlay.PathsEqual(candidatePath, wanted))
                 return candidate;
             if (!string.IsNullOrEmpty(remapped) && DiskOverlay.PathsEqual(candidatePath, remapped))
@@ -211,10 +178,6 @@ public class DiskAsset : ScriptableObject
         return AssetDatabase.LoadAssetAtPath<DiskAsset>(projectPath);
     }
 
-    /// <summary>
-    /// If <paramref name="absolutePath"/> contains an <c>Assets</c> segment, rewrite it under
-    /// this project's root (keeps the relative path from Assets onward).
-    /// </summary>
     static string RemapForeignAssetsPath(string absolutePath, string rootPrefix)
     {
         if (string.IsNullOrEmpty(absolutePath))
@@ -223,21 +186,20 @@ public class DiskAsset : ScriptableObject
         int assetsIdx = normalized.IndexOf("/Assets/", StringComparison.OrdinalIgnoreCase);
         if (assetsIdx < 0)
         {
-            // Windows path may start with Assets\ without a leading slash after drive quirks
             if (normalized.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
-                assetsIdx = -1; // already project-relative shape
+                assetsIdx = -1;
             else
                 return null;
         }
 
         string fromAssets = assetsIdx >= 0
-            ? normalized.Substring(assetsIdx + 1) // "Assets/…"
+            ? normalized.Substring(assetsIdx + 1)
             : normalized;
         string remapped = Path.GetFullPath(Path.Combine(
             rootPrefix.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
             fromAssets.Replace('/', Path.DirectorySeparatorChar)));
         if (string.Equals(remapped, Path.GetFullPath(absolutePath), StringComparison.OrdinalIgnoreCase))
-            return null; // already in this project
+            return null;
         return remapped;
     }
 
@@ -250,12 +212,10 @@ public class DiskAsset : ScriptableObject
     }
 #endif
 
-    void OnValidate()
+    protected override void OnValidate()
     {
-        if (string.IsNullOrEmpty(label))
-            label = name;
+        base.OnValidate();
 #if UNITY_EDITOR
-        // AssetDatabase is main-thread only; OnValidate can run on the scene loading thread.
         EditorApplication.delayCall -= SyncProjectRelativeQcow2PathDeferred;
         EditorApplication.delayCall += SyncProjectRelativeQcow2PathDeferred;
 #endif

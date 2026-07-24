@@ -313,6 +313,7 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
+  snapshot: {fileID: 0}
   diskAsset: {fileID: 0}
   autoLoadVmState: 1
   overrideSnapshotLaunchConfig: 0
@@ -356,7 +357,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7c4e9b2a1f8d4e6a9b0c3d5e7f1a2b3c, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: UnityQemu::UnityQemu.SnapshotUI
+  m_EditorClassIdentifier: UnityQemu::UnityQemu.LegacySnapshotUI
   virtualMachine: {fileID: 543766795}
   refreshOnReady: 1
   snapshots:
@@ -413,6 +414,7 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
+  snapshot: {fileID: 0}
   diskAsset: {fileID: 0}
   autoLoadVmState: 1
   overrideSnapshotLaunchConfig: 0
@@ -599,16 +601,17 @@ MonoBehaviour:
   showGui: 1
   inputProvider: {fileID: 0}
   runInEditMode: 0
-  diskAsset: {fileID: -6750239444755058063, guid: 4d9efcbd490c78e4497f65de67ec1d3c, type: 3}
+  snapshot: {fileID: -6750239444755058063, guid: 5b954b17d3e906444bea5d4ab49a27e0, type: 3}
+  diskAsset: {fileID: -6750239444755058063, guid: 2a2f90d1459d64544b43e90a4ba3ef71, type: 3}
   autoLoadVmState: 1
-  overrideSnapshotLaunchConfig: 1
+  overrideSnapshotLaunchConfig: 0
   launchConfig:
-    memoryMb: 512
+    memoryMb: 256
     extraQemuArgs: "-cpu pentium3\r\n    -vga cirrus\r\n    -device sb16,audiodev=snd0\r\n   
-      -audiodev dsound,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
+      -audiodev sdl,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
       -usb -device usb-tablet"
     cdroms:
-    - {fileID: -6750239444755058063, guid: e5718c623e7aba244b406dc870c060fc, type: 3}
+    - {fileID: -6750239444755058063, guid: 5b1cfe14e542a944c8dc833f0a1fac88, type: 3}
     floppies: []
     hostFolders: []
     smbShareFolder: {fileID: 0}
@@ -705,9 +708,9 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: fb89e5398eb0458fad90c1d1ed58f510, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: UnityQemu::UnityQemu.DurableSnapshotUI
+  m_EditorClassIdentifier: UnityQemu::UnityQemu.SnapshotUI
   virtualMachine: {fileID: 1795018730}
-  currentSnapshot: {fileID: -6750239444755058063, guid: 4d9efcbd490c78e4497f65de67ec1d3c, type: 3}
+  currentSnapshot: {fileID: -6750239444755058063, guid: 2a2f90d1459d64544b43e90a4ba3ef71, type: 3}
 --- !u!114 &1795018736
 MonoBehaviour:
   m_ObjectHideFlags: 0

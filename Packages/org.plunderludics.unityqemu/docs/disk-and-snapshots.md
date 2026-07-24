@@ -11,7 +11,7 @@ Working design note for UnityQemu. Goal: hide overlay/snapshot complexity from u
 1. A **base** qcow2 (e.g. `win95.qcow2`) holds a clean guest install.
 2. A **writable overlay** (e.g. `o1.qcow2`) is created with `qemu-img create -b base -F qcow2 overlay`.
 3. QEMU boots with `-hda overlay`; guest writes go to the overlay only.
-4. **Internal snapshots** (`savevm` / `loadvm`) are stored *inside* the active qcow2 via [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
+4. **Internal snapshots** (`savevm` / `loadvm`) are stored *inside* the active qcow2 via [LegacySnapshotUI.cs](../Runtime/Qemu/LegacySnapshotUI.cs).
 
 This protects the base image from accidental writes, but introduces several problems:
 
@@ -64,7 +64,7 @@ base.qcow2  ←  work.qcow2  (contains savevm tags: "slot1", "slot2", …)
 | Pros | Cons |
 |---|---|
 | Instant in-session load | One corrupt overlay = all snapshots gone |
-| Already implemented ([SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs)) | Snapshots not portable/extractable |
+| Already implemented ([LegacySnapshotUI.cs](../Runtime/Qemu/LegacySnapshotUI.cs)) | Snapshots not portable/extractable |
 | Simple overlay protects base | Unity watches mutable qcow2 |
 | | Mental model leaks to user |
 
@@ -309,7 +309,7 @@ For fast undo during a play session, extra `savevm`/`loadvm` tags can still targ
 
 - Are **not** copied out as durable snapshot files.
 - Are **lost** when the VM stops or the work overlay is deleted.
-- Can reuse the existing [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs) with a clear "temporary" label in the inspector.
+- Can reuse the existing [LegacySnapshotUI.cs](../Runtime/Qemu/LegacySnapshotUI.cs) with a clear "temporary" label in the inspector.
 
 This gives instant in-session load without compromising durable snapshot isolation.
 
@@ -371,7 +371,7 @@ Do **not** implement yet — notes only. Revisit when ready to build Phase 1.
 1. **Phase 1 — Disk asset wrapper:** `DiskAsset`, custom importer, auto work-overlay in `Library/`, wire into [VirtualMachine.cs](../Runtime/Qemu/VirtualMachine.cs).
 2. **Phase 2 — Durable save:** Pause → `savevm` → atomic copy of work overlay to snapshot path.
 3. **Phase 3 — Durable load:** Copy snapshot → work overlay → restart VM → `loadvm`.
-4. **Phase 4 — Snapshot UI:** durable save/load via [DurableSnapshotUI.cs](../Runtime/Qemu/DurableSnapshotUI.cs); keep HMP list in [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs).
+4. **Phase 4 — Snapshot UI:** durable save/load via [SnapshotUI.cs](../Runtime/Qemu/SnapshotUI.cs); keep HMP list in [LegacySnapshotUI.cs](../Runtime/Qemu/LegacySnapshotUI.cs).
 5. **Phase 5 — Polish:** Quick slots, flatten-on-export, multi-disk, size optimization.
 6. **Optional later:** Re-test Approach D (`migrate`) on a newer QEMU; keep D2 as the default if migrate remains unreliable.
 

@@ -1,4 +1,5 @@
 using System.IO;
+using UnityEditor;
 using UnityEditor.AssetImporters;
 using UnityEngine;
 
@@ -24,6 +25,11 @@ public class IsoImporter : ScriptedImporter
 
         ctx.AddObjectToAsset("main", cdrom);
         ctx.SetMainObject(cdrom);
+
+        Texture2D icon = AssetDatabase.LoadAssetAtPath<Texture2D>(
+            "Packages/org.plunderludics.unityqemu/Editor/Icons/CdRomAssetIcon.png");
+        if (icon != null)
+            EditorGUIUtility.SetIconForObject(cdrom, icon);
     }
 }
 }

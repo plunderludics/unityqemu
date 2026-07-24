@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
@@ -9,40 +10,38 @@ public class DiskAssetEditor : UnityEditor.Editor
     {
         var disk = (DiskAsset)target;
 
-        DrawKindHeader(disk);
+        // One snap scan shared by header + tree.
+        var snapsByDisk = UqsnapAsset.BuildIndexByDisk();
+        DrawKindHeader(disk, snapsByDisk);
 
-        // Importer-backed DiskAssets are drawn with GUI.enabled=false (read-only asset).
-        // Re-enable for the tree so click / context-menu still work.
         bool prevEnabled = GUI.enabled;
         GUI.enabled = true;
-        SnapshotTreeGUI.Draw(disk);
+        SnapshotTreeGUI.Draw(disk, snapsByDisk);
         GUI.enabled = prevEnabled;
 
         DrawDefaultInspector();
     }
 
-    public static void DrawKindHeader(DiskAsset disk)
+    public static void DrawKindHeader(
+        DiskAsset disk,
+        Dictionary<DiskAsset, List<UqsnapAsset>> snapsByDisk = null)
     {
-        bool isSnap = disk.HasVmState;
-        string title = isSnap ? "Snapshot" : "Disk";
-        string detail;
-        if (!isSnap)
-            detail = "Disk image — boots fresh, no saved machine state.";
-        else if (disk.HasVmStateSidecar)
-            detail = "Saved machine state plus disk changes since its parent.";
-        else
-            detail = "Older snapshot format. Save it again, or use " +
-                     "Tools → UnityQemu → Convert Legacy Snapshots, to upgrade.";
+        snapsByDisk ??= UqsnapAsset.BuildIndexByDisk();
+        snapsByDisk.TryGetValue(disk, out var snaps);
+        int count = snaps != null ? snaps.Count : 0;
+        string detail = count == 0
+            ? "Disk image — boots fresh when assigned on a VirtualMachine with no Snapshot."
+            : count == 1
+                ? $"Disk tip for snapshot '{snaps[0].DisplayLabel}'."
+                : $"Disk tip linked from {count} snapshots.";
 
         var prev = GUI.backgroundColor;
-        GUI.backgroundColor = isSnap
-            ? new Color(0.55f, 0.85f, 0.55f, 1f)
-            : new Color(0.55f, 0.7f, 0.95f, 1f);
+        GUI.backgroundColor = new Color(0.55f, 0.7f, 0.95f, 1f);
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
             GUI.backgroundColor = prev;
             var titleStyle = new GUIStyle(EditorStyles.boldLabel) { fontSize = 12 };
-            EditorGUILayout.LabelField(isSnap ? "○  " + title : "▣  " + title, titleStyle);
+            EditorGUILayout.LabelField("▣  Disk", titleStyle);
             EditorGUILayout.LabelField(detail, EditorStyles.wordWrappedMiniLabel);
         }
         EditorGUILayout.Space(2);

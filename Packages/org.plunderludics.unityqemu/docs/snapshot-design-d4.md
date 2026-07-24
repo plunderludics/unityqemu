@@ -1,4 +1,4 @@
-# Snapshot Design (D4.1) — thin disk diffs + compressed vmstate sidecars via migration streams
+# Snapshot Design (D4.1) — thin disk diffs + migration streams
 
 **Status:** implemented and verified end-to-end (branch `d4-tcp-migration`), including
 the full conversion of the existing snapshot library. QEMU-side mechanisms verified
@@ -24,22 +24,23 @@ the RAM/CPU state travels over a loopback socket pumped (and compressed) by Unit
 
 ## 1. Artifact
 
-Snapshot `X` = two files, always side by side:
+Snapshot `X` = two Unity assets, side by side:
 
 | File | Contents | Typical size (256 MB WinXP guest) |
 |---|---|---|
-| `X.uqsnap` | qcow2, backing = parent snapshot's file, **no internal snapshots** | MBs (true diff) |
-| `X.uqsnap.vmstate` | gzip of the raw migration stream | ~30–60 MB |
+| `X.qcow2` | thin disk tip (`DiskAsset`), backing = parent disk | MBs (true diff) |
+| `X.uqsnap` | gzip/raw migration stream (`UqsnapAsset`) + ref to `X.qcow2` + launch metadata | ~30–180 MB |
 
-- Launch config / QEMU version metadata stay in the importer (`.meta`), as today.
-- **Format detection:** a `.uqsnap` with a `.vmstate` sidecar is D4; without one it is
-  legacy D2 (embedded savevm) and boots via the old byte-copy + `loadvm` path, which is
-  kept alive for any remaining unconverted files (see §5). The project's
-  `Assets/qemu/Snapshots` library has already been converted.
-- Snapshot files are only ever **read** after creation (backing files are opened
-  read-only; the sidecar is streamed in). They can live on read-only media, be shared
-  by concurrent VMs, and ship in builds without a copy step — unlike `loadvm`, which
-  requires opening the qcow2 containing the vmstate as the writable active drive.
+- **VM boot slots:** `snapshot` (`UqsnapAsset`) and `diskAsset` (`DiskAsset`, read-only /
+  auto-filled when a snapshot is set). Bare disk = cold boot; snapshot + Auto Load =
+  restore machine state.
+- **Ownership:** one-way `UqsnapAsset.disk` → `DiskAsset`. State is not loaded alone.
+- Legacy D2 (embedded savevm inside a fat `.uqsnap` disk) is no longer used in this
+  project library.
+- Snapshot / disk files are only ever **read** after creation (backing files are opened
+  read-only; the `.uqsnap` stream is fed in). They can live on read-only media, be shared
+  by concurrent VMs, and ship in builds without a copy step — unlike embedded `loadvm`,
+  which required opening a qcow2 containing savevm blobs as the writable active drive.
 
 ## 2. Transport: what works on the Windows build (verified)
 
@@ -82,9 +83,9 @@ loopback TCP.
 
 ### Boot / load snapshot B (D4 format)
 
-1. Work image = **thin overlay directly on `B.uqsnap`** (no byte-copy).
+1. Work image = **thin overlay directly on `B.qcow2`** (the snapshot's linked disk).
 2. Start QEMU with `-incoming tcp:127.0.0.1:PORT` (QEMU listens; port picked free).
-3. Unity connects, streams the decompressed sidecar, half-closes; QEMU applies it.
+3. Unity connects, streams the decompressed `B.uqsnap` bytes, half-closes; QEMU applies them.
 4. Poll QMP `query-status` until runstate leaves `inmigrate` (arrives `paused`,
    since we always migrate while stopped). Don't wait for QEMU to close the socket
    (§2).
@@ -95,9 +96,9 @@ loopback TCP.
    Reload (quick-load) with no prior quick-save rewinds to the just-loaded state.
    Costs seconds + ~RAM size in the ephemeral work file (deleted at session end).
 
-If the incoming load fails (device-topology mismatch, e.g. an overridden launch
-config), QEMU exits; fall back to a cold boot of the same thin overlay without
-`-incoming` so the user at least gets the disk state.
+If the incoming load fails (bad stream, device-topology mismatch, etc.), fall back to
+a cold boot of the same thin overlay without `-incoming` so the user at least gets
+the disk state.
 
 ### Save (child / sibling / overwrite — one pipeline)
 
@@ -109,25 +110,25 @@ config), QEMU exits; fall back to a cold boot of the same thin overlay without
    `postmigrate` runstate, where savevm is refused (`cont` from postmigrate is allowed).
 4. Unity builds a connected loopback socket pair, duplicates one end into the QEMU
    process (`WSADuplicateSocketW` → QMP `get-win32-socket`), runs `migrate fd:<name>`;
-   pump socket → gzip → `X.uqsnap.vmstate` (temp + rename). Completion by polling
+   pump socket → gzip/raw → `X.uqsnap` (temp + rename). Completion by polling
    QMP `query-migrate` until `completed`, then `closefd` + quiet-drain (§2).
 5. `cont` — total pause is steps 1–5, a few seconds. QEMU keeps running throughout;
    no process restart on any save.
 6. Offline, while the guest runs: `qemu-img convert -O qcow2 -B <parent> <frozen layer>
-   → X.uqsnap` (temp + rename). Then import + write metadata as today.
+   → X.qcow2` (temp + rename). Then import the pair and wire `UqsnapAsset.disk`.
 
 Why `convert -B` instead of copy + rebase:
 
 - The frozen layer contains fat quick-save savevm blobs (boot-time auto quick-save,
   user quick-saves). `convert` copies only active disk content — internal snapshots
-  are dropped, output is guaranteed vmstate-free and thin.
+  are dropped, output is guaranteed savevm-free and thin.
 - It computes a true content diff against any `-B` base, so **one command covers all
-  parent choices**: child (`-B` = current), sibling/overwrite (`-B` = current's
-  parent — merges current's delta + session delta), and legacy conversion (§5).
+  parent choices**: child (`-B` = current tip), sibling/overwrite (`-B` = current tip's
+  parent — merges current's delta + session delta).
 - Cost: reads the full virtual disk (~2 GB → seconds on SSD), but runs while the
   guest is already resumed.
 
-Child vs sibling remains purely which parent the UI passes, unchanged from D2.
+Child vs sibling remains purely which parent the UI passes.
 
 ### In-session quick save / load
 
@@ -139,7 +140,7 @@ incoming migration only at startup — ~1 s startup + 2–3 s stream feed).
 ### Work-layer bookkeeping
 
 `blockdev-snapshot-sync` adds one work file per save; a session's chain is
-`work_lN → … → work_l1 → work → boot.uqsnap`. All layers share the session-id file
+`work_lN → … → work_l1 → work → boot.qcow2`. All layers share the session-id file
 name prefix, are deleted on session end, and are swept by the orphan cleanup on the
 next start. **Path hygiene (verified gotcha):** QEMU records the backing reference
 verbatim from the path the parent was opened with, and qcow2 resolves relative
@@ -164,39 +165,23 @@ absolute (already the convention for work images).
   i8257 idle-source wedge (§2) still exists — if QEMU ever stops re-arming the DMA
   bottom-half for stopped guests, plain `migrate tcp:` becomes viable again.
 
-## 5. Migrating legacy (D2) snapshots
+## 5. Legacy (D2) snapshots
 
-Automated by `LegacySnapshotMigrator` (editor tool,
-**Tools → UnityQemu → Convert Legacy Snapshots In Folder…**). Per old snapshot:
-
-1. Boot it the legacy way (byte-copy + `loadvm` — this code path is retained for
-   sidecar-less `.uqsnap`s).
-2. Run a normal D4 save **in place over its own file with its original parent**
-   (overwrite semantics) → thin `convert -B` disk diff + compressed sidecar. In-place
-   overwrite keeps the asset GUID (children / scene references stay valid) and the
-   guest-visible content is unchanged, so child overlays stay correct.
-3. Sizes after converting the real library (13 snapshots, 2026-07-23): 7.3 GB →
-   5.6 GB total. Mid-game states compress worst (RoadWar 445 MB → 183 MB disk +
-   172 MB state); install-heavy snapshots keep a fat legitimate disk delta
-   (Halo: 1.7 GB disk, 116 MB state); idle-desktop ones drop to ~40–90 MB disk +
-   ~60 MB state. RAM previously stored raw inside the qcow2 is now gzipped in the
-   sidecar; the disk deltas are true diffs.
+Embedded-savevm fat `.uqsnap` disks are no longer supported. The project library was
+converted to the D4 pair (`X.qcow2` + `X.uqsnap`); the one-shot batch migrator has
+been removed.
 
 ## 6. Implementation map
 
 1. `MigrationRelay` (Runtime): `OutgoingCapture` (socket pair + `WSADuplicateSocketW`
-   + gzip receive with quiet-drain), sidecar feeder with connect retry (load).
+   + gzip receive with quiet-drain), `.uqsnap` feeder with connect retry (load).
    Pumps on a worker thread.
 2. `VirtualMachine`: `-incoming` launch mode + state feed + auto quick-save;
-   `CaptureStateAsync` (stop / blockdev-snapshot-sync / quick-save / migrate / cont);
-   work-layer chain tracking + cleanup; sidecar-aware boot branching
-   (D4 thin overlay vs legacy byte-copy).
+   cold-boot fallback when state restore fails; `CaptureStateAsync`;
+   work-layer chain tracking + cleanup; thin overlay on the linked `DiskAsset`.
 3. `DiskOverlay`: `ConvertThin` (qemu-img convert -B, temp + rename);
    prefix-based orphan sweep for layered work files.
-4. `DiskAsset`: `.vmstate` sidecar path helper + presence check.
-5. `DurableSnapshotUI`: save pipeline swaps savevm+copy for capture+convert;
-   no restart after child saves. Load path unchanged in shape.
-6. `LegacySnapshotMigrator` (Editor): batch conversion of sidecar-less snapshots,
-   menu item + scriptable API. Can be removed once no legacy snapshots remain
-   anywhere.
-7. Sidecar follows the `.uqsnap` on move/rename (editor tooling; prototype: manual).
+4. `DiskAsset` (`.qcow2`) / `UqsnapAsset` (`.uqsnap`): one-way `UqsnapAsset.disk`
+   reference; separate ScriptedImporters.
+5. `SnapshotUI`: save writes the `.uqsnap` stream + thin `.qcow2`, imports
+   both, assigns the boot snapshot while QEMU keeps running after child saves.

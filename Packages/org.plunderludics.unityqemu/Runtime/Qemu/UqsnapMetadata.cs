@@ -4,8 +4,8 @@ using UnityEngine;
 namespace UnityQemu {
 /// <summary>
 /// Extra Unity-side data for durable <c>.uqsnap</c> images (launch config + versions).
-/// Plain <c>.qcow2</c> disks leave <see cref="DiskAsset.hasUqsnapMetadata"/> false.
-/// User-facing annotations live on <see cref="DiskAsset.note"/>.
+/// Lives on <see cref="UqsnapAsset"/>; plain disks have none.
+/// User-facing annotations live on <see cref="DiskAsset.note"/> / <see cref="UqsnapAsset.note"/>.
 /// </summary>
 [Serializable]
 public class UqsnapMetadata
@@ -22,12 +22,21 @@ public class UqsnapMetadata
     [Tooltip("UnityQemu package version at save time.")]
     public string unityQemuVersion;
 
+    [Tooltip(
+        "When true, the machine-state file is stored raw (faster save/load, larger). " +
+        "When false (default, including older snapshots), it is gzip-compressed.")]
+    public bool vmstateUncompressed;
+
+    /// <summary>True when the <c>.uqsnap</c> machine-state bytes should be read/written as gzip.</summary>
+    public bool VmstateIsCompressed => !vmstateUncompressed;
+
     public static UqsnapMetadata CreateEmpty() => new UqsnapMetadata
     {
         createdAt = "",
         launchConfig = LaunchConfig.CreateDefault(),
         qemuVersion = "",
         unityQemuVersion = "",
+        vmstateUncompressed = false,
     };
 
     public UqsnapMetadata Clone()
@@ -38,6 +47,7 @@ public class UqsnapMetadata
             launchConfig = launchConfig != null ? launchConfig.Clone() : LaunchConfig.CreateDefault(),
             qemuVersion = qemuVersion ?? "",
             unityQemuVersion = unityQemuVersion ?? "",
+            vmstateUncompressed = vmstateUncompressed,
         };
     }
 

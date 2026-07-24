@@ -14,13 +14,13 @@ namespace UnityQemu {
 /// Ephemeral work images and qcow2 helpers for the snapshot model.
 /// <list type="bullet">
 /// <item>Asset images are immutable; only <see cref="WorkDirectory"/> files are written by QEMU.</item>
-/// <item>Current-format snapshots boot as a thin overlay; legacy fat snapshots still byte-copy.</item>
+/// <item>Boots use a thin work overlay on the disk tip; durable machine state lives in <c>.uqsnap</c>.</item>
 /// <item>Relative backing is OK for siblings under Assets/; work images always use absolute backing.</item>
 /// </list>
 /// </summary>
 public static class DiskOverlay
 {
-    /// <summary>Internal savevm tag embedded in durable snapshot qcow2 copies.</summary>
+    /// <summary>Internal savevm tag used on the ephemeral work overlay for session Reload.</summary>
     public const string DurableSaveVmTag = "__unityqemu_state";
 
     public static string WorkDirectory
@@ -83,28 +83,6 @@ public static class DiskOverlay
     {
         string overlayPath = WorkOverlayPathForSession(sessionId);
         CreateOverlay(baseQcow2Path, overlayPath);
-        return overlayPath;
-    }
-
-    /// <summary>
-    /// Replace the work image with a byte-copy of <paramref name="sourceQcow2Path"/>.
-    /// If <paramref name="expectedBackingPath"/> is set, rewrite the header afterward so a
-    /// same-folder relative backing from Assets/ still resolves from the work directory.
-    /// </summary>
-    public static string ReplaceWorkOverlayFromCopy(
-        string sourceQcow2Path,
-        string sessionId,
-        string expectedBackingPath = null)
-    {
-        if (string.IsNullOrEmpty(sourceQcow2Path) || !File.Exists(sourceQcow2Path))
-            throw new FileNotFoundException("Source qcow2 not found", sourceQcow2Path);
-
-        string overlayPath = WorkOverlayPathForSession(sessionId);
-        CopyAtomic(sourceQcow2Path, overlayPath);
-
-        if (!string.IsNullOrEmpty(expectedBackingPath))
-            EnsureBackingMatches(overlayPath, expectedBackingPath);
-
         return overlayPath;
     }
 
@@ -211,7 +189,7 @@ public static class DiskOverlay
     /// (including its backing chain), stored as only the clusters that differ from
     /// <paramref name="backingPath"/>. Drops internal snapshots (quick-save savevm blobs)
     /// by construction — <c>qemu-img convert</c> reads active content only.
-    /// One command covers save-child, save-sibling/overwrite and legacy conversion;
+    /// One command covers save-child and save-sibling/overwrite;
     /// only the backing choice differs. Safe while QEMU holds the source read-only
     /// (<c>-U</c> shared open); temp + rename so readers never see a partial file.
     /// </summary>
@@ -245,25 +223,6 @@ public static class DiskOverlay
             try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
             throw;
         }
-    }
-
-    /// <summary>Copy file via temp + rename so readers never see a partial destination.</summary>
-    public static void CopyAtomic(string sourcePath, string destPath)
-    {
-        if (!File.Exists(sourcePath))
-            throw new FileNotFoundException("Source not found", sourcePath);
-
-        string destDir = Path.GetDirectoryName(destPath);
-        if (!string.IsNullOrEmpty(destDir))
-            Directory.CreateDirectory(destDir);
-
-        string tmp = destPath + ".tmp";
-        if (File.Exists(tmp))
-            File.Delete(tmp);
-        File.Copy(sourcePath, tmp, overwrite: true);
-        if (File.Exists(destPath))
-            File.Delete(destPath);
-        File.Move(tmp, destPath);
     }
 
     /// <summary>
@@ -370,22 +329,6 @@ public static class DiskOverlay
     }
 
     /// <summary>
-    /// Content-aware rebase so <paramref name="overlayPath"/> backs onto
-    /// <paramref name="newBackingPath"/> with the same guest-visible bytes.
-    /// Requires the previous backing file to still exist. Preserves savevm tags when QEMU allows.
-    /// </summary>
-    public static void FlattenOnto(string overlayPath, string newBackingPath)
-    {
-        RebaseOnto(overlayPath, newBackingPath, unsafeHeaderOnly: false);
-        if (!HasInternalSnapshot(overlayPath, DurableSaveVmTag))
-        {
-            throw new InvalidOperationException(
-                $"Full rebase onto '{newBackingPath}' dropped the savevm tag '{DurableSaveVmTag}'.");
-        }
-        EnsureBackingMatches(overlayPath, newBackingPath);
-    }
-
-    /// <summary>
     /// Change <paramref name="overlayPath"/>'s backing file.
     /// Full rebase compares clusters; <paramref name="unsafeHeaderOnly"/> only rewrites the path.
     /// QEMU must not have the image open.
@@ -418,24 +361,6 @@ public static class DiskOverlay
             600_000,
             "rebase", "-f", "qcow2",
             "-b", backingArg, "-F", "qcow2", overlayPath);
-    }
-
-    /// <summary>True if <paramref name="imagePath"/> has an internal snapshot named <paramref name="tag"/>.</summary>
-    public static bool HasInternalSnapshot(string imagePath, string tag)
-    {
-        if (string.IsNullOrEmpty(imagePath) || string.IsNullOrEmpty(tag))
-            return false;
-        string json = RunQemuImg("info", "--output=json", imagePath);
-        var info = JObject.Parse(json);
-        var snapshots = info["snapshots"] as JArray;
-        if (snapshots == null)
-            return false;
-        foreach (var snap in snapshots)
-        {
-            if (string.Equals((string)snap["name"], tag, StringComparison.Ordinal))
-                return true;
-        }
-        return false;
     }
 
     /// <summary>Fully resolved backing filename, or null for a base image.</summary>

@@ -3,7 +3,7 @@ using UnityEditor;
 using UnityEngine;
 
 namespace UnityQemu {
-/// <summary>Tiny modal text prompt for snapshot names (shared by SnapshotUI / DurableSnapshotUI).</summary>
+/// <summary>Tiny modal text prompt for snapshot names (shared by SnapshotUI / LegacySnapshotUI).</summary>
 class SnapshotNameDialog : EditorWindow
 {
     string _value;

@@ -10,6 +10,7 @@ namespace UnityQemu {
 /// Handle for an imported <c>.iso</c> CD-ROM image. Thin wrapper so inspectors can take a typed
 /// reference instead of a generic <see cref="UnityEngine.Object"/>.
 /// </summary>
+[Icon("Packages/org.plunderludics.unityqemu/Editor/Icons/CdRomAssetIcon.png")]
 [CreateAssetMenu(fileName = "CdRom", menuName = "UnityQemu/CD-ROM Asset", order = 12)]
 public class CdRomAsset : ScriptableObject
 {

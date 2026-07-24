@@ -13,10 +13,10 @@ namespace UnityQemu {
 /// Plumbing for QEMU migration streams (durable snapshot state capture/restore).
 /// <list type="bullet">
 /// <item>Save: a connected loopback socket is duplicated into the QEMU process
-/// (QMP <c>get-win32-socket</c>) and used with <c>migrate fd:</c>; we gzip the
-/// stream into a <c>.vmstate</c> sidecar.</item>
-/// <item>Load: QEMU `-incoming tcp:` listens; we connect and feed the gunzipped
-/// sidecar.</item>
+/// (QMP <c>get-win32-socket</c>) and used with <c>migrate fd:</c>; we optionally
+/// gzip the stream into a <c>.uqsnap</c> asset.</item>
+/// <item>Load: QEMU <c>-incoming tcp:</c> listens; we connect and feed the (possibly
+/// gunzipped) <c>.uqsnap</c> stream.</item>
 /// </list>
 /// Why <c>fd:</c> instead of <c>tcp:</c> for saving: QEMU delivers outgoing TCP
 /// connect completion via a glib *idle* source on its main loop. A restored guest
@@ -96,12 +96,14 @@ public static class MigrationRelay
         }
 
         /// <summary>
-        /// Gzip everything QEMU writes into <paramref name="outputPath"/>
-        /// (written via temp + rename). Returns the compressed byte count.
+        /// Copy everything QEMU writes into <paramref name="outputPath"/>
+        /// (written via temp + rename). When <paramref name="gzip"/> is true, the
+        /// file is gzip-compressed. Returns the on-disk byte count.
         /// Ends at EOF, or — once <see cref="FinishAfterDrain"/> was called — when
         /// the socket has been silent for the drain window.
         /// </summary>
-        public Task<long> ReceiveToFileAsync(string outputPath, CancellationToken ct = default)
+        public Task<long> ReceiveToFileAsync(
+            string outputPath, bool gzip = true, CancellationToken ct = default)
         {
             Socket readEnd = _readEnd;
             return Task.Run(() =>
@@ -110,29 +112,15 @@ public static class MigrationRelay
                 try
                 {
                     using (FileStream file = File.Create(tmp))
-                    using (var gzip = new GZipStream(file, CompressionLevel.Fastest))
                     {
-                        var buffer = new byte[256 * 1024];
-                        var quiet = new Stopwatch();
-                        while (true)
+                        if (gzip)
                         {
-                            ct.ThrowIfCancellationRequested();
-                            // Readable == data available or connection closed.
-                            if (readEnd.Poll(200_000 /*µs*/, SelectMode.SelectRead))
-                            {
-                                int read = readEnd.Receive(buffer);
-                                if (read <= 0)
-                                    break; // EOF
-                                gzip.Write(buffer, 0, read);
-                                quiet.Reset();
-                            }
-                            else if (_drainQuietly)
-                            {
-                                if (!quiet.IsRunning)
-                                    quiet.Start();
-                                else if (quiet.ElapsedMilliseconds > 1500)
-                                    break; // completed + socket silent — stream drained
-                            }
+                            using (var gz = new GZipStream(file, CompressionLevel.Fastest))
+                                DrainSocketTo(readEnd, gz, ct);
+                        }
+                        else
+                        {
+                            DrainSocketTo(readEnd, file, ct);
                         }
                     }
 
@@ -147,6 +135,31 @@ public static class MigrationRelay
                     throw;
                 }
             }, ct);
+        }
+
+        void DrainSocketTo(Socket readEnd, Stream sink, CancellationToken ct)
+        {
+            var buffer = new byte[256 * 1024];
+            var quiet = new Stopwatch();
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (readEnd.Poll(200_000 /*µs*/, SelectMode.SelectRead))
+                {
+                    int read = readEnd.Receive(buffer);
+                    if (read <= 0)
+                        break; // EOF
+                    sink.Write(buffer, 0, read);
+                    quiet.Reset();
+                }
+                else if (_drainQuietly)
+                {
+                    if (!quiet.IsRunning)
+                        quiet.Start();
+                    else if (quiet.ElapsedMilliseconds > 1500)
+                        break; // completed + socket silent — stream drained
+                }
+            }
         }
 
         /// <summary>
@@ -181,17 +194,22 @@ public static class MigrationRelay
 
     /// <summary>
     /// Connect to a QEMU started with <c>-incoming tcp:127.0.0.1:port</c> (retrying while
-    /// it boots) and feed it the gunzipped contents of <paramref name="vmstatePath"/>.
+    /// it boots) and feed it the contents of <paramref name="vmstatePath"/>.
+    /// When <paramref name="gzip"/> is true, the file is gunzipped on the way in.
     /// Returns once the stream is fully written and half-closed. Whether QEMU
     /// accepted the state is observed via QMP runstate polling by the caller — QEMU
     /// may never close its side of the socket (see class remarks), so we don't wait
     /// for that.
     /// </summary>
     public static Task SendFromFileAsync(
-        int port, string vmstatePath, int connectTimeoutMs = 15_000, CancellationToken ct = default)
+        int port,
+        string vmstatePath,
+        bool gzip = true,
+        int connectTimeoutMs = 15_000,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(vmstatePath) || !File.Exists(vmstatePath))
-            throw new FileNotFoundException("vmstate sidecar not found", vmstatePath);
+            throw new FileNotFoundException("uqsnap machine-state file not found", vmstatePath);
 
         return Task.Run(() =>
         {
@@ -200,9 +218,16 @@ public static class MigrationRelay
             using (NetworkStream net = client.GetStream())
             {
                 using (FileStream file = File.OpenRead(vmstatePath))
-                using (var gzip = new GZipStream(file, CompressionMode.Decompress))
                 {
-                    Pump(gzip, net, ct);
+                    if (gzip)
+                    {
+                        using (var gz = new GZipStream(file, CompressionMode.Decompress))
+                            Pump(gz, net, ct);
+                    }
+                    else
+                    {
+                        Pump(file, net, ct);
+                    }
                 }
                 net.Flush();
                 // Half-close: QEMU reads to EOF, then applies the state.

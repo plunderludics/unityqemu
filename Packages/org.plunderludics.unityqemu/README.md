@@ -11,9 +11,10 @@ Run QEMU guests inside Unity (VNC framebuffer, QMP control, GDB memory access).
 
 ## Usage
 
-Add a `VirtualMachine` component and assign a `DiskAsset` (`diskAsset`):
-a plain `.qcow2` for a fresh boot, or a `.uqsnap` (same `DiskAsset` type with
-`uqsnapMetadata`) to resume saved state (`autoLoadVmState` on by default).
+Add a `VirtualMachine` component. Assign either:
+- a `DiskAsset` (`.qcow2`) for a cold boot, or
+- a `UqsnapAsset` (`snapshot`, `.uqsnap`) to resume saved machine state
+  (`autoLoadVmState` on by default; `diskAsset` is filled from the snapshot's linked disk).
 Drop `.iso` files into the project (imported as `CdRomAsset`) and assign them under
 launch config CD-ROMs. Then press Play or enable edit-mode run.
 

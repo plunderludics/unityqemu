@@ -6,11 +6,9 @@ using UnityEngine;
 
 namespace UnityQemu.Editor {
 /// <summary>
-/// Imports <c>.qcow2</c> and <c>.uqsnap</c> as <see cref="DiskAsset"/>.
-/// Snapshots set <see cref="hasUqsnapMetadata"/>; plain disks leave it false.
-/// QEMU must not write these files — use ephemeral Library work images.
+/// Imports <c>.qcow2</c> as a <see cref="DiskAsset"/>. Pure disk — no machine state.
 /// </summary>
-[ScriptedImporter(4, new[] { "qcow2", "uqsnap" })]
+[ScriptedImporter(6, "qcow2")]
 public class DiskAssetImporter : ScriptedImporter
 {
     [Tooltip("Immediate backing DiskAsset (from the qcow2 backing-file header).")]
@@ -20,16 +18,8 @@ public class DiskAssetImporter : ScriptedImporter
     [Tooltip("Freeform annotation stored on the imported DiskAsset.")]
     public string note;
 
-    [Tooltip("True for durable snapshots (.uqsnap). Cleared automatically for plain disks.")]
-    public bool hasUqsnapMetadata;
-
-    [Tooltip("Launch config and version metadata for durable snapshots.")]
-    public UqsnapMetadata uqsnapMetadata;
-
     public override void OnImportAsset(AssetImportContext ctx)
     {
-        bool isUqsnap = ctx.assetPath.EndsWith(".uqsnap", StringComparison.OrdinalIgnoreCase);
-
         DiskAsset resolvedBacking = null;
         try
         {
@@ -47,7 +37,6 @@ public class DiskAssetImporter : ScriptedImporter
                 }
                 else
                 {
-                    // Fix stale absolute backing paths from another checkout/machine.
                     string localBacking = resolvedBacking.GetQcow2FilesystemPath();
                     if (!string.IsNullOrEmpty(localBacking) && File.Exists(localBacking))
                     {
@@ -76,25 +65,20 @@ public class DiskAssetImporter : ScriptedImporter
         if (backingDisk != resolvedBacking && resolvedBacking != null)
             SchedulePersistInferredBacking(ctx.assetPath, resolvedBacking);
 
-        // Extension is authoritative for whether this file can be a durable snapshot.
-        if (isUqsnap)
-            hasUqsnapMetadata = true;
-        else
-            hasUqsnapMetadata = false;
-
         var disk = ScriptableObject.CreateInstance<DiskAsset>();
         disk.projectRelativeQcow2Path = ctx.assetPath.Replace('\\', '/');
         disk.backingDisk = resolvedBacking;
         disk.note = note ?? "";
         disk.label = Path.GetFileNameWithoutExtension(ctx.assetPath);
         disk.name = disk.label;
-        disk.hasUqsnapMetadata = hasUqsnapMetadata;
-        disk.uqsnapMetadata = hasUqsnapMetadata
-            ? (uqsnapMetadata != null ? uqsnapMetadata.Clone() : UqsnapMetadata.CreateEmpty())
-            : null;
 
         ctx.AddObjectToAsset("main", disk);
         ctx.SetMainObject(disk);
+
+        Texture2D icon = AssetDatabase.LoadAssetAtPath<Texture2D>(
+            "Packages/org.plunderludics.unityqemu/Editor/Icons/DiskAssetIcon.png");
+        if (icon != null)
+            EditorGUIUtility.SetIconForObject(disk, icon);
     }
 
     static void SchedulePersistInferredBacking(string imageAssetPath, DiskAsset inferredBacking)
@@ -122,33 +106,14 @@ public class DiskAssetImporter : ScriptedImporter
     }
 }
 
-/// <summary>
-/// Importer inspector: settings only. Tree / kind header live on <see cref="DiskAssetEditor"/>.
-/// Hides snapshot metadata fields for plain .qcow2 assets.
-/// </summary>
 [CustomEditor(typeof(DiskAssetImporter))]
 public class DiskAssetImporterEditor : ScriptedImporterEditor
 {
     public override void OnInspectorGUI()
     {
         serializedObject.Update();
-
         EditorGUILayout.PropertyField(serializedObject.FindProperty("backingDisk"));
         EditorGUILayout.PropertyField(serializedObject.FindProperty("note"));
-
-        string path = AssetDatabase.GetAssetPath(assetTarget);
-        bool isUqsnap = !string.IsNullOrEmpty(path) &&
-            path.EndsWith(".uqsnap", StringComparison.OrdinalIgnoreCase);
-        if (isUqsnap)
-        {
-            SerializedProperty hasMeta = serializedObject.FindProperty("hasUqsnapMetadata");
-            SerializedProperty meta = serializedObject.FindProperty("uqsnapMetadata");
-            if (hasMeta != null)
-                EditorGUILayout.PropertyField(hasMeta);
-            if (meta != null)
-                EditorGUILayout.PropertyField(meta, true);
-        }
-
         serializedObject.ApplyModifiedProperties();
         ApplyRevertGUI();
     }

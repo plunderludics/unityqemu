@@ -9,6 +9,7 @@ using System.Threading;
 using System;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.Serialization;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -26,23 +27,26 @@ public class VirtualMachine : MonoBehaviour
     GdbClient _gdbClient;
     bool _starting;
 
-    /// <summary>Active work overlay path when using <see cref="diskAsset"/> + ephemeral overlay.</summary>
+    /// <summary>Active work overlay path when using the boot disk + ephemeral overlay.</summary>
     string _workOverlayPath;
 
     /// <summary>
-    /// Set by <see cref="PrepareBootFromDisk"/>: the next start must boot the prepared work
+    /// Set by <see cref="PrepareBoot"/>: the next start must boot the prepared work
     /// image instead of minting a fresh one. Consumed by StartQemuAsync.
     /// </summary>
     bool _workPreparedForNextStart;
 
-    /// <summary>If set, <c>loadvm</c> this tag after QMP connects (legacy durable snapshot restore).</summary>
-    string _pendingLoadVmTag;
-
     /// <summary>
-    /// If set, the next start launches with <c>-incoming tcp:</c> and this <c>.vmstate</c>
-    /// sidecar is streamed in after QMP connects (D4 durable snapshot restore).
+    /// If set, the next start launches with <c>-incoming tcp:</c> and this machine-state
+    /// stream (<c>.uqsnap</c>) is fed in after QMP connects.
     /// </summary>
     string _pendingIncomingStatePath;
+
+    /// <summary>
+    /// Whether <see cref="_pendingIncomingStatePath"/> is gzip-compressed.
+    /// Default true matches older snapshots that omit the metadata flag.
+    /// </summary>
+    bool _pendingIncomingGzip = true;
 
     /// <summary>Loopback port QEMU listens on for <c>-incoming</c> when a state feed is pending.</summary>
     int _incomingPort;
@@ -80,22 +84,29 @@ public class VirtualMachine : MonoBehaviour
     public InputProvider inputProvider;
 
     [Tooltip("Run QEMU and stream the VNC texture while the editor is not in Play mode")]
-    public bool runInEditMode = false;
+    [FormerlySerializedAs("runInEditMode")]
+    public bool runVmInEditMode = false;
 
     [Header("Disk")]
     [Tooltip(
-        "Image to boot: a plain disk (.qcow2, boots fresh) or a snapshot (.uqsnap, " +
-        "restores its saved machine state when Auto Load Vm State is on).")]
-    [OnValueChanged(nameof(OnDiskAssetChanged))]
+        "Durable snapshot (.uqsnap) to boot on Play / auto-start. " +
+        "Not changed by SnapshotUI Load/Save — those update Session Current only.")]
+    [OnValueChanged(nameof(OnSnapshotChanged))]
+    public UqsnapAsset snapshot;
+
+    [Tooltip(
+        "Disk tip (.qcow2) for a cold boot when Snapshot is empty. " +
+        "Filled from Snapshot when one is assigned in this config.")]
+    [DisableIf(nameof(HasSnapshot))]
     public DiskAsset diskAsset;
 
-    [ShowIf(nameof(HasUqsnapInDiskSlot))]
+    [ShowIf(nameof(HasSnapshot))]
     [Tooltip(
         "When on (default), restore the snapshot's saved machine state on start. " +
         "Turn off to boot only its disk contents.")]
     public bool autoLoadVmState = true;
 
-    [ShowIf(nameof(HasUqsnapInDiskSlot))]
+    [ShowIf(nameof(HasSnapshot))]
     [Tooltip(
         "When off (default), launch with the memory / extra QEMU args / media that were " +
         "saved with the snapshot. Turn on to edit and use the Launch Config below instead.")]
@@ -106,7 +117,7 @@ public class VirtualMachine : MonoBehaviour
     [DisableIf(nameof(ShowLockedSnapshotLaunchConfig))]
     [Tooltip(
         "Extra QEMU args and removable media. " +
-        "With a .uqsnap and Override off, shows the snapshot's config (read-only).")]
+        "With a snapshot and Override off, shows the snapshot's config (read-only).")]
     public LaunchConfig launchConfig = LaunchConfig.CreateDefault();
 
     [Group("Advanced")]
@@ -121,17 +132,63 @@ public class VirtualMachine : MonoBehaviour
     [SerializeField] private bool gdbPhysicalMemory = true;
     [SerializeField] private RenderTexture outputTexture; // This is kind of unnecessary should just use _vncClient.Texture directly, ideally..
 
-    /// <summary>True when <see cref="diskAsset"/> is a .uqsnap (has <c>uqsnapMetadata</c>).</summary>
-    public bool HasUqsnapInDiskSlot => diskAsset != null && diskAsset.HasVmState;
+    /// <summary>
+    /// Tip this session is on (loaded/saved, or set from boot config at start).
+    /// Not serialized — does not alter <see cref="snapshot"/> / <see cref="diskAsset"/>.
+    /// </summary>
+    [NonSerialized] BootableAsset _sessionCurrent;
 
-    bool HasVmState => HasUqsnapInDiskSlot;
-    bool ShowLockedSnapshotLaunchConfig => HasUqsnapInDiskSlot && !overrideSnapshotLaunchConfig;
+    [ShowInInspector, ReadOnly]
+    [LabelText("Session Current")]
+    [PropertyTooltip(
+        "Live tip for this QEMU session (after Load/Save, or the boot config once started). " +
+        "Independent of the Snapshot / Disk slots above.")]
+    public BootableAsset sessionCurrent => _sessionCurrent;
+
+    /// <summary>True when boot-config <see cref="snapshot"/> is assigned.</summary>
+    public bool HasSnapshot => snapshot != null;
+
+    /// <summary>Disk tip from boot config only (Snapshot.disk or Disk Asset).</summary>
+    public DiskAsset ConfiguredDiskAsset =>
+        snapshot != null && snapshot.disk != null ? snapshot.disk : diskAsset;
 
     /// <summary>
-    /// Launch config stored on the boot .uqsnap, when it owns config (no override); else null.
+    /// Disk tip for -hda / overlays / save parents: session tip when set, else boot config.
+    /// </summary>
+    public DiskAsset ActiveDiskAsset
+    {
+        get
+        {
+            DiskAsset tip = _sessionCurrent != null ? _sessionCurrent.DiskTip : null;
+            return tip != null ? tip : ConfiguredDiskAsset;
+        }
+    }
+
+    bool ShowLockedSnapshotLaunchConfig => HasSnapshot && !overrideSnapshotLaunchConfig;
+
+    /// <summary>
+    /// Uqsnap that owns launch config for this session: session current if it is a
+    /// snapshot, otherwise the boot-config snapshot. Null when override is on.
+    /// </summary>
+    UqsnapAsset LaunchConfigOwnerSnap
+    {
+        get
+        {
+            if (overrideSnapshotLaunchConfig)
+                return null;
+            if (_sessionCurrent is UqsnapAsset sessionSnap)
+                return sessionSnap;
+            return HasSnapshot ? snapshot : null;
+        }
+    }
+
+    /// <summary>
+    /// Launch config stored on the owning uqsnap, when it owns config (no override); else null.
     /// </summary>
     LaunchConfig SnapshotOwnedLaunchConfig =>
-        HasVmState && !overrideSnapshotLaunchConfig ? diskAsset.uqsnapMetadata?.launchConfig : null;
+        LaunchConfigOwnerSnap != null
+            ? LaunchConfigOwnerSnap.GetStoredLaunchConfig()
+            : null;
 
     /// <summary>
     /// Launch config used for CD/floppy/host-folder/SMB when a uqsnap owns config; otherwise local.
@@ -169,13 +226,14 @@ public class VirtualMachine : MonoBehaviour
     bool AddToEffectiveLaunchConfig(Func<LaunchConfig, bool> append)
     {
         LaunchConfig target;
-        if (HasVmState && !overrideSnapshotLaunchConfig)
+        UqsnapAsset ownerSnap = LaunchConfigOwnerSnap;
+        if (ownerSnap != null)
         {
-            if (diskAsset.uqsnapMetadata == null)
-                diskAsset.uqsnapMetadata = UqsnapMetadata.CreateEmpty();
-            if (diskAsset.uqsnapMetadata.launchConfig == null)
-                diskAsset.uqsnapMetadata.launchConfig = LaunchConfig.CreateDefault();
-            target = diskAsset.uqsnapMetadata.launchConfig;
+            if (ownerSnap.metadata == null)
+                ownerSnap.metadata = UqsnapMetadata.CreateEmpty();
+            if (ownerSnap.metadata.launchConfig == null)
+                ownerSnap.metadata.launchConfig = LaunchConfig.CreateDefault();
+            target = ownerSnap.metadata.launchConfig;
         }
         else
         {
@@ -194,8 +252,8 @@ public class VirtualMachine : MonoBehaviour
             launchConfig.CopyFrom(target);
 
 #if UNITY_EDITOR
-        if (!ReferenceEquals(launchConfig, target))
-            UnityEditor.EditorUtility.SetDirty(diskAsset);
+        if (!ReferenceEquals(launchConfig, target) && ownerSnap != null)
+            UnityEditor.EditorUtility.SetDirty(ownerSnap);
         UnityEditor.EditorUtility.SetDirty(this);
 #endif
         return true;
@@ -212,46 +270,53 @@ public class VirtualMachine : MonoBehaviour
 
     void OnOverrideSnapshotLaunchConfigChanged()
     {
-        if (!HasVmState)
+        if (!HasSnapshot)
             return;
-        SyncLaunchConfigFromDiskMetadata();
+        SyncLaunchConfigFromSnapshotMetadata();
     }
 
-    void SyncLaunchConfigFromDiskMetadata()
+    void SyncLaunchConfigFromSnapshotMetadata()
     {
-        if (!HasVmState)
+        if (!HasSnapshot || snapshot == null)
             return;
         if (launchConfig == null)
             launchConfig = LaunchConfig.CreateDefault();
         launchConfig.CopyFrom(
-            diskAsset.uqsnapMetadata.launchConfig ?? LaunchConfig.CreateDefault());
+            snapshot.GetStoredLaunchConfig() ?? LaunchConfig.CreateDefault());
     }
 
-    void OnDiskAssetChanged()
+    void OnSnapshotChanged()
     {
-        if (HasVmState && !overrideSnapshotLaunchConfig)
-            SyncLaunchConfigFromDiskMetadata();
+        SyncDiskFromSnapshot();
+        if (HasSnapshot && !overrideSnapshotLaunchConfig)
+            SyncLaunchConfigFromSnapshotMetadata();
     }
 
-    bool ShouldRun => Application.isPlaying || runInEditMode;
+    /// <summary>Keep <see cref="diskAsset"/> mirrored from <see cref="snapshot"/> when set.</summary>
+    void SyncDiskFromSnapshot()
+    {
+        if (snapshot == null)
+            return;
+        diskAsset = snapshot.disk;
+    }
+
+    bool ShouldRun => Application.isPlaying || runVmInEditMode;
     bool IsRunning => _qemuProcess != null && !_qemuProcess.HasExited;
 
     /// <summary>
-    /// Error text from the most recent boot's state restore (legacy loadvm or incoming
-    /// migration), or null when it succeeded or no restore was requested. The boot
-    /// itself deliberately survives a failed restore (cold boot of the disk contents),
-    /// so tooling that needs the state — e.g. the legacy snapshot converter — checks this.
+    /// Error text from the most recent boot's incoming state restore, or null when
+    /// it succeeded or no restore was requested. The boot itself deliberately survives
+    /// a failed restore (cold boot of the disk contents), so tooling can check this.
     /// </summary>
     public string LastStateRestoreError { get; private set; }
 
     string ResolveDiskImagePath()
     {
-        if (diskAsset == null)
+        DiskAsset disk = ActiveDiskAsset;
+        if (disk == null)
             return null;
 
-        DiskOverlay.EnsureBackingChain(diskAsset);
-        if (ShouldByteCopyBoot)
-            return EnsureWorkOverlayForBoot();
+        DiskOverlay.EnsureBackingChain(disk);
 
         if (useEphemeralWorkOverlay)
         {
@@ -260,16 +325,8 @@ public class VirtualMachine : MonoBehaviour
                 return work;
         }
 
-        return diskAsset.GetQcow2FilesystemPath();
+        return disk.GetQcow2FilesystemPath();
     }
-
-    /// <summary>
-    /// Legacy .uqsnap images (embedded savevm, no .vmstate sidecar) must byte-copy into
-    /// the work file so loadvm can reach the embedded state. D4 snapshots (sidecar
-    /// present) and plain disks boot as a thin overlay instead.
-    /// </summary>
-    bool ShouldByteCopyBoot =>
-        HasVmState && diskAsset != null && !diskAsset.HasVmStateSidecar;
 
     /// <summary>Current -hda path (work overlay or configured disk).</summary>
     public string ActiveDiskPath =>
@@ -277,29 +334,10 @@ public class VirtualMachine : MonoBehaviour
 
     public string WorkOverlayPath => _workOverlayPath;
 
-    /// <summary>The configured boot image (plain disk or .uqsnap).</summary>
-    public DiskAsset ActiveDiskAsset => diskAsset;
 
-    /// <summary>
-    /// Canonical backing path for a correctly prepared work image:
-    /// byte-copied .uqsnap → its <see cref="DiskAsset.backingDisk"/>;
-    /// thin overlay → the boot disk itself.
-    /// </summary>
-    public string ExpectedWorkBackingFilesystemPath
-    {
-        get
-        {
-            if (diskAsset == null)
-                return null;
-            if (ShouldByteCopyBoot)
-            {
-                return diskAsset.backingDisk != null
-                    ? diskAsset.backingDisk.GetQcow2FilesystemPath()
-                    : null;
-            }
-            return diskAsset.GetQcow2FilesystemPath();
-        }
-    }
+    /// <summary>Canonical backing path for a thin work overlay: the boot disk tip.</summary>
+    public string ExpectedWorkBackingFilesystemPath =>
+        ActiveDiskAsset != null ? ActiveDiskAsset.GetQcow2FilesystemPath() : null;
 
     string WorkSessionId => $"{gameObject.name}-{GetInstanceID()}";
 
@@ -373,15 +411,15 @@ public class VirtualMachine : MonoBehaviour
 
     void WarnIfSnapshotLaunchMetadataMismatched()
     {
-        if (!HasVmState || overrideSnapshotLaunchConfig)
+        if (!HasSnapshot || overrideSnapshotLaunchConfig || snapshot == null)
             return;
 
-        UqsnapMetadata meta = diskAsset.uqsnapMetadata;
+        UqsnapMetadata meta = snapshot.metadata;
         string snapArgs = meta?.launchConfig != null ? meta.launchConfig.extraQemuArgs : null;
         if (string.IsNullOrWhiteSpace(snapArgs))
         {
             UnityEngine.Debug.LogWarning(
-                $"Disk '{diskAsset.name}' has no stored extra QEMU args — " +
+                $"Snapshot '{snapshot.name}' has no stored extra QEMU args — " +
                 "using the VirtualMachine Launch Config. Re-save the snapshot to record args.");
             return;
         }
@@ -392,36 +430,25 @@ public class VirtualMachine : MonoBehaviour
             !string.Equals(meta.qemuVersion, currentQemu, StringComparison.Ordinal))
         {
             UnityEngine.Debug.LogWarning(
-                $"Disk '{diskAsset.name}' was saved with QEMU '{meta.qemuVersion}', " +
+                $"Snapshot '{snapshot.name}' was saved with QEMU '{meta.qemuVersion}', " +
                 $"but this project has '{currentQemu}'. Restoring saved state may fail if " +
                 "the versions are incompatible.");
         }
     }
 
-    /// <summary>
-    /// Ensure a work image exists for the configured disk (thin overlay, or byte-copy for
-    /// legacy snapshots that still embed their state).
-    /// </summary>
+    /// <summary>Ensure a thin work overlay exists for the configured boot disk.</summary>
     public string EnsureWorkOverlayForBoot()
     {
-        if (diskAsset == null)
+        DiskAsset disk = ActiveDiskAsset;
+        if (disk == null)
             return null;
 
-        if (ShouldByteCopyBoot)
-        {
-            if (!IsValidByteCopyWorkImage())
-                PrepareBootFromDisk(diskAsset, loadVmState: autoLoadVmState);
-            else
-                RepairWorkBackingHeader();
-            return _workOverlayPath;
-        }
-
-        DiskOverlay.EnsureBackingChain(diskAsset);
-        string basePath = diskAsset.GetQcow2FilesystemPath();
+        DiskOverlay.EnsureBackingChain(disk);
+        string basePath = disk.GetQcow2FilesystemPath();
         if (string.IsNullOrEmpty(basePath) || !File.Exists(basePath))
         {
             UnityEngine.Debug.LogError(
-                $"DiskAsset '{diskAsset.name}' has no readable image at '{basePath}'");
+                $"DiskAsset '{disk.name}' has no readable image at '{basePath}'");
             return null;
         }
 
@@ -436,8 +463,8 @@ public class VirtualMachine : MonoBehaviour
 
     /// <summary>
     /// Thin work overlay must back onto the boot disk. Reject leftover work from a prior
-    /// .uqsnap session (byte-copy that backs onto a different parent) so switching back to
-    /// a plain base doesn't keep showing that child's guest disk.
+    /// session that backs onto a different parent so switching boot tips doesn't keep
+    /// showing that child's guest disk.
     /// </summary>
     bool IsValidThinWorkOverlay(string expectedBasePath)
     {
@@ -466,71 +493,38 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
-    /// True when the work file is a byte-copy of the boot .uqsnap: it must back onto
-    /// <see cref="DiskAsset.backingDisk"/>, not onto the boot .uqsnap itself (thin overlay).
+    /// Prepare the work image for booting <paramref name="snap"/> and queue its state
+    /// restore for the next start. Updates <see cref="sessionCurrent"/> only — does not
+    /// change boot-config <see cref="snapshot"/> / <see cref="diskAsset"/>.
+    /// Call while QEMU is stopped.
     /// </summary>
-    bool IsValidByteCopyWorkImage()
+    public void PrepareBoot(UqsnapAsset snap, bool loadVmState = true)
     {
-        if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
-            return false;
+        if (snap == null)
+            throw new ArgumentNullException(nameof(snap));
+        if (snap.disk == null)
+            throw new InvalidOperationException(
+                $"Snapshot '{snap.name}' has no linked disk tip to boot");
 
-        string expectedParent = ExpectedWorkBackingFilesystemPath;
-        if (string.IsNullOrEmpty(expectedParent))
-            return false;
-
-        try
-        {
-            string workBacking = DiskOverlay.GetBackingPath(_workOverlayPath);
-            if (DiskOverlay.PathsEqual(workBacking, expectedParent))
-                return true;
-
-            string bootPath = diskAsset.GetQcow2FilesystemPath();
-            if (DiskOverlay.PathsEqual(workBacking, bootPath))
-            {
-                UnityEngine.Debug.LogWarning(
-                    $"UnityQemu: work image is a thin overlay on '{diskAsset.name}'. " +
-                    "Replacing with a byte-copy.");
-            }
-            return false;
-        }
-        catch (Exception e)
-        {
-            UnityEngine.Debug.LogWarning(
-                $"UnityQemu: could not inspect work overlay; recreating. {e.Message}");
-            return false;
-        }
-    }
-
-    void RepairWorkBackingHeader()
-    {
-        string expected = ExpectedWorkBackingFilesystemPath;
-        if (string.IsNullOrEmpty(expected) || !File.Exists(expected))
-            return;
-        try
-        {
-            DiskOverlay.EnsureBackingMatches(_workOverlayPath, expected);
-        }
-        catch (Exception e)
-        {
-            UnityEngine.Debug.LogWarning(
-                $"UnityQemu: could not repair work backing header: {e.Message}");
-        }
+        SetSessionCurrent(snap);
+        PrepareBootDisk(snap.disk, loadVmState && snap.HasMachineState ? snap : null);
     }
 
     /// <summary>
-    /// Prepare the work image for booting <paramref name="disk"/> and queue its state
-    /// restore for the next start. Call while QEMU is stopped.
-    /// <list type="bullet">
-    /// <item>Legacy .uqsnap (embedded savevm): byte-copy + loadvm after boot.</item>
-    /// <item>D4 .uqsnap (.vmstate sidecar): thin overlay + incoming migration feed.</item>
-    /// <item>Plain disk: thin overlay, no state.</item>
-    /// </list>
+    /// Prepare a cold boot of a plain disk. Updates <see cref="sessionCurrent"/> only —
+    /// does not clear boot-config <see cref="snapshot"/>.
+    /// Call while QEMU is stopped.
     /// </summary>
-    public void PrepareBootFromDisk(DiskAsset disk, bool loadVmState = true)
+    public void PrepareBoot(DiskAsset disk)
     {
         if (disk == null)
             throw new ArgumentNullException(nameof(disk));
+        SetSessionCurrent(disk);
+        PrepareBootDisk(disk, state: null);
+    }
 
+    void PrepareBootDisk(DiskAsset disk, UqsnapAsset state)
+    {
         string imagePath = disk.GetQcow2FilesystemPath();
         if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
             throw new FileNotFoundException("Disk image not found", imagePath);
@@ -538,34 +532,31 @@ public class VirtualMachine : MonoBehaviour
         DiskOverlay.EnsureBackingChain(disk);
         ResetSessionLayers();
 
-        bool legacySnapshot = disk.HasVmState && !disk.HasVmStateSidecar;
-        if (legacySnapshot)
+        _workOverlayPath = DiskOverlay.CreateWorkOverlay(imagePath, WorkSessionId);
+        if (state != null)
         {
-            string expectedBacking = disk.backingDisk != null
-                ? disk.backingDisk.GetQcow2FilesystemPath()
-                : null;
-            _workOverlayPath = DiskOverlay.ReplaceWorkOverlayFromCopy(
-                imagePath, WorkSessionId, expectedBacking);
-            _pendingLoadVmTag = loadVmState ? DiskOverlay.DurableSaveVmTag : null;
-            _pendingIncomingStatePath = null;
+            _pendingIncomingStatePath = state.GetMachineStateFilesystemPath();
+            _pendingIncomingGzip = state.MachineStateIsCompressed;
         }
         else
         {
-            _workOverlayPath = DiskOverlay.CreateWorkOverlay(imagePath, WorkSessionId);
-            _pendingLoadVmTag = null;
-            _pendingIncomingStatePath = loadVmState && disk.HasVmStateSidecar
-                ? disk.GetVmStateSidecarPath()
-                : null;
+            _pendingIncomingStatePath = null;
+            _pendingIncomingGzip = true;
         }
 
         _workPreparedForNextStart = true;
-        diskAsset = disk;
-        if (disk.HasVmState && !overrideSnapshotLaunchConfig)
-            SyncLaunchConfigFromDiskMetadata();
         UnityEngine.Debug.Log(
-            $"Prepared boot from '{disk.name}' → {_workOverlayPath}" +
-            (_pendingLoadVmTag != null ? $" (loadvm {_pendingLoadVmTag})" : "") +
+            $"Prepared boot from '{(state != null ? state.name : disk.name)}' → {_workOverlayPath}" +
             (_pendingIncomingStatePath != null ? $" (incoming {_pendingIncomingStatePath})" : ""));
+    }
+
+    /// <summary>
+    /// Point session current at <paramref name="asset"/> without changing boot config
+    /// or rebuilding the work overlay (e.g. after a durable save while QEMU keeps running).
+    /// </summary>
+    public void SetSessionCurrent(BootableAsset asset)
+    {
+        _sessionCurrent = asset;
     }
 
     /// <summary>
@@ -578,12 +569,6 @@ public class VirtualMachine : MonoBehaviour
             DiskOverlay.TryDeleteWorkFile(layer);
         _sessionLayerPaths.Clear();
         _workLayerCounter = 0;
-    }
-
-    /// <summary>Queue a loadvm tag for the next successful QMP connect (cleared after attempt).</summary>
-    public void RequestLoadVmOnReady(string tag)
-    {
-        _pendingLoadVmTag = tag;
     }
 
 #if UNITY_EDITOR
@@ -930,7 +915,7 @@ public class VirtualMachine : MonoBehaviour
     void OnEnable()
     {
         if (ShowLockedSnapshotLaunchConfig)
-            SyncLaunchConfigFromDiskMetadata();
+            SyncLaunchConfigFromSnapshotMetadata();
 #if UNITY_EDITOR
         // Always drive edit-mode ticks while enabled; only skip auto-start during transitions.
         EditorApplication.update -= EditorTick;
@@ -953,6 +938,7 @@ public class VirtualMachine : MonoBehaviour
 
     void OnValidate()
     {
+        SyncDiskFromSnapshot();
 #if UNITY_EDITOR
         // Defer so we don't start processes during the OnValidate call stack.
         EditorApplication.delayCall -= OnValidateDeferred;
@@ -970,7 +956,7 @@ public class VirtualMachine : MonoBehaviour
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
 
-        if (!runInEditMode && !Application.isPlaying && IsRunning)
+        if (!runVmInEditMode && !Application.isPlaying && IsRunning)
         {
             StopQemu();
             return;
@@ -981,7 +967,7 @@ public class VirtualMachine : MonoBehaviour
 
     void EditorTick()
     {
-        if (Application.isPlaying || !runInEditMode || !enabled || !gameObject.activeInHierarchy)
+        if (Application.isPlaying || !runVmInEditMode || !enabled || !gameObject.activeInHierarchy)
             return;
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
@@ -1010,6 +996,11 @@ public class VirtualMachine : MonoBehaviour
         LastStateRestoreError = null;
         try
         {
+        // When a D4 state restore kills QEMU (e.g. overridden RAM), retry once without
+        // -incoming so the guest still boots with the snapshot's disk contents.
+        bool coldBootAfterFailedState = false;
+        for (int attempt = 0; ; attempt++)
+        {
         // Ensure a previous instance isn't still holding VNC/QMP/GDB ports.
         if (_qemuProcess != null)
         {
@@ -1018,7 +1009,9 @@ public class VirtualMachine : MonoBehaviour
 
         // Reclaim work images left behind by previous editor sessions (session ids embed
         // instance ids, which change across restarts). Locked files (running QEMU) are skipped.
-        CleanupOrphanedWorkOverlays();
+        // Skip on cold-boot retry — the thin work overlay from the failed attempt is still good.
+        if (!coldBootAfterFailedState)
+            CleanupOrphanedWorkOverlays();
         // Use Path.Combine to take advantage of unity's dark magic (somehow redirects to the actual package location in packagecache if needed)
         var qemuExe = ResolveQemuExecutablePath();
         // UnityEngine.Debug.Log($"QEMU executable: {qemuExe}");
@@ -1050,27 +1043,33 @@ public class VirtualMachine : MonoBehaviour
             process.StartInfo.ArgumentList.Add("sdl");
         }
 
-        // Every start boots a freshly minted work image (thin overlay or .uqsnap byte-copy).
-        // Exception: a boot prepared by the save/load pipeline (PrepareBootFromDisk) — that
+        // Every start boots a freshly minted thin work overlay.
+        // Exception: a boot prepared by the save/load pipeline (PrepareBoot) — that
         // work file must be used as-is. Discarding the path forces recreation in
-        // EnsureWorkOverlayForBoot.
-        bool preparedBoot = _workPreparedForNextStart;
+        // EnsureWorkOverlayForBoot. Cold-boot retry also keeps the prepared work image.
+        bool preparedBoot = _workPreparedForNextStart || coldBootAfterFailedState;
         if (!preparedBoot)
         {
             _workOverlayPath = null;
-            _pendingLoadVmTag = null;
             _pendingIncomingStatePath = null;
+            _pendingIncomingGzip = true;
             ResetSessionLayers();
+            // Session follows boot config on a normal start.
+            _sessionCurrent = snapshot != null ? (BootableAsset)snapshot : diskAsset;
+        }
+        else if (coldBootAfterFailedState)
+        {
+            _pendingIncomingStatePath = null;
+            _pendingIncomingGzip = true;
         }
         string hdaPath = ResolveDiskImagePath();
         _workPreparedForNextStart = false;
-        // Fresh start of a D4 snapshot: state comes from the .vmstate sidecar via -incoming.
-        // (ResolveDiskImagePath may itself have prepared a legacy loadvm boot instead.)
+        // Fresh start of a snapshot: state comes from the .uqsnap migration stream via -incoming.
         if (!preparedBoot && string.IsNullOrEmpty(_pendingIncomingStatePath) &&
-            string.IsNullOrEmpty(_pendingLoadVmTag) &&
-            HasVmState && autoLoadVmState && diskAsset.HasVmStateSidecar)
+            HasSnapshot && autoLoadVmState && snapshot != null && snapshot.HasMachineState)
         {
-            _pendingIncomingStatePath = diskAsset.GetVmStateSidecarPath();
+            _pendingIncomingStatePath = snapshot.GetMachineStateFilesystemPath();
+            _pendingIncomingGzip = snapshot.MachineStateIsCompressed;
         }
         if (!string.IsNullOrEmpty(hdaPath))
         {
@@ -1098,7 +1097,7 @@ public class VirtualMachine : MonoBehaviour
             else
             {
                 UnityEngine.Debug.LogWarning(
-                    $"UnityQemu: vmstate sidecar missing at '{_pendingIncomingStatePath}' — booting cold.");
+                    $"UnityQemu: machine-state file missing at '{_pendingIncomingStatePath}' — booting cold.");
                 _pendingIncomingStatePath = null;
             }
         }
@@ -1167,26 +1166,29 @@ public class VirtualMachine : MonoBehaviour
             await ConnectQmpAsync();
 
             string incomingStatePath = _pendingIncomingStatePath;
+            bool incomingGzip = _pendingIncomingGzip;
             _pendingIncomingStatePath = null;
+            _pendingIncomingGzip = true;
             if (!string.IsNullOrEmpty(incomingStatePath))
             {
-                // D4 restore: stream the sidecar into -incoming, quick-save, resume.
-                await FeedIncomingStateAsync(incomingStatePath);
-            }
-            else
-            {
-                // Legacy restore: loadvm the embedded savevm tag (byte-copied .uqsnap).
-                string loadTag = _pendingLoadVmTag;
-                _pendingLoadVmTag = null;
-                if (string.IsNullOrEmpty(loadTag) && HasVmState && autoLoadVmState &&
-                    !diskAsset.HasVmStateSidecar)
+                if (!IsRunning && attempt == 0)
                 {
-                    loadTag = DiskOverlay.DurableSaveVmTag;
+                    LastStateRestoreError =
+                        "emulator exited before state could be restored";
+                    UnityEngine.Debug.LogWarning(
+                        "Unable to load machine state from snapshot — starting with disk contents from boot.");
+                    coldBootAfterFailedState = true;
+                    continue;
                 }
 
-                if (!string.IsNullOrEmpty(loadTag))
+                // Stream the .uqsnap migration file into -incoming, quick-save, resume.
+                await FeedIncomingStateAsync(incomingStatePath, incomingGzip);
+                if (!string.IsNullOrEmpty(LastStateRestoreError) && attempt == 0)
                 {
-                    await LoadSaveStateAsync(loadTag);
+                    UnityEngine.Debug.LogWarning(
+                        "Unable to load machine state from snapshot — starting with disk contents from boot.");
+                    coldBootAfterFailedState = true;
+                    continue;
                 }
             }
         }
@@ -1204,6 +1206,8 @@ public class VirtualMachine : MonoBehaviour
 
         try { OnReady?.Invoke(); }
         catch (Exception e) { UnityEngine.Debug.LogException(e); }
+        break;
+        } // cold-boot retry loop
         }
         catch (Exception e)
         {
@@ -1418,27 +1422,29 @@ public class VirtualMachine : MonoBehaviour
             {
                 // HMP reports loadvm failures as output text, not an error response.
                 LastStateRestoreError = result.Trim();
-                UnityEngine.Debug.LogError($"loadvm {tag}: {result}");
+                UnityEngine.Debug.LogWarning($"Unable to load vm state from snapshot (loadvm {tag}): {result}");
             }
         }
         catch (Exception e)
         {
             LastStateRestoreError = e.Message;
-            UnityEngine.Debug.LogError($"Failed to load save state '{tag}': {e.Message}");
+            UnityEngine.Debug.LogWarning($"Unable to load vm state from snapshot '{tag}': {e.Message}");
         }
     }
 
     /// <summary>
-    /// D4 restore: stream a gzipped .vmstate sidecar into a QEMU launched with
+    /// D4 restore: stream a .uqsnap machine-state file into a QEMU launched with
     /// <c>-incoming tcp:</c>, wait for the load, quick-save into the fresh work overlay
     /// (so Reload with no prior quick-save rewinds to the just-loaded state), resume.
     /// </summary>
-    async Task FeedIncomingStateAsync(string vmstatePath)
+    async Task FeedIncomingStateAsync(string vmstatePath, bool gzip)
     {
         try
         {
-            UnityEngine.Debug.Log($"Restoring vmstate from '{vmstatePath}' (port {_incomingPort})…");
-            await MigrationRelay.SendFromFileAsync(_incomingPort, vmstatePath);
+            UnityEngine.Debug.Log(
+                $"Restoring machine state from '{vmstatePath}' " +
+                $"({(gzip ? "gzip" : "raw")}, port {_incomingPort})…");
+            await MigrationRelay.SendFromFileAsync(_incomingPort, vmstatePath, gzip);
             await WaitForRunStateToLeaveAsync("inmigrate", TimeSpan.FromSeconds(60));
 
             // Resume first: while paused after an incoming migration the block
@@ -1450,19 +1456,16 @@ public class VirtualMachine : MonoBehaviour
             if (!string.IsNullOrWhiteSpace(quickSave))
                 UnityEngine.Debug.LogWarning($"Post-restore quick-save: {quickSave.Trim()}");
 
-            UnityEngine.Debug.Log("vmstate restored");
+            UnityEngine.Debug.Log("machine state restored");
         }
         catch (Exception e)
         {
             LastStateRestoreError = e.Message;
             bool qemuDied = _qemuProcess == null || _qemuProcess.HasExited;
-            UnityEngine.Debug.LogError(
-                $"Failed to restore snapshot state from '{vmstatePath}': {e.Message}" +
+            UnityEngine.Debug.LogWarning(
+                $"Unable to load vm state from snapshot '{vmstatePath}': {e.Message}" +
                 (qemuDied
-                    ? "\nThe emulator exited while restoring saved state — usually the launch " +
-                      "config (memory, devices, media) no longer matches what was saved, " +
-                      "or the QEMU version differs. Turn off Auto Load Vm State to boot " +
-                      "only the disk contents."
+                    ? " (emulator exited — often a launch-config or QEMU-version mismatch)"
                     : ""));
         }
     }
@@ -1511,13 +1514,13 @@ public class VirtualMachine : MonoBehaviour
     /// D4 durable save, QEMU side: pause → freeze the current work layer as the session's
     /// disk delta (<c>blockdev-snapshot-sync</c>; a fresh layer becomes active) →
     /// quick-save into the new layer (must precede migrate: the postmigrate runstate
-    /// refuses savevm) → migrate RAM/CPU out into a gzipped
-    /// <paramref name="vmstateOutputPath"/> → resume.
+    /// refuses savevm) → migrate RAM/CPU out into <paramref name="vmstateOutputPath"/>
+    /// → resume. When <paramref name="gzip"/> is true, the file is gzip-compressed.
     /// The migration runs over a pre-connected duplicated socket (<c>migrate fd:</c>);
     /// see <see cref="MigrationRelay"/> for why <c>tcp:</c> can hang.
     /// Returns the frozen layer path for the offline disk-diff step. QEMU keeps running.
     /// </summary>
-    public async Task<string> CaptureStateAsync(string vmstateOutputPath)
+    public async Task<string> CaptureStateAsync(string vmstateOutputPath, bool gzip = true)
     {
         if (_qmpClient == null || !_qmpClient.IsConnected)
             throw new InvalidOperationException("QMP not connected");
@@ -1562,7 +1565,7 @@ public class VirtualMachine : MonoBehaviour
                     "get-win32-socket", fdArgs.ToString(Newtonsoft.Json.Formatting.None));
                 capture.CloseQemuEnd();
 
-                Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath);
+                Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath, gzip);
                 try
                 {
                     await _qmpClient.ExecuteCommandAsync(
@@ -1587,10 +1590,10 @@ public class VirtualMachine : MonoBehaviour
                 }
                 catch { /* already released by migrate */ }
                 capture.FinishAfterDrain();
-                long compressedBytes = await receiveTask;
+                long bytes = await receiveTask;
                 UnityEngine.Debug.Log(
-                    $"vmstate captured: {vmstateOutputPath} " +
-                    $"({compressedBytes / (1024.0 * 1024.0):F1} MB compressed)");
+                    $"machine state captured: {vmstateOutputPath} " +
+                    $"({bytes / (1024.0 * 1024.0):F1} MB{(gzip ? " gzip" : " raw")})");
             }
         }
         finally
