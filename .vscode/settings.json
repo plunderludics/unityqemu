@@ -1,0 +1,16 @@
+{
+  "dotnet.defaultSolution": "unityqemu.sln",
+  "files.exclude": {
+    "**/Library/": true,
+    "**/Temp/": true,
+    "**/Obj/": true,
+    "**/Build/": true,
+    "**/Logs/": true,
+    "**/.vs/": true
+  },
+  "search.exclude": {
+    "**/Library/": true,
+    "**/Temp/": true,
+    "**/Logs/": true
+  }
+}

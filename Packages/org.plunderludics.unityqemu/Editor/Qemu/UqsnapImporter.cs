@@ -8,7 +8,7 @@ namespace UnityQemu.Editor {
 /// Imports <c>.uqsnap</c> as a <see cref="UqsnapAsset"/> (migration stream + disk ref + metadata).
 /// Optional sibling <c>.png</c> (same basename) becomes <see cref="UqsnapAsset.screenshot"/> and the Project icon.
 /// </summary>
-[ScriptedImporter(4, "uqsnap")]
+[ScriptedImporter(5, "uqsnap")]
 public class UqsnapImporter : ScriptedImporter
 {
     [Tooltip("Disk tip this machine state belongs to.")]
@@ -21,11 +21,25 @@ public class UqsnapImporter : ScriptedImporter
     [Tooltip("Launch config and version metadata.")]
     public UqsnapMetadata metadata;
 
+    /// <summary>
+    /// Prefer importing the sibling <c>.qcow2</c> before this <c>.uqsnap</c>, and reimport
+    /// when that disk's import result changes. Must not call AssetDatabase APIs.
+    /// </summary>
+    public static string[] GatherDependenciesFromSourceFile(string assetPath)
+    {
+        string qcow2Path = Path.ChangeExtension(assetPath, ".qcow2").Replace('\\', '/');
+        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", qcow2Path));
+        if (!File.Exists(full))
+            return System.Array.Empty<string>();
+        return new[] { qcow2Path };
+    }
+
     public override void OnImportAsset(AssetImportContext ctx)
     {
-        // Foo.uqsnap ↔ Foo.qcow2 — reimport when the sibling disk appears/changes.
+        // Foo.uqsnap ↔ Foo.qcow2 — artifact dep so we reimport when the DiskAsset appears
+        // (DependsOnSourceAsset alone does not fire on the sibling's first import).
         string qcow2Path = Path.ChangeExtension(ctx.assetPath, ".qcow2").Replace('\\', '/');
-        ctx.DependsOnSourceAsset(qcow2Path);
+        ctx.DependsOnArtifact(qcow2Path);
 
         if (disk == null)
         {
@@ -38,8 +52,7 @@ public class UqsnapImporter : ScriptedImporter
         Texture2D screenshot = null;
         if (!string.IsNullOrEmpty(pngPath))
         {
-            // Reimport this .uqsnap when the sibling preview changes.
-            ctx.DependsOnSourceAsset(pngPath);
+            ctx.DependsOnArtifact(pngPath);
             screenshot = AssetDatabase.LoadAssetAtPath<Texture2D>(pngPath);
         }
 
@@ -66,9 +79,20 @@ public class UqsnapImporter : ScriptedImporter
 
         if (disk == null)
         {
-            ctx.LogImportWarning(
-                $"No DiskAsset linked and no sibling '{qcow2Path}'. " +
-                "Assign Disk on the importer, or use UnityQemu → Repair Uqsnap Disk Links.");
+            string fullQcow2 = Path.GetFullPath(
+                Path.Combine(Application.dataPath, "..", qcow2Path));
+            if (File.Exists(fullQcow2))
+            {
+                ctx.LogImportWarning(
+                    $"Sibling '{qcow2Path}' has no DiskAsset yet; " +
+                    "will retry when that asset finishes importing.");
+            }
+            else
+            {
+                ctx.LogImportWarning(
+                    $"No DiskAsset linked and no sibling file at '{qcow2Path}'. " +
+                    "Assign Disk on the importer, or use UnityQemu → Repair Uqsnap Disk Links.");
+            }
         }
     }
 
