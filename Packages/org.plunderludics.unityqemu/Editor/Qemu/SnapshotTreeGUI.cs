@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using UnityEditor;
 using UnityEngine;
 
@@ -15,14 +14,16 @@ public static class SnapshotTreeGUI
     const float HeaderRowHeight = 16f;
     const float Indent = 18f;
     const float ConnectorWidth = 14f;
+    const float FoldoutWidth = 14f;
     const float SizeColWidth = 48f;
     const float SizeColsGap = 4f;
 
     static GUIStyle _headerLabel;
     static GUIStyle _columnHeader;
     static GUIStyle _diskLabel;
+    static GUIStyle _diskLabelSelected;
     static GUIStyle _snapLabel;
-    static GUIStyle _selectedLabel;
+    static GUIStyle _snapLabelSelected;
     static GUIStyle _diskSizeBadge;
     static GUIStyle _stateSizeBadge;
 
@@ -38,9 +39,9 @@ public static class SnapshotTreeGUI
 
         EnsureStyles();
 
-        // One scan each per inspector paint — not once per tree row.
-        snapsByDisk ??= UqsnapAsset.BuildIndexByDisk();
-        var childrenByParent = DiskAsset.BuildChildrenIndex();
+        // Cached across inspector Layout/Repaint; invalidated when .qcow2 / .uqsnap change.
+        snapsByDisk ??= SnapshotTreeCache.SnapsByDisk();
+        var childrenByParent = SnapshotTreeCache.ChildrenByParent();
 
         EditorGUILayout.Space(4);
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
@@ -54,7 +55,7 @@ public static class SnapshotTreeGUI
 
             EditorGUILayout.Space(2);
             EditorGUILayout.LabelField(
-                "▣ disk   ★ this asset — click to select. State size is from linked .uqsnap(s).",
+                "▣ disk (grey)   ○ has .uqsnap (blue)   ★ this asset — click to select.",
                 EditorStyles.miniLabel);
         }
         EditorGUILayout.Space(4);
@@ -86,6 +87,11 @@ public static class SnapshotTreeGUI
         Dictionary<DiskAsset, List<DiskAsset>> childrenByParent)
     {
         ancestorLast.Add(isLast);
+        if (!childrenByParent.TryGetValue(node, out List<DiskAsset> children))
+            children = s_EmptyDisks;
+
+        bool hasChildren = children.Count > 0;
+        bool expanded = !hasChildren || GetExpanded(node);
         GetNodeSizes(node, snapsByDisk, out string diskLabel, out string stateLabel);
         bool hasSnap = snapsByDisk.TryGetValue(node, out var snaps) && snaps.Count > 0;
         DrawNodeRow(
@@ -97,17 +103,20 @@ public static class SnapshotTreeGUI
             depth: depth,
             isLast: isLast,
             ancestorLast: ancestorLast,
+            hasChildren: hasChildren,
+            expanded: expanded,
             selected: node == focus,
             asset: node);
 
-        if (!childrenByParent.TryGetValue(node, out List<DiskAsset> children))
-            children = s_EmptyDisks;
-        for (int i = 0; i < children.Count; i++)
+        if (expanded)
         {
-            bool childLast = i == children.Count - 1;
-            DrawBranch(
-                children[i], focus, depth + 1, childLast, ancestorLast,
-                snapsByDisk, childrenByParent);
+            for (int i = 0; i < children.Count; i++)
+            {
+                bool childLast = i == children.Count - 1;
+                DrawBranch(
+                    children[i], focus, depth + 1, childLast, ancestorLast,
+                    snapsByDisk, childrenByParent);
+            }
         }
         ancestorLast.RemoveAt(ancestorLast.Count - 1);
     }
@@ -125,6 +134,8 @@ public static class SnapshotTreeGUI
         int depth,
         bool isLast,
         List<bool> ancestorLast,
+        bool hasChildren,
+        bool expanded,
         bool selected,
         DiskAsset asset)
     {
@@ -132,11 +143,13 @@ public static class SnapshotTreeGUI
         bool hover = !selected && row.Contains(Event.current.mousePosition);
 
         if (selected)
-            EditorGUI.DrawRect(Pad(row, 1), new Color(0.95f, 0.72f, 0.25f, 0.35f));
+            EditorGUI.DrawRect(Pad(row, 1), kind == NodeKind.Disk
+                ? new Color(0.7f, 0.7f, 0.72f, 0.22f)
+                : new Color(0.35f, 0.55f, 0.9f, 0.22f));
         else if (hover)
             EditorGUI.DrawRect(row, kind == NodeKind.Disk
-                ? new Color(0.35f, 0.55f, 0.85f, 0.12f)
-                : new Color(0.45f, 0.7f, 0.45f, 0.12f));
+                ? new Color(0.55f, 0.55f, 0.55f, 0.14f)
+                : new Color(0.35f, 0.55f, 0.85f, 0.14f));
 
         if (ancestorLast != null)
         {
@@ -172,27 +185,27 @@ public static class SnapshotTreeGUI
             x = row.x + 6;
         }
 
-        string marker;
-        GUIStyle style;
-        if (kind == NodeKind.Disk)
-        {
-            marker = "▣";
-            style = _diskLabel;
-        }
-        else if (selected)
-        {
-            marker = "★";
-            style = _selectedLabel;
-        }
-        else
-        {
-            marker = "○";
-            style = _snapLabel;
-        }
+        // Grey = disk-only, blue = has .uqsnap. ★ marks the inspected asset.
+        string marker = selected ? "★" : (kind == NodeKind.Disk ? "▣" : "○");
+        GUIStyle style = kind == NodeKind.Disk
+            ? (selected ? _diskLabelSelected : _diskLabel)
+            : (selected ? _snapLabelSelected : _snapLabel);
 
         GetSizeColumnRects(row, out Rect diskRect, out Rect stateRect);
         float rightPad = row.xMax - diskRect.x + 4;
-        var labelRect = new Rect(x, row.y, Mathf.Max(40, row.xMax - x - rightPad), row.height);
+        Rect foldoutRect = new Rect(x, row.y + 2f, FoldoutWidth, row.height - 4f);
+        if (hasChildren)
+        {
+            EditorGUI.BeginChangeCheck();
+            bool nextExpanded = EditorGUI.Foldout(foldoutRect, expanded, GUIContent.none, false);
+            if (EditorGUI.EndChangeCheck())
+                SetExpanded(asset, nextExpanded);
+        }
+
+        // Reserve the foldout gutter for every node so labels at the same depth
+        // remain aligned when only some of them have children.
+        float labelX = x + FoldoutWidth;
+        var labelRect = new Rect(labelX, row.y, Mathf.Max(40, row.xMax - labelX - rightPad), row.height);
         EditorGUIUtility.AddCursorRect(labelRect, MouseCursor.Link);
 
         Event e = Event.current;
@@ -224,32 +237,26 @@ public static class SnapshotTreeGUI
         diskLabel = "—";
         stateLabel = "—";
         string imagePath = node.GetQcow2FilesystemPath();
-        if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
+        long? diskBytes = SnapshotTreeCache.GetFileLength(imagePath);
+        if (diskBytes == null)
             return;
-        try
+
+        diskLabel = FormatBytesCompact(diskBytes.Value);
+        long stateBytes = 0;
+        bool any = false;
+        if (snapsByDisk.TryGetValue(node, out List<UqsnapAsset> snaps))
         {
-            diskLabel = FormatBytesCompact(new FileInfo(imagePath).Length);
-            long stateBytes = 0;
-            bool any = false;
-            if (snapsByDisk.TryGetValue(node, out List<UqsnapAsset> snaps))
+            foreach (UqsnapAsset snap in snaps)
             {
-                foreach (UqsnapAsset snap in snaps)
-                {
-                    string statePath = snap.GetMachineStateFilesystemPath();
-                    if (string.IsNullOrEmpty(statePath) || !File.Exists(statePath))
-                        continue;
-                    stateBytes += new FileInfo(statePath).Length;
-                    any = true;
-                }
+                long? len = SnapshotTreeCache.GetFileLength(snap.GetMachineStateFilesystemPath());
+                if (len == null)
+                    continue;
+                stateBytes += len.Value;
+                any = true;
             }
-            if (any)
-                stateLabel = FormatBytesCompact(stateBytes);
         }
-        catch
-        {
-            diskLabel = "—";
-            stateLabel = "—";
-        }
+        if (any)
+            stateLabel = FormatBytesCompact(stateBytes);
     }
 
     /// <summary>Short form for tight tree badges: <c>7M</c>, <c>1.2G</c>.</summary>
@@ -293,6 +300,29 @@ public static class SnapshotTreeGUI
         EditorGUIUtility.PingObject(asset);
     }
 
+    static bool GetExpanded(DiskAsset asset)
+    {
+        if (asset == null)
+            return true;
+        return SessionState.GetBool(GetExpandedKey(asset), true);
+    }
+
+    static void SetExpanded(DiskAsset asset, bool expanded)
+    {
+        if (asset == null)
+            return;
+        SessionState.SetBool(GetExpandedKey(asset), expanded);
+    }
+
+    static string GetExpandedKey(DiskAsset asset)
+    {
+        string assetPath = AssetDatabase.GetAssetPath(asset);
+        string guid = string.IsNullOrEmpty(assetPath) ? null : AssetDatabase.AssetPathToGUID(assetPath);
+        if (!string.IsNullOrEmpty(guid))
+            return $"UnityQemu.SnapshotTreeGUI.Expanded.{guid}";
+        return $"UnityQemu.SnapshotTreeGUI.Expanded.Instance.{asset.GetInstanceID()}";
+    }
+
     static Rect Pad(Rect r, float pad) =>
         new Rect(r.x + pad, r.y + pad, r.width - pad * 2, r.height - pad * 2);
 
@@ -317,6 +347,7 @@ public static class SnapshotTreeGUI
             ? new Color(0.65f, 0.65f, 0.65f, 0.9f)
             : new Color(0.4f, 0.4f, 0.4f, 0.9f);
 
+        // Grey — disk-only tips
         _diskLabel = new GUIStyle(EditorStyles.label)
         {
             alignment = TextAnchor.MiddleLeft,
@@ -324,43 +355,49 @@ public static class SnapshotTreeGUI
             padding = new RectOffset(2, 2, 0, 0),
         };
         _diskLabel.normal.textColor = EditorGUIUtility.isProSkin
-            ? new Color(0.65f, 0.82f, 1f)
-            : new Color(0.15f, 0.35f, 0.65f);
+            ? new Color(0.72f, 0.72f, 0.74f)
+            : new Color(0.35f, 0.35f, 0.38f);
 
+        _diskLabelSelected = new GUIStyle(_diskLabel);
+        _diskLabelSelected.normal.textColor = EditorGUIUtility.isProSkin
+            ? new Color(0.9f, 0.9f, 0.92f)
+            : new Color(0.18f, 0.18f, 0.2f);
+
+        // Blue — tips with linked .uqsnap
         _snapLabel = new GUIStyle(EditorStyles.label)
         {
             alignment = TextAnchor.MiddleLeft,
             padding = new RectOffset(2, 2, 0, 0),
         };
         _snapLabel.normal.textColor = EditorGUIUtility.isProSkin
-            ? new Color(0.75f, 0.92f, 0.75f)
-            : new Color(0.12f, 0.42f, 0.18f);
+            ? new Color(0.65f, 0.82f, 1f)
+            : new Color(0.15f, 0.35f, 0.65f);
 
-        _selectedLabel = new GUIStyle(_snapLabel)
+        _snapLabelSelected = new GUIStyle(_snapLabel)
         {
             fontStyle = FontStyle.Bold,
         };
-        _selectedLabel.normal.textColor = EditorGUIUtility.isProSkin
-            ? new Color(1f, 0.92f, 0.65f)
-            : new Color(0.45f, 0.28f, 0.02f);
+        _snapLabelSelected.normal.textColor = EditorGUIUtility.isProSkin
+            ? new Color(0.8f, 0.92f, 1f)
+            : new Color(0.08f, 0.28f, 0.58f);
 
-        // Cool blue — disk overlay size
+        // Grey — disk overlay size (matches DiskAsset)
         _diskSizeBadge = new GUIStyle(EditorStyles.miniLabel)
         {
             alignment = TextAnchor.MiddleRight,
         };
         _diskSizeBadge.normal.textColor = EditorGUIUtility.isProSkin
-            ? new Color(0.55f, 0.78f, 1f, 0.95f)
-            : new Color(0.15f, 0.4f, 0.7f, 0.95f);
+            ? new Color(0.7f, 0.7f, 0.72f, 0.95f)
+            : new Color(0.38f, 0.38f, 0.4f, 0.95f);
 
-        // Warm amber — machine state size
+        // Blue — machine state size (matches Uqsnap)
         _stateSizeBadge = new GUIStyle(EditorStyles.miniLabel)
         {
             alignment = TextAnchor.MiddleRight,
         };
         _stateSizeBadge.normal.textColor = EditorGUIUtility.isProSkin
-            ? new Color(1f, 0.78f, 0.45f, 0.95f)
-            : new Color(0.65f, 0.4f, 0.08f, 0.95f);
+            ? new Color(0.55f, 0.78f, 1f, 0.95f)
+            : new Color(0.15f, 0.4f, 0.7f, 0.95f);
     }
 }
 }

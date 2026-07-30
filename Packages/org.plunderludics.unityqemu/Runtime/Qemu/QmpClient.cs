@@ -131,7 +131,12 @@ public class QmpClient : IDisposable
 
             if (response["event"] != null)
             {
-                LogVerbose($"QMP event: {responseLine}");
+                string eventName = response["event"]?.ToString() ?? "?";
+                // Routine lifecycle noise (our own device_del, pause/resume) stays Verbose-only.
+                if (Verbose)
+                    Debug.Log($"QMP event: {responseLine}");
+                else if (!IsRoutineQmpEvent(eventName))
+                    Debug.Log($"QMP event: {eventName}");
                 continue;
             }
 
@@ -142,7 +147,10 @@ public class QmpClient : IDisposable
                 JToken error = response["error"];
                 string errorClass = error["class"]?.ToString() ?? "Unknown";
                 string errorDesc = error["desc"]?.ToString() ?? "Unknown error";
-                throw new Exception($"QMP command failed: {errorClass} - {errorDesc}");
+                string message = $"QMP `{command}` failed: {errorClass} - {errorDesc}";
+                // Always surface — callers sometimes catch/swallow.
+                Debug.LogWarning(message);
+                throw new Exception(message);
             }
 
             if (response["id"] != null && response["id"].Value<int>() != commandId)
@@ -157,6 +165,10 @@ public class QmpClient : IDisposable
 
     /// <summary>
     /// Run a Human Monitor Protocol (HMP) command via QMP passthrough.
+    /// Returns the raw reply. Most mutating commands succeed with an empty string;
+    /// <c>drive_add if=none</c> prints <c>OK</c>. Failures put other text in the reply
+    /// (often without the word "error"). Prefer
+    /// <see cref="VirtualMachine.RunHumanMonitorCommandOrThrowAsync"/>.
     /// </summary>
     public async Task<string> RunHumanMonitorCommandAsync(string commandLine)
     {
@@ -178,6 +190,30 @@ public class QmpClient : IDisposable
     {
         if (Verbose)
             Debug.Log(message);
+    }
+
+    /// <summary>
+    /// Expected chatter during pause/resume, hotplug, and RTC — not worth a console line
+    /// unless <see cref="Verbose"/> is on. Unusual events (SHUTDOWN, GUEST_PANICKED, …) still log.
+    /// </summary>
+    static bool IsRoutineQmpEvent(string eventName)
+    {
+        switch (eventName)
+        {
+            case "DEVICE_DELETED":
+            case "DEVICE_TRAY_MOVED":
+            case "STOP":
+            case "RESUME":
+            case "RESET":
+            case "WAKEUP":
+            case "SUSPEND":
+            case "SUSPEND_DISK":
+            case "RTC_CHANGE":
+            case "BALLOON_CHANGE":
+                return true;
+            default:
+                return false;
+        }
     }
 
     public void Dispose()

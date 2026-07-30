@@ -18,6 +18,8 @@ public static class Win32X86GuestMemory
         public int ImageFileName;
         /// <summary>Embedded MM_AVL_TABLE sentinel (XP SP3).</summary>
         public int VadRoot;
+        /// <summary>Main EXE image base (PEB-equivalent; XP SP3).</summary>
+        public int SectionBaseAddress;
     }
 
     public static EprocessOffsets XpSp3Defaults => new EprocessOffsets
@@ -27,6 +29,7 @@ public static class Win32X86GuestMemory
         ActiveProcessLinks = 0x88,
         ImageFileName = 0x174,
         VadRoot = 0x11C,
+        SectionBaseAddress = 0x138,
     };
 
     /// <summary>MMVAD node layout when EPROCESS.VadRoot is an MM_AVL_TABLE (XP SP3).</summary>

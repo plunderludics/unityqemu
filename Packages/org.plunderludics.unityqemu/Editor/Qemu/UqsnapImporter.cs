@@ -91,71 +91,9 @@ public class UqsnapImporter : ScriptedImporter
             {
                 ctx.LogImportWarning(
                     $"No DiskAsset linked and no sibling file at '{qcow2Path}'. " +
-                    "Assign Disk on the importer, or use UnityQemu → Repair Uqsnap Disk Links.");
+                    "Assign Disk on the importer, or add a matching .qcow2 beside this .uqsnap.");
             }
         }
-    }
-
-    /// <summary>
-    /// For each .uqsnap with a null/missing disk, link the sibling .qcow2 DiskAsset when present.
-    /// </summary>
-    [MenuItem("UnityQemu/Repair Uqsnap Disk Links")]
-    public static void RepairAllDiskLinks()
-    {
-        int fixedCount = 0;
-        int alreadyOk = 0;
-        int missingSibling = 0;
-        string[] guids = AssetDatabase.FindAssets("t:UqsnapAsset");
-        try
-        {
-            for (int i = 0; i < guids.Length; i++)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guids[i]);
-                if (!UqsnapAsset.IsUqsnapAssetPath(path))
-                    continue;
-                EditorUtility.DisplayProgressBar(
-                    "Repair Uqsnap Disk Links", path, (float)i / guids.Length);
-
-                var snap = AssetDatabase.LoadAssetAtPath<UqsnapAsset>(path);
-                var importer = AssetImporter.GetAtPath(path) as UqsnapImporter;
-                if (importer == null)
-                    continue;
-
-                DiskAsset current = snap != null ? snap.disk : importer.disk;
-                if (current != null)
-                {
-                    alreadyOk++;
-                    continue;
-                }
-
-                string qcow2Path = Path.ChangeExtension(path, ".qcow2").Replace('\\', '/');
-                DiskAsset sibling = AssetDatabase.LoadAssetAtPath<DiskAsset>(qcow2Path);
-                if (sibling == null)
-                {
-                    missingSibling++;
-                    Debug.LogWarning(
-                        $"UnityQemu: '{path}' has no disk and no sibling DiskAsset at '{qcow2Path}'");
-                    continue;
-                }
-
-                importer.disk = sibling;
-                EditorUtility.SetDirty(importer);
-                AssetDatabase.WriteImportSettingsIfDirty(path);
-                importer.SaveAndReimport();
-                fixedCount++;
-                Debug.Log($"UnityQemu linked disk for '{path}': '{qcow2Path}'");
-            }
-        }
-        finally
-        {
-            EditorUtility.ClearProgressBar();
-        }
-
-        AssetDatabase.SaveAssets();
-        EditorUtility.DisplayDialog(
-            "Repair Uqsnap Disk Links",
-            $"Fixed: {fixedCount}\nAlready linked: {alreadyOk}\nNo sibling .qcow2: {missingSibling}",
-            "OK");
     }
 
     static void SchedulePersistDisk(string uqsnapPath, DiskAsset inferredDisk)

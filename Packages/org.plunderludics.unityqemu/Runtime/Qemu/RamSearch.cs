@@ -227,9 +227,18 @@ public class RamSearch : MonoBehaviour
 
     // --- RAM search: manual candidate entry ---
 
+    [Group("RAM search/add")]
+    [ShowInInspector, ReadOnly]
+    [ShowIf(nameof(HasActiveImageBase))]
+    [Tooltip("Main EXE base of the active process — use with +RVA / NAME+RVA below")]
+    string ActiveModuleBase =>
+        $"{_activeImageName} @ 0x{_activeImageBase:X8}  (enter +RVA or {_activeImageName}+RVA)";
+
     [Group("RAM search/add/row")]
     [HideLabel]
-    [Tooltip("Physical address to add — hex (0x12AB00 or 12AB00) ")]
+    [Tooltip(
+        "Physical hex (0x12AB00), process VA (va:00A9C590), " +
+        "or module RVA (RCT.EXE+69C590 / +69C590)")]
     public string manualAddress = "";
 
     [Group("RAM search/add/row")]
@@ -238,35 +247,37 @@ public class RamSearch : MonoBehaviour
     public void AddManualCandidate()
     {
         if (!Ready(out string err)) { status = err; return; }
-        if (!TryParseAddress(manualAddress, out long address))
-        {
-            status = $"Cannot parse address '{manualAddress}' — use hex like 0x0012AB00";
-            return;
-        }
-        if (_cands.Any(c => c.Address == address))
-        {
-            status = $"0x{address:X8} is already a candidate";
-            return;
-        }
 
         int size = Mathf.Clamp(valueSize, 1, 4);
-        uint value = 0;
+        long address;
+        string how;
+        uint value;
         try
         {
             using (virtualMachine.BeginMemorySession())
             {
+                if (!TryResolveManualAddress(manualAddress, out address, out how, out err))
+                {
+                    status = err;
+                    return;
+                }
+                if (_cands.Any(c => c.Address == address))
+                {
+                    status = $"0x{address:X8} is already a candidate";
+                    return;
+                }
                 byte[] mem = virtualMachine.ReadBytes(address, size);
                 value = ReadValue(mem, 0, size);
             }
         }
         catch (Exception e)
         {
-            status = $"Read failed @ 0x{address:X8}: {e.Message}";
+            status = $"Add failed: {e.Message}";
             return;
         }
 
         _cands.Add(new Candidate { Address = address, LastValue = value });
-        status = $"Added 0x{address:X8} = {value} ({_cands.Count} candidates)";
+        status = $"Added {how} → phys 0x{address:X8} = {value} ({_cands.Count} candidates)";
         RebuildCandidateEntries();
     }
 
@@ -329,11 +340,15 @@ public class RamSearch : MonoBehaviour
     readonly List<Candidate> _cands = new List<Candidate>();
     int _activeIndex = -1;
     float _nextCandidateRefresh;
+    uint _activeImageBase;
+    uint _activeDirectoryTableBase;
+    string _activeImageName = "";
 
     public IReadOnlyList<Win32X86GuestMemory.GuestProcess> Processes => _processes;
     public IReadOnlyList<Win32X86GuestMemory.PhysicalRange> SelectedPhysicalRegions => _selectedRegions;
 
     bool HasActiveRegions => _selectedRegions.Count > 0;
+    bool HasActiveImageBase => _activeImageBase != 0;
     bool HasCandidates => _cands.Count > 0;
     bool CanScan => GdbReady && (scanScope == GuestMemoryScanScope.FullPhysicalRam || HasActiveRegions);
     bool CanFilterCandidates => GdbReady && HasCandidates;
@@ -381,6 +396,9 @@ public class RamSearch : MonoBehaviour
         if (_processes.Count > 0)
             ApplyProcessNameFilter();
         autoRefreshInterval = Mathf.Max(0.05f, autoRefreshInterval);
+        // New field on older serialized components defaults to 0.
+        if (offsets.SectionBaseAddress == 0)
+            offsets.SectionBaseAddress = Win32X86GuestMemory.XpSp3Defaults.SectionBaseAddress;
     }
 
     void OnProcessNameFilterChanged()
@@ -451,6 +469,7 @@ public class RamSearch : MonoBehaviour
 
         _activeIndex = -1;
         _selectedRegions.Clear();
+        ClearActiveModuleContext();
         regionSummary = "";
         activeProcess = "(none — click Regions on a process)";
         string ramNote = guestRamMiB > 0 ? $", guest RAM {guestRamMiB} MiB" : "";
@@ -494,17 +513,21 @@ public class RamSearch : MonoBehaviour
         status = $"Walking VADs for {proc.Name} (PID {proc.Pid})...";
 
         _selectedRegions.Clear();
+        uint imageBase = 0;
         using (virtualMachine.BeginMemorySession())
         {
+            imageBase = ReadUInt32Phys(proc.EprocessPhysical + offsets.SectionBaseAddress);
             _selectedRegions.AddRange(
                 Win32X86GuestMemory.EnumerateUserPhysicalRanges(
                     ReadPhys, proc.DirectoryTableBase, kernelDtb, proc.EprocessVirtual, offsets));
         }
 
+        SetActiveModuleContext(proc.Name, proc.DirectoryTableBase, imageBase);
         long totalBytes = _selectedRegions.Sum(r => (long)r.Length);
         regionSummary = FormatRegions(proc, _selectedRegions, totalBytes);
         scanScope = GuestMemoryScanScope.ActiveProcess;
-        status = $"{proc.Name}: {_selectedRegions.Count} physical ranges, {totalBytes / 1024} KiB mapped";
+        string baseNote = imageBase != 0 ? $", image base 0x{imageBase:X8}" : "";
+        status = $"{proc.Name}: {_selectedRegions.Count} physical ranges, {totalBytes / 1024} KiB mapped{baseNote}";
         RebuildProcessEntries();
     }
 
@@ -527,7 +550,7 @@ public class RamSearch : MonoBehaviour
         }
 
         var proc = GetSelectedProcess();
-        memoryMapAsset.SetFrom(proc, _selectedRegions, systemEprocessPhysical);
+        memoryMapAsset.SetFrom(proc, _selectedRegions, systemEprocessPhysical, _activeImageBase);
 #if UNITY_EDITOR
         EditorUtility.SetDirty(memoryMapAsset);
         AssetDatabase.SaveAssets();
@@ -555,6 +578,10 @@ public class RamSearch : MonoBehaviour
         _activeIndex = -1;
         if (memoryMapAsset.systemEprocessPhysical != 0)
             systemEprocessPhysical = memoryMapAsset.systemEprocessPhysical;
+        SetActiveModuleContext(
+            memoryMapAsset.processName,
+            memoryMapAsset.directoryTableBase,
+            memoryMapAsset.imageBase);
         activeProcess = $"{memoryMapAsset.processName} (PID {memoryMapAsset.pid}) [saved map]";
         long totalBytes = memoryMapAsset.TotalBytes;
         regionSummary = FormatSavedMapSummary(memoryMapAsset, totalBytes);
@@ -562,7 +589,10 @@ public class RamSearch : MonoBehaviour
         string eprocNote = memoryMapAsset.systemEprocessPhysical != 0
             ? $", System EPROCESS 0x{memoryMapAsset.systemEprocessPhysical:X}"
             : "";
-        status = $"Loaded {memoryMapAsset.processName}: {_selectedRegions.Count} ranges, {totalBytes / 1024} KiB{eprocNote}";
+        string baseNote = memoryMapAsset.imageBase != 0
+            ? $", image base 0x{memoryMapAsset.imageBase:X8}"
+            : "";
+        status = $"Loaded {memoryMapAsset.processName}: {_selectedRegions.Count} ranges, {totalBytes / 1024} KiB{eprocNote}{baseNote}";
         RebuildProcessEntries();
     }
 
@@ -783,6 +813,168 @@ public class RamSearch : MonoBehaviour
 
         return long.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out address)
             && address >= 0;
+    }
+
+    /// <summary>
+    /// Resolves manual entry to a guest <b>physical</b> address.
+    /// Accepts physical hex, <c>va:…</c> process virtual, or <c>MODULE+RVA</c> / <c>+RVA</c>.
+    /// </summary>
+    bool TryResolveManualAddress(string text, out long physical, out string description, out string error)
+    {
+        physical = 0;
+        description = null;
+        error = null;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            error = "Enter a physical hex, va:…, or MODULE+RVA address";
+            return false;
+        }
+
+        string s = text.Trim();
+
+        // Module-relative: RCT.EXE+69C590 / +69C590 / RCT.EXE+0x69C590
+        int plus = s.IndexOf('+');
+        if (plus >= 0)
+        {
+            string module = s.Substring(0, plus).Trim();
+            string offsetText = s.Substring(plus + 1).Trim();
+            if (!TryParseAddress(offsetText, out long rva))
+            {
+                error = $"Cannot parse RVA '{offsetText}' — use hex like 69C590";
+                return false;
+            }
+            if (!TryResolveModuleRelative(module, (uint)rva, out physical, out uint va, out error))
+                return false;
+            string modLabel = string.IsNullOrEmpty(module) ? _activeImageName : module;
+            if (string.IsNullOrEmpty(modLabel))
+                modLabel = "image";
+            description = $"{modLabel}+{rva:X} (va 0x{va:X8})";
+            return true;
+        }
+
+        // Explicit process virtual: va:00A9C590
+        if (s.StartsWith("va:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!TryParseAddress(s.Substring(3), out long vaLong) || vaLong > uint.MaxValue)
+            {
+                error = $"Cannot parse virtual address '{s}' — use va:00A9C590";
+                return false;
+            }
+            if (!TryTranslateProcessVa((uint)vaLong, out physical, out error))
+                return false;
+            description = $"va 0x{vaLong:X8}";
+            return true;
+        }
+
+        // Default: guest physical
+        if (!TryParseAddress(s, out physical))
+        {
+            error = $"Cannot parse address '{text}' — use 0x12AB00, va:00A9C590, or RCT.EXE+69C590";
+            return false;
+        }
+        description = $"phys 0x{physical:X8}";
+        return true;
+    }
+
+    bool TryResolveModuleRelative(
+        string moduleName,
+        uint rva,
+        out long physical,
+        out uint virtualAddress,
+        out string error)
+    {
+        physical = 0;
+        virtualAddress = 0;
+        if (!TryGetActiveModule(out string imageName, out uint imageBase, out error))
+            return false;
+
+        if (!string.IsNullOrEmpty(moduleName) &&
+            !ModuleNamesMatch(moduleName, imageName))
+        {
+            error =
+                $"Module '{moduleName}' does not match active process '{imageName}' " +
+                "(only the main EXE base is supported)";
+            return false;
+        }
+
+        virtualAddress = imageBase + rva;
+        return TryTranslateProcessVa(virtualAddress, out physical, out error);
+    }
+
+    bool TryTranslateProcessVa(uint virtualAddress, out long physical, out string error)
+    {
+        physical = 0;
+        if (_activeDirectoryTableBase == 0)
+        {
+            error = "No process page tables — click Regions on a process (or load a saved map with DTB)";
+            return false;
+        }
+        if (!Win32X86GuestMemory.TryTranslateVirtualToPhysical(
+                ReadPhys, _activeDirectoryTableBase, virtualAddress, out physical))
+        {
+            error = $"VA 0x{virtualAddress:X8} is not mapped in the active process";
+            return false;
+        }
+        error = null;
+        return true;
+    }
+
+    bool TryGetActiveModule(out string imageName, out uint imageBase, out string error)
+    {
+        imageName = _activeImageName;
+        imageBase = _activeImageBase;
+        if (imageBase == 0)
+        {
+            error =
+                "No main-module base — click Regions on a process " +
+                "(or re-save/load a map that includes imageBase)";
+            return false;
+        }
+        if (string.IsNullOrEmpty(imageName))
+            imageName = "(unknown)";
+        error = null;
+        return true;
+    }
+
+    void SetActiveModuleContext(string imageName, uint directoryTableBase, uint imageBase)
+    {
+        _activeImageName = imageName ?? "";
+        _activeDirectoryTableBase = directoryTableBase;
+        _activeImageBase = imageBase;
+    }
+
+    void ClearActiveModuleContext()
+    {
+        _activeImageName = "";
+        _activeDirectoryTableBase = 0;
+        _activeImageBase = 0;
+    }
+
+    uint ReadUInt32Phys(long address)
+    {
+        byte[] b = virtualMachine.ReadBytes(address, 4);
+        return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+    }
+
+    static bool ModuleNamesMatch(string requested, string active)
+    {
+        if (string.IsNullOrEmpty(requested) || string.IsNullOrEmpty(active))
+            return false;
+        if (requested.Equals(active, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // CE sometimes omits the extension; EPROCESS ImageFileName is "RCT.EXE".
+        string req = StripExeExtension(requested);
+        string act = StripExeExtension(active);
+        return req.Equals(act, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string StripExeExtension(string name)
+    {
+        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            return name.Substring(0, name.Length - 4);
+        return name;
     }
 
     IEnumerable<(long start, int length)> GetScanWindows()

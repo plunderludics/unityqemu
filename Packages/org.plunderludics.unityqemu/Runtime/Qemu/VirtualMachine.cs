@@ -1,8 +1,6 @@
 using System.Diagnostics;
 using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text.RegularExpressions;
+using System.Text;
 using System.Threading.Tasks;
 using System.Globalization;
 using System.Threading;
@@ -12,6 +10,7 @@ using UnityEngine;
 using UnityEngine.Serialization;
 #if UNITY_EDITOR
 using UnityEditor;
+using UnityEditor.SceneManagement;
 #endif
 
 using TriInspector;
@@ -19,6 +18,9 @@ using TriInspector;
 namespace UnityQemu {
 [ExecuteAlways]
 [DeclareFoldoutGroup("Advanced", Expanded = false)]
+[DeclareFoldoutGroup("Status", Expanded = false)]
+[DeclareHorizontalGroup("guest/restart")]
+[DeclareHorizontalGroup("guest/pause")]
 public class VirtualMachine : MonoBehaviour
 {
     Process _qemuProcess;
@@ -26,6 +28,9 @@ public class VirtualMachine : MonoBehaviour
     QmpClient _qmpClient;
     GdbClient _gdbClient;
     bool _starting;
+    bool _autoRestartInFlight;
+    float _lastAutoRestartRealtime = float.NegativeInfinity;
+    const float AutoRestartCooldownSeconds = 2f;
 
     /// <summary>Active work overlay path when using the boot disk + ephemeral overlay.</summary>
     string _workOverlayPath;
@@ -64,20 +69,21 @@ public class VirtualMachine : MonoBehaviour
     /// <summary>Block device name of the <c>-hda</c> drive on the pc machine type.</summary>
     public const string HdaBlockDeviceName = "ide0-hd0";
 
-    [ShowInInspector] bool VncConnected => _vncClient != null && _vncClient.IsConnected;
-    [ShowInInspector] bool VncInternalClientConnected => _vncClient != null && _vncClient.IsInternalClientConnected;
-    [ShowInInspector] public bool GdbConnected => _gdbClient != null && _gdbClient.IsConnected;
-    [ShowInInspector] public bool GdbStopped => _gdbClient != null && _gdbClient.IsStopped;
-    [ShowInInspector] public bool QmpConnected => _qmpClient != null && _qmpClient.IsConnected;
-
-    public bool enableQmp = true;
-    public bool enableGdb = true;
-    [Tooltip("Log QMP connect/command traffic")]
-    public bool verboseQmp = false;
-    [Tooltip("Log GDB attach/interrupt/packet chatter")]
-    public bool verboseGdb = false;
     [Tooltip("Also open QEMU's native SDL window (independent of snapshot launch config).")]
     public bool showGui = false;
+
+    [Tooltip(
+        "When on, if the QEMU process exits unexpectedly (crash, Task Manager kill, OS " +
+        "reclaim, etc.), automatically start it again while this VM should still be running. " +
+        "Off by default. Intentional stops (disable, destroy, save/load pipeline) do not restart.")]
+    public bool autoRestart = false;
+
+    [Header("Audio")]
+    [Tooltip(
+        "When on, capture guest audio over VNC (QEMU Audio RFB) and play it in Unity. " +
+        "Off by default. If Extra Qemu Args still use -audiodev sdl/dsound, mute or change " +
+        "that backend yourself to avoid double playback with the host mixer.")]
+    public bool playAudioInUnity = false;
 
     [Header("Input")]
     [Tooltip("If null, uses an attached InputProvider or adds a BasicInputProvider in Play mode.")]
@@ -116,21 +122,31 @@ public class VirtualMachine : MonoBehaviour
     // Nested serializable foldout. Disabled when a uqsnap owns launch config.
     [DisableIf(nameof(ShowLockedSnapshotLaunchConfig))]
     [Tooltip(
-        "Extra QEMU args and removable media. " +
+        "Memory, USB EHCI, freeform QEMU args, and removable media (CD / floppy images). " +
         "With a snapshot and Override off, shows the snapshot's config (read-only).")]
     public LaunchConfig launchConfig = LaunchConfig.CreateDefault();
 
-    [Group("Advanced")]
+    [Header("Rendering")]
     [Tooltip(
-        "Keep the assigned disk immutable by writing into a Library/ work overlay. " +
-        "Leave on unless you intentionally want QEMU to write the Disk Asset file.")]
-    public bool useEphemeralWorkOverlay = true;
+        "Use an assigned RenderTexture instead of auto-creating one sized to the guest framebuffer.")]
+    [LabelText("Use Custom Render Texture")]
+    public bool useCustomRenderTexture = false;
 
-    [SerializeField] private int vncPort = 5900;
-    [SerializeField] private int qmpPort = 4444;
-    [SerializeField] private int gdbPort = 1234;
-    [SerializeField] private bool gdbPhysicalMemory = true;
-    [SerializeField] private RenderTexture outputTexture; // This is kind of unnecessary should just use _vncClient.Texture directly, ideally..
+    [ShowIf(nameof(useCustomRenderTexture))]
+    [Tooltip("RenderTexture to blit the guest framebuffer into.")]
+    [SerializeField] RenderTexture outputTexture;
+
+    [HideIf(nameof(useCustomRenderTexture))]
+    [Tooltip("Filter / auto-resize for the auto-created output RenderTexture.")]
+    [LabelText("Render Texture Settings")]
+    [SerializeField] RenderTextureSettings renderTextureSettings = new RenderTextureSettings();
+
+    /// <summary>Runtime auto RT when <see cref="useCustomRenderTexture"/> is off.</summary>
+    RenderTexture _autoOutputTexture;
+
+    /// <summary>Effective output RenderTexture (custom slot or auto-created).</summary>
+    public RenderTexture OutputTexture =>
+        useCustomRenderTexture ? outputTexture : _autoOutputTexture;
 
     /// <summary>
     /// Tip this session is on (loaded/saved, or set from boot config at start).
@@ -138,12 +154,112 @@ public class VirtualMachine : MonoBehaviour
     /// </summary>
     [NonSerialized] BootableAsset _sessionCurrent;
 
+    // --- Advanced (collapsed) -------------------------------------------------
+
+    [Group("Advanced")]
+    [Tooltip(
+        "Keep the assigned disk immutable by writing into a Library/ work overlay. " +
+        "Leave on unless you intentionally want QEMU to write the Disk Asset file.")]
+    public bool useEphemeralWorkOverlay = true;
+
+    [Group("Advanced")]
+    [Tooltip(
+        "Off (default): pick free VNC/QMP/GDB ports on each start (VNC prefers a " +
+        "display hashed from the project path so separate Unity projects rarely collide). " +
+        "On: use the fixed ports below (rare — external clients, scripts).")]
+    public bool overridePorts = false;
+
+    [Group("Advanced")]
+    [ShowIf(nameof(overridePorts))]
+    [SerializeField] int vncPort = 5900;
+
+    [Group("Advanced")]
+    [ShowIf(nameof(overridePorts))]
+    [SerializeField] int qmpPort = 4444;
+
+    [Group("Advanced")]
+    [ShowIf(nameof(overridePorts))]
+    [SerializeField] int gdbPort = 1234;
+
+    [Group("Advanced")]
+    [Tooltip("QMP is required for snapshots, pause/reboot, and media hotplug. Leave on.")]
+    public bool enableQmp = true;
+
+    [Group("Advanced")]
+    [Tooltip(
+        "GDB stub for guest memory peek/poke (RamSearch, MemViewer). " +
+        "Idle overhead is small; each memory op briefly stops the vCPU.")]
+    public bool enableGdb = true;
+
+    [Group("Advanced")]
+    [Tooltip("Use physical addresses for GDB memory ops (needed for RamSearch).")]
+    [LabelText("GDB Physical Memory")]
+    [SerializeField] bool gdbPhysicalMemory = true;
+
+    [Group("Advanced")]
+    [Tooltip(
+        "Log full QMP connect/command JSON and routine events (STOP/RESUME/DEVICE_DELETED…). " +
+        "QMP errors and unusual events are always logged.")]
+    public bool verboseQmp = false;
+
+    [Group("Advanced")]
+    [Tooltip("Log GDB attach/interrupt/packet chatter")]
+    public bool verboseGdb = false;
+
+    // --- Status (collapsed) ---------------------------------------------------
+
+    [Group("Status")]
+    [ShowInInspector] bool VncConnected => _vncClient != null && _vncClient.IsConnected;
+    [Group("Status")]
+    [ShowInInspector] bool VncInternalClientConnected => _vncClient != null && _vncClient.IsInternalClientConnected;
+    [Group("Status")]
+    [ShowInInspector] float VncNotifyFps => _vncClient?.NotifyFps ?? 0f;
+    [Group("Status")]
+    [ShowInInspector] float VncApplyFps => _vncClient?.ApplyFps ?? 0f;
+    [Group("Status")]
+    [ShowInInspector] public bool GdbConnected => _gdbClient != null && _gdbClient.IsConnected;
+    [Group("Status")]
+    [ShowInInspector] public bool GdbStopped => _gdbClient != null && _gdbClient.IsStopped;
+    [Group("Status")]
+    [ShowInInspector] public bool QmpConnected => _qmpClient != null && _qmpClient.IsConnected;
+
+    /// <summary>Ports used by the current (or last) QEMU process. 0 = not allocated.</summary>
+    int _activeVncPort;
+    int _activeQmpPort;
+    int _activeGdbPort;
+    QemuPortAllocator.HeldPort _heldVncPort;
+    QemuPortAllocator.HeldPort _heldQmpPort;
+    QemuPortAllocator.HeldPort _heldGdbPort;
+    const int MaxPortBindRetries = 3;
+
+    [Group("Status")]
+    [ShowInInspector, ReadOnly]
+    [LabelText("Active VNC Port")]
+    int ActiveVncPort => _activeVncPort;
+
+    [Group("Status")]
+    [ShowInInspector, ReadOnly]
+    [LabelText("Active QMP Port")]
+    int ActiveQmpPort => _activeQmpPort;
+
+    [Group("Status")]
+    [ShowInInspector, ReadOnly]
+    [LabelText("Active GDB Port")]
+    int ActiveGdbPort => _activeGdbPort;
+
+    [Group("Status")]
     [ShowInInspector, ReadOnly]
     [LabelText("Session Current")]
     [PropertyTooltip(
         "Live tip for this QEMU session (after Load/Save, or the boot config once started). " +
         "Independent of the Snapshot / Disk slots above.")]
     public BootableAsset sessionCurrent => _sessionCurrent;
+
+    [Group("Status")]
+    [HideIf(nameof(useCustomRenderTexture))]
+    [ShowInInspector, ReadOnly]
+    [LabelText("Output Texture")]
+    RenderTexture AutoOutputTexture => _autoOutputTexture;
 
     /// <summary>True when boot-config <see cref="snapshot"/> is assigned.</summary>
     public bool HasSnapshot => snapshot != null;
@@ -191,7 +307,7 @@ public class VirtualMachine : MonoBehaviour
             : null;
 
     /// <summary>
-    /// Launch config used for CD/floppy/host-folder/SMB when a uqsnap owns config; otherwise local.
+    /// Launch config used for CD/floppy when a uqsnap owns config; otherwise local.
     /// Extra args may still fall back via <see cref="EffectiveExtraQemuArgs"/> if the snapshot has none.
     /// </summary>
     public LaunchConfig EffectiveLaunchConfig => SnapshotOwnedLaunchConfig ?? launchConfig;
@@ -212,11 +328,7 @@ public class VirtualMachine : MonoBehaviour
     }
 
     public CdRomAsset[] EffectiveCdroms => EffectiveLaunchConfig?.cdroms;
-    public UnityEngine.Object[] EffectiveFloppies => EffectiveLaunchConfig?.floppies;
-    public UnityEngine.Object[] EffectiveHostFolders => EffectiveLaunchConfig?.hostFolders;
-
-    /// <summary>Project folder for QEMU user-net SMB, or null when unset.</summary>
-    public UnityEngine.Object EffectiveSmbShareFolder => EffectiveLaunchConfig?.smbShareFolder;
+    public FloppyAsset[] EffectiveFloppies => EffectiveLaunchConfig?.floppies;
 
     /// <summary>
     /// Append media to the launch config that durable save will persist
@@ -262,11 +374,22 @@ public class VirtualMachine : MonoBehaviour
     public bool AddCdRomToEffectiveLaunchConfig(CdRomAsset asset) =>
         asset != null && AddToEffectiveLaunchConfig(cfg => cfg.AddCdRom(asset));
 
-    public bool AddHostFolderToEffectiveLaunchConfig(UnityEngine.Object folder) =>
-        folder != null && AddToEffectiveLaunchConfig(cfg => cfg.AddHostFolder(folder));
+    public bool RemoveCdRomFromEffectiveLaunchConfig(CdRomAsset asset) =>
+        asset != null && AddToEffectiveLaunchConfig(cfg => cfg.RemoveCdRom(asset));
 
-    public bool AddFloppyToEffectiveLaunchConfig(UnityEngine.Object source) =>
-        source != null && AddToEffectiveLaunchConfig(cfg => cfg.AddFloppy(source));
+    public bool AddFloppyToEffectiveLaunchConfig(FloppyAsset asset) =>
+        asset != null && AddToEffectiveLaunchConfig(cfg => cfg.AddFloppy(asset));
+
+    public bool RemoveFloppyFromEffectiveLaunchConfig(FloppyAsset asset) =>
+        asset != null && AddToEffectiveLaunchConfig(cfg => cfg.RemoveFloppy(asset));
+
+    /// <summary>
+    /// Record a dedicated EHCI controller on EffectiveLaunchConfig so the next durable
+    /// save restores with the same PCI USB host that may have been hotplugged for vvfat.
+    /// </summary>
+    public bool RecordUsbEhciInEffectiveLaunchConfig(
+        string id = null, string pciAddr = null, bool enable = true) =>
+        AddToEffectiveLaunchConfig(cfg => cfg.RecordUsbEhci(id, pciAddr, enable));
 
     void OnOverrideSnapshotLaunchConfigChanged()
     {
@@ -290,6 +413,9 @@ public class VirtualMachine : MonoBehaviour
         SyncDiskFromSnapshot();
         if (HasSnapshot && !overrideSnapshotLaunchConfig)
             SyncLaunchConfigFromSnapshotMetadata();
+#if UNITY_EDITOR
+        RefreshIdleOutputPreview();
+#endif
     }
 
     /// <summary>Keep <see cref="diskAsset"/> mirrored from <see cref="snapshot"/> when set.</summary>
@@ -342,12 +468,7 @@ public class VirtualMachine : MonoBehaviour
     string WorkSessionId => $"{gameObject.name}-{GetInstanceID()}";
 
     /// <summary>Filesystem path to the bundled qemu-system-i386 binary.</summary>
-    public static string ResolveQemuExecutablePath()
-    {
-        string qemuExe = Path.Combine(
-            "Packages", "org.plunderludics.unityqemu", "qemu~", "qemu-system-i386.exe");
-        return Path.GetFullPath(qemuExe);
-    }
+    public static string ResolveQemuExecutablePath() => Paths.QemuSystemI386Path;
 
     /// <summary>First line of <c>qemu-system-… --version</c>, or empty on failure.</summary>
     public static string QueryBundledQemuVersion()
@@ -362,6 +483,7 @@ public class VirtualMachine : MonoBehaviour
             {
                 FileName = exe,
                 Arguments = "--version",
+                WorkingDirectory = Paths.QemuDir,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -557,6 +679,9 @@ public class VirtualMachine : MonoBehaviour
     public void SetSessionCurrent(BootableAsset asset)
     {
         _sessionCurrent = asset;
+#if UNITY_EDITOR
+        RefreshIdleOutputPreview();
+#endif
     }
 
     /// <summary>
@@ -572,53 +697,32 @@ public class VirtualMachine : MonoBehaviour
     }
 
 #if UNITY_EDITOR
-    static string ResolveObjectFilesystemPath(UnityEngine.Object obj)
-    {
-        if (obj == null)
-            return null;
-        string assetPath = AssetDatabase.GetAssetPath(obj);
-        if (string.IsNullOrEmpty(assetPath))
-            return null;
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
-    }
-
-    /// <summary>
-    /// Folder → <c>fat:floppy:ro:...</c> (must be ro — drive is readonly for savevm);
-    /// otherwise filesystem path to the asset.
-    /// </summary>
-    static string ResolveFloppyFileSpec(UnityEngine.Object source)
-    {
-        if (source == null)
-            return null;
-
-        string assetPath = AssetDatabase.GetAssetPath(source);
-        if (string.IsNullOrEmpty(assetPath))
-        {
-            UnityEngine.Debug.LogWarning($"Floppy source '{source.name}' has no asset path.");
-            return null;
-        }
-
-        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
-        if (AssetDatabase.IsValidFolder(assetPath))
-            return $"fat:floppy:ro:{full.Replace('\\', '/')}";
-
-        return full;
-    }
-
-    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources)
+    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, FloppyAsset[] sources)
     {
         int index = 0;
         if (sources != null)
         {
             foreach (var source in sources)
             {
-                string fileSpec = ResolveFloppyFileSpec(source);
-                if (string.IsNullOrEmpty(fileSpec))
+                if (source == null)
                     continue;
+                string path = source.GetImgFilesystemPath();
+                if (string.IsNullOrEmpty(path))
+                {
+                    UnityEngine.Debug.LogWarning(
+                        $"FloppyAsset '{source.name}' has no readable image path");
+                    continue;
+                }
+                if (!File.Exists(path))
+                {
+                    UnityEngine.Debug.LogWarning(
+                        $"FloppyAsset '{source.name}' image missing at '{path}'");
+                    continue;
+                }
                 // Must use if=floppy (A:/B:), not if=ide — IDE index 0 is already -hda.
-                // readonly so savevm/loadvm are not blocked by raw/vvfat.
+                // readonly so savevm/loadvm are not blocked by raw.
                 args.Add("-drive");
-                args.Add($"file={fileSpec},if=floppy,index={index},format=raw,readonly=on");
+                args.Add($"file={path},if=floppy,index={index},format=raw,readonly=on");
                 index++;
             }
         }
@@ -634,147 +738,37 @@ public class VirtualMachine : MonoBehaviour
                 "file.driver=null-co,file.size=1474560");
         }
     }
-
-    /// <summary>
-    /// Folder → <c>fat:rw:...</c> vvfat disk (large FAT volume). Non-folders are ignored.
-    /// </summary>
-    static string ResolveHostFolderFileSpec(UnityEngine.Object source)
-    {
-        if (source == null)
-            return null;
-
-        string assetPath = AssetDatabase.GetAssetPath(source);
-        if (string.IsNullOrEmpty(assetPath))
-        {
-            UnityEngine.Debug.LogWarning($"Host folder '{source.name}' has no asset path.");
-            return null;
-        }
-
-        if (!AssetDatabase.IsValidFolder(assetPath))
-        {
-            UnityEngine.Debug.LogWarning(
-                $"Host folder entry '{assetPath}' is not a folder — drag a project folder for vvfat.");
-            return null;
-        }
-
-        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
-        return $"fat:rw:{full.Replace('\\', '/')}";
-    }
-
-    /// <summary>
-    /// Attach host folders as extra IDE disks (vvfat). Skips index 0 (-hda) and any
-    /// indices already taken by CD-ROMs.
-    /// </summary>
-    static void AppendHostFolderArgs(
-        System.Collections.Generic.IList<string> args,
-        UnityEngine.Object[] sources,
-        System.Collections.Generic.HashSet<int> usedIdeIndices)
-    {
-        if (sources == null)
-            return;
-
-        // Prefer leftover classic IDE units, then higher indices if QEMU exposes them.
-        int[] ideIndices = { 1, 3, 2, 4, 5 };
-        int attached = 0;
-        foreach (var source in sources)
-        {
-            string fileSpec = ResolveHostFolderFileSpec(source);
-            if (string.IsNullOrEmpty(fileSpec))
-                continue;
-
-            int index = -1;
-            foreach (int candidate in ideIndices)
-            {
-                if (usedIdeIndices != null && usedIdeIndices.Contains(candidate))
-                    continue;
-                index = candidate;
-                break;
-            }
-
-            if (index < 0)
-            {
-                UnityEngine.Debug.LogWarning(
-                    "UnityQemu: no free IDE index left for host folder " +
-                    $"'{source.name}' (CDs/disk already occupy the bus).");
-                continue;
-            }
-
-            usedIdeIndices?.Add(index);
-            args.Add("-drive");
-            args.Add($"file={fileSpec},if=ide,index={index},format=raw");
-            attached++;
-        }
-
-        if (sources.Length > 0 && attached == 0)
-        {
-            UnityEngine.Debug.LogWarning(
-                "UnityQemu: no host folders attached — IDE slots exhausted by disk/CDs.");
-        }
-    }
 #else
-    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, UnityEngine.Object[] sources) { }
-    static void AppendHostFolderArgs(
-        System.Collections.Generic.IList<string> args,
-        UnityEngine.Object[] sources,
-        System.Collections.Generic.HashSet<int> usedIdeIndices) { }
-
-    static string InjectSmbShareIntoExtraArgs(string extraArgs, UnityEngine.Object smbFolder) =>
-        extraArgs ?? "";
-#endif
-
-#if UNITY_EDITOR
-    /// <summary>
-    /// Inject <c>smb=</c> into an existing <c>-netdev user,...</c> line, or append a user netdev.
-    /// Guest maps <c>\\10.0.2.4\qemu</c>.
-    /// </summary>
-    static string InjectSmbShareIntoExtraArgs(string extraArgs, UnityEngine.Object smbFolder)
+    // Player builds: FloppyAsset resolves via Paths like CdRomAsset.
+    static void AppendFloppyArgs(System.Collections.Generic.IList<string> args, FloppyAsset[] sources)
     {
-        if (smbFolder == null)
-            return extraArgs ?? "";
-
-        string assetPath = AssetDatabase.GetAssetPath(smbFolder);
-        if (string.IsNullOrEmpty(assetPath) || !AssetDatabase.IsValidFolder(assetPath))
+        int index = 0;
+        if (sources != null)
         {
-            UnityEngine.Debug.LogWarning(
-                $"UnityQemu SMB share '{smbFolder.name}' must be a project folder.");
-            return extraArgs ?? "";
-        }
-
-        string full = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath))
-            .Replace('\\', '/');
-        if (full.IndexOfAny(new[] { ' ', '\t' }) >= 0)
-        {
-            UnityEngine.Debug.LogWarning(
-                $"UnityQemu SMB path has spaces ('{full}'); QEMU arg splitting may break. " +
-                "Use a folder path without spaces.");
-        }
-
-        string extra = extraArgs ?? "";
-        var netdevUser = new Regex(@"-netdev\s+(user,[^\s\r\n]+)", RegexOptions.IgnoreCase);
-        Match m = netdevUser.Match(extra);
-        if (m.Success)
-        {
-            string opts = m.Groups[1].Value;
-            if (opts.IndexOf("smb=", StringComparison.OrdinalIgnoreCase) >= 0)
+            foreach (var source in sources)
             {
-                opts = Regex.Replace(
-                    opts, @"smb=[^,]*", "smb=" + full, RegexOptions.IgnoreCase);
+                if (source == null)
+                    continue;
+                string path = source.GetImgFilesystemPath();
+                if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                {
+                    UnityEngine.Debug.LogWarning(
+                        $"FloppyAsset '{source.name}' image missing at '{path}'");
+                    continue;
+                }
+                args.Add("-drive");
+                args.Add($"file={path},if=floppy,index={index},format=raw,readonly=on");
+                index++;
             }
-            else
-            {
-                opts += ",smb=" + full;
-            }
-
-            return extra.Substring(0, m.Groups[1].Index) +
-                   opts +
-                   extra.Substring(m.Groups[1].Index + m.Groups[1].Length);
         }
 
-        UnityEngine.Debug.LogWarning(
-            "UnityQemu: SMB share set but Extra Qemu Args has no '-netdev user,...'. " +
-            "Appending user netdev + rtl8139.");
-        return extra.TrimEnd() +
-               $"\n-netdev user,id=net0,smb={full}\n-device rtl8139,netdev=net0\n";
+        if (index == 0)
+        {
+            args.Add("-drive");
+            args.Add(
+                $"id={EmptyFloppyDriveId},if=floppy,index=0,format=raw,readonly=on," +
+                "file.driver=null-co,file.size=1474560");
+        }
     }
 #endif
 
@@ -844,6 +838,11 @@ public class VirtualMachine : MonoBehaviour
     public event Action OnReady;
 
     /// <summary>
+    /// Fired on the main thread after the QEMU process and QMP/VNC/GDB clients are torn down.
+    /// </summary>
+    public event Action OnStopped;
+
+    /// <summary>
     /// Fired each tick after the guest framebuffer <see cref="Texture"/> is updated
     /// (and the optional output RenderTexture blit), and before input is processed.
     /// Subscribe to present or post-process the frame (e.g. chroma blit) so results are
@@ -851,13 +850,103 @@ public class VirtualMachine : MonoBehaviour
     /// </summary>
     public event Action OnTextureUpdated;
 
-    public Texture2D Texture => _vncClient?.Texture;
+    public Texture2D Texture
+    {
+        get
+        {
+            if (_vncClient?.Texture != null)
+                return _vncClient.Texture;
+#if UNITY_EDITOR
+            // Edit-mode idle: expose the uqsnap screenshot so consumers (Blitter, etc.)
+            // see the same preview we blit into OutputTexture.
+            if (!Application.isPlaying && !IsRunning)
+                return IdlePreviewScreenshot;
+#endif
+            return null;
+        }
+    }
 
-    public int Width => _vncClient?.Texture?.width ?? -1;
-    public int Height => _vncClient?.Texture?.height ?? -1;
+    public int Width => Texture != null ? Texture.width : -1;
+    public int Height => Texture != null ? Texture.height : -1;
 
-    [Button]
-    public async void Restart() {
+#if UNITY_EDITOR
+    /// <summary>
+    /// Session tip when it is a uqsnap, else the boot <see cref="snapshot"/>.
+    /// Used for edit-mode idle preview on <see cref="OutputTexture"/>.
+    /// </summary>
+    Texture2D IdlePreviewScreenshot
+    {
+        get
+        {
+            var snap = (_sessionCurrent as UqsnapAsset) ?? snapshot;
+            return snap != null ? snap.screenshot : null;
+        }
+    }
+
+    /// <summary>
+    /// When QEMU is not running in the editor, blit the assigned snapshot's screenshot
+    /// into <see cref="OutputTexture"/> so Scene/Game views show the saved frame.
+    /// </summary>
+    void RefreshIdleOutputPreview()
+    {
+        // Scene save / asset reimport can drop the RT contents a few ticks later, so keep
+        // repainting views for a moment rather than trusting a single blit to stick.
+        _idlePreviewRepaintUntil = EditorApplication.timeSinceStartup + IdlePreviewRepaintWindow;
+        BlitIdleOutputPreview(repaintViews: true);
+    }
+
+    /// <summary>
+    /// The output RenderTexture loses its contents whenever the editor releases it
+    /// (scene save, asset reimport, domain reload, graphics device reset), and there is no
+    /// notification for that — so re-blit the idle frame periodically while QEMU is down.
+    /// </summary>
+    void MaintainIdleOutputPreview()
+    {
+        double now = EditorApplication.timeSinceStartup;
+        if (now < _nextIdlePreviewBlit)
+            return;
+        _nextIdlePreviewBlit = now + IdlePreviewBlitInterval;
+
+        BlitIdleOutputPreview(repaintViews: now < _idlePreviewRepaintUntil);
+    }
+
+    void BlitIdleOutputPreview(bool repaintViews)
+    {
+        if (Application.isPlaying || IsRunning || _starting)
+            return;
+
+        Texture2D src = IdlePreviewScreenshot;
+        if (src == null)
+            return;
+
+        EnsureOutputTexture(src.width, src.height);
+        RenderTexture dest = OutputTexture;
+        if (dest == null)
+            return;
+
+        Graphics.Blit(src, dest);
+        OnTextureUpdated?.Invoke();
+        if (!repaintViews)
+            return;
+
+        EditorApplication.QueuePlayerLoopUpdate();
+        SceneView.RepaintAll();
+    }
+
+    /// <summary>Throttle for the idle re-blit driven by <see cref="EditorTick"/>.</summary>
+    const double IdlePreviewBlitInterval = 0.2;
+
+    /// <summary>How long to keep requesting view repaints after an explicit refresh.</summary>
+    const double IdlePreviewRepaintWindow = 1.5;
+
+    double _nextIdlePreviewBlit;
+    double _idlePreviewRepaintUntil;
+#endif
+
+    [PropertyOrder(1000)]
+    [Group("guest/restart")]
+    [Button("Restart QEMU")]
+    public async void RestartQemu() {
         try
         {
 #if UNITY_EDITOR
@@ -883,22 +972,8 @@ public class VirtualMachine : MonoBehaviour
     /// <summary>Start the QEMU process (used by durable snapshot save/load).</summary>
     public Task StartGuestProcessAsync() => StartQemuAsync();
 
-    [Button("Pause guest")]
-    [EnableIf(nameof(CanPauseResume))]
-    public async void PauseGuest()
-    {
-        try { await PauseAsync(); }
-        catch (Exception e) { UnityEngine.Debug.LogWarning($"Pause guest: {e.Message}"); }
-    }
-
-    [Button("Resume guest")]
-    [EnableIf(nameof(CanPauseResume))]
-    public async void ResumeGuest()
-    {
-        try { await ResumeAsync(); }
-        catch (Exception e) { UnityEngine.Debug.LogWarning($"Resume guest: {e.Message}"); }
-    }
-
+    [PropertyOrder(1001)]
+    [Group("guest/restart")]
     [Button("Reboot guest")]
     [EnableIf(nameof(QmpConnected))]
     [Tooltip(
@@ -910,30 +985,76 @@ public class VirtualMachine : MonoBehaviour
         catch (Exception e) { UnityEngine.Debug.LogWarning($"Reboot guest: {e.Message}"); }
     }
 
+    [PropertyOrder(1010)]
+    [Group("guest/pause")]
+    [Button("Pause guest")]
+    [EnableIf(nameof(CanPauseResume))]
+    public async void PauseGuest()
+    {
+        try { await PauseAsync(); }
+        catch (Exception e) { UnityEngine.Debug.LogWarning($"Pause guest: {e.Message}"); }
+    }
+
+    [PropertyOrder(1011)]
+    [Group("guest/pause")]
+    [Button("Resume guest")]
+    [EnableIf(nameof(CanPauseResume))]
+    public async void ResumeGuest()
+    {
+        try { await ResumeAsync(); }
+        catch (Exception e) { UnityEngine.Debug.LogWarning($"Resume guest: {e.Message}"); }
+    }
+
     bool CanPauseResume => QmpConnected || GdbConnected;
 
     void OnEnable()
     {
+#if UNITY_EDITOR
+        // Keep the tick subscription outside the undo guard: deleting a VM still runs
+        // OnDisable with Undo.isProcessing, and skipping unsubscribe leaves a destroyed
+        // instance hooked to EditorApplication.update.
+        EditorApplication.update -= EditorTick;
+        EditorApplication.update += EditorTick;
+        EditorSceneManager.sceneSaved -= OnEditorSceneSaved;
+        EditorSceneManager.sceneSaved += OnEditorSceneSaved;
+
+        // A persistent RenderTexture can be recreated/cleared by editor serialization.
+        // Repaint the saved frame once enable/reload processing settles.
+        QueueIdleOutputPreviewRefresh();
+#endif
+#if UNITY_EDITOR && UNITY_2022_2_OR_NEWER
+        // Undo/redo re-enables components; ignore so we don't restart QEMU.
+        if (Undo.isProcessing) return;
+#endif
         if (ShowLockedSnapshotLaunchConfig)
             SyncLaunchConfigFromSnapshotMetadata();
 #if UNITY_EDITOR
-        // Always drive edit-mode ticks while enabled; only skip auto-start during transitions.
-        EditorApplication.update -= EditorTick;
-        EditorApplication.update += EditorTick;
+        // Drive edit-mode ticks while enabled; only skip auto-start during transitions.
         if (EditorApplication.isPlayingOrWillChangePlaymode && !Application.isPlaying)
             return;
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
 #endif
         TryAutoStart();
+#if UNITY_EDITOR
+        RefreshIdleOutputPreview();
+#endif
     }
 
     void OnDisable()
     {
 #if UNITY_EDITOR
         EditorApplication.update -= EditorTick;
+        EditorSceneManager.sceneSaved -= OnEditorSceneSaved;
+        EditorApplication.delayCall -= RefreshIdleOutputPreviewDeferred;
+#endif
+#if UNITY_EDITOR && UNITY_2022_2_OR_NEWER
+        // Undo/redo disables components; ignore so we don't kill QEMU.
+        if (Undo.isProcessing) return;
 #endif
         StopQemu();
+        ReleaseClaimedPorts();
+        ReleaseAutoOutputTexture();
     }
 
     void OnValidate()
@@ -947,6 +1068,25 @@ public class VirtualMachine : MonoBehaviour
     }
 
 #if UNITY_EDITOR
+    void OnEditorSceneSaved(UnityEngine.SceneManagement.Scene scene)
+    {
+        if (scene == gameObject.scene)
+            QueueIdleOutputPreviewRefresh();
+    }
+
+    void QueueIdleOutputPreviewRefresh()
+    {
+        EditorApplication.delayCall -= RefreshIdleOutputPreviewDeferred;
+        EditorApplication.delayCall += RefreshIdleOutputPreviewDeferred;
+    }
+
+    void RefreshIdleOutputPreviewDeferred()
+    {
+        if (this == null)
+            return;
+        RefreshIdleOutputPreview();
+    }
+
     void OnValidateDeferred()
     {
         if (this == null)
@@ -959,19 +1099,28 @@ public class VirtualMachine : MonoBehaviour
         if (!runVmInEditMode && !Application.isPlaying && IsRunning)
         {
             StopQemu();
+            ReleaseClaimedPorts();
             return;
         }
 
         TryAutoStart();
+        RefreshIdleOutputPreview();
     }
 
     void EditorTick()
     {
-        if (Application.isPlaying || !runVmInEditMode || !enabled || !gameObject.activeInHierarchy)
+        // Unity fake-null: destroyed instances can still receive a late update callback.
+        if (this == null)
+            return;
+        if (Application.isPlaying || !enabled || !gameObject.activeInHierarchy)
             return;
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
-        Tick();
+
+        if (runVmInEditMode)
+            Tick();
+
+        MaintainIdleOutputPreview();
     }
 #endif
 
@@ -1005,6 +1154,8 @@ public class VirtualMachine : MonoBehaviour
         if (_qemuProcess != null)
         {
             await StopQemuAsync();
+            if (this == null)
+                return;
         }
 
         // Reclaim work images left behind by previous editor sessions (session ids embed
@@ -1018,31 +1169,9 @@ public class VirtualMachine : MonoBehaviour
 
         WarnIfSnapshotLaunchMetadataMismatched();
 
-        var process = new Process();
-        process.StartInfo.FileName = qemuExe;
-
-        // Memory from effective launch config; extra args via EffectiveExtraQemuArgs so an
-        // empty uqsnap extraQemuArgs still falls back to the VM Launch Config (incl. sb16).
-        int memoryMb = EffectiveLaunchConfig?.ResolvedMemoryMb ?? LaunchConfig.DefaultMemoryMb;
-        string argsToUse = LaunchConfig.StripMemoryArgs(EffectiveExtraQemuArgs);
-
-        argsToUse = InjectSmbShareIntoExtraArgs(argsToUse, EffectiveSmbShareFolder);
-
-        process.StartInfo.ArgumentList.Add("-m");
-        process.StartInfo.ArgumentList.Add(memoryMb.ToString());
-
-        foreach (var arg in argsToUse.Split(
-                     new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
-        {
-            process.StartInfo.ArgumentList.Add(arg);
-        }
-
-        if (showGui)
-        {
-            process.StartInfo.ArgumentList.Add("-display");
-            process.StartInfo.ArgumentList.Add("sdl");
-        }
-
+        // Resolve work overlay + pending incoming *before* -m so we can validate the
+        // RAM size embedded in the migration stream and (when needed) fall back to a
+        // cold disk boot.
         // Every start boots a freshly minted thin work overlay.
         // Exception: a boot prepared by the save/load pipeline (PrepareBoot) — that
         // work file must be used as-is. Discarding the path forces recreation in
@@ -1071,6 +1200,69 @@ public class VirtualMachine : MonoBehaviour
             _pendingIncomingStatePath = snapshot.GetMachineStateFilesystemPath();
             _pendingIncomingGzip = snapshot.MachineStateIsCompressed;
         }
+
+        // Memory from effective launch config (may adjust to match the migration stream
+        // when the user is not overriding snapshot launch config).
+        // Extra args via EffectiveExtraQemuArgs so an empty uqsnap extraQemuArgs still falls
+        // back to the VM Launch Config (incl. sb16).
+        int memoryMb = EffectiveLaunchConfig?.ResolvedMemoryMb ?? LaunchConfig.DefaultMemoryMb;
+        if (!string.IsNullOrEmpty(_pendingIncomingStatePath) &&
+            MigrationRelay.TryProbePcRamBytes(
+                _pendingIncomingStatePath, _pendingIncomingGzip, out long streamRamBytes))
+        {
+            int streamMb = (int)(streamRamBytes / (1024L * 1024L));
+            if (streamMb > 0 && streamMb != memoryMb)
+            {
+                if (overrideSnapshotLaunchConfig)
+                {
+                    UnityEngine.Debug.LogWarning(
+                        $"Snapshot machine-state has pc.ram={streamMb} MB but launch config says " +
+                        $"{memoryMb} MB — skipping machine-state restore and booting disk contents " +
+                        $"with launch-config memory.");
+                    // If the user intentionally overrode the launch config, we should still start
+                    // with that configuration even if state restore can't be trusted.
+                    _pendingIncomingStatePath = null;
+                    _pendingIncomingGzip = true;
+                }
+                else
+                {
+                    UnityEngine.Debug.LogWarning(
+                        $"Snapshot machine-state has pc.ram={streamMb} MB but launch metadata " +
+                        $"says {memoryMb} MB — using stream size for -m so restore can succeed.");
+                    memoryMb = streamMb;
+                    // Keep session metadata in sync so EffectiveLaunchConfig matches what we boot.
+                    UqsnapAsset owner = LaunchConfigOwnerSnap;
+                    if (owner?.metadata?.launchConfig != null)
+                        owner.metadata.launchConfig.memoryMb = streamMb;
+                }
+            }
+        }
+
+        bool boundPorts = false;
+        for (int portTry = 0; portTry < MaxPortBindRetries; portTry++)
+        {
+        AllocatePortsForStart();
+
+        var process = new Process();
+        process.StartInfo.FileName = qemuExe;
+
+        process.StartInfo.ArgumentList.Add("-m");
+        process.StartInfo.ArgumentList.Add(memoryMb.ToString());
+
+        foreach (var arg in EffectiveExtraQemuArgs.Split(
+                     new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            process.StartInfo.ArgumentList.Add(arg);
+        }
+
+        EffectiveLaunchConfig?.AppendUsbEhciArgs(process.StartInfo.ArgumentList);
+
+        if (showGui)
+        {
+            process.StartInfo.ArgumentList.Add("-display");
+            process.StartInfo.ArgumentList.Add("sdl");
+        }
+
         if (!string.IsNullOrEmpty(hdaPath))
         {
             process.StartInfo.ArgumentList.Add("-hda");
@@ -1102,16 +1294,18 @@ public class VirtualMachine : MonoBehaviour
             }
         }
 
-        // IDE index 0 is -hda; CDs and host folders share the remaining units.
+        // IDE index 0 is -hda; CDs use the remaining units. vvfat is hotplug-only (PeripheralsUI).
         var usedIdeIndices = new System.Collections.Generic.HashSet<int> { 0 };
         AppendCdromArgs(process.StartInfo.ArgumentList, EffectiveCdroms, usedIdeIndices);
         AppendFloppyArgs(process.StartInfo.ArgumentList, EffectiveFloppies);
-        AppendHostFolderArgs(process.StartInfo.ArgumentList, EffectiveHostFolders, usedIdeIndices);
 
-        // Add VNC display - :0 means display 0, which is port 5900
-        // Format: -display vnc=:0
+        // Add VNC display - :N means display N → TCP port 5900+N.
+        // audiodev=snd0 only when Unity playback is on (matches LaunchConfig id=snd0).
         process.StartInfo.ArgumentList.Add("-display");
-        process.StartInfo.ArgumentList.Add($"vnc=:{vncPort - 5900}");
+        string vncDisplay = $"vnc=:{_activeVncPort - QemuPortAllocator.VncBasePort}";
+        if (playAudioInUnity)
+            vncDisplay += ",audiodev=snd0";
+        process.StartInfo.ArgumentList.Add(vncDisplay);
         
         // Add QMP socket for command control
         // Format: -qmp tcp:host:port,server,nowait
@@ -1119,7 +1313,7 @@ public class VirtualMachine : MonoBehaviour
         // (Ctrl+Alt+2 in the SDL/GTK window) when we also want interactive monitor access.
         if (enableQmp) {
             process.StartInfo.ArgumentList.Add("-qmp");
-            process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{qmpPort},server,nowait");
+            process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{_activeQmpPort},server,nowait");
             process.StartInfo.ArgumentList.Add("-monitor");
             process.StartInfo.ArgumentList.Add("vc");
         }
@@ -1127,7 +1321,7 @@ public class VirtualMachine : MonoBehaviour
         // GDB stub for memory peek/poke (-s is shorthand for tcp::1234)
         if (enableGdb) {
             process.StartInfo.ArgumentList.Add("-gdb");
-            process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{gdbPort},server,nowait");
+            process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{_activeGdbPort},server,nowait");
         }
         
         // Redirect output to see if QEMU has any errors
@@ -1135,35 +1329,79 @@ public class VirtualMachine : MonoBehaviour
         process.StartInfo.RedirectStandardError = true;
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.CreateNoWindow = true;
+        // So QEMU finds share/ BIOS next to the packaged qemu~ tree.
+        process.StartInfo.WorkingDirectory = Paths.QemuDir;
 
         UnityEngine.Debug.Log($"{qemuExe} {string.Join(' ', process.StartInfo.ArgumentList)}");
 
+        // Drop OS holds immediately before spawn so qemu-system can bind the same ports.
+        HandOffPortsToQemu();
         process.Start();
         _qemuProcess = process;
 
-        UnityEngine.Debug.Log($"Started QEMU process (PID: {process.Id}) with VNC on port {vncPort}");
-        
+        UnityEngine.Debug.Log(
+            $"Started QEMU process (PID: {process.Id}) with VNC on port {_activeVncPort}" +
+            (enableQmp ? $", QMP {_activeQmpPort}" : "") +
+            (enableGdb ? $", GDB {_activeGdbPort}" : "") +
+            $" (preferred VNC display :{QemuPortAllocator.PreferredVncDisplay()})");
+
+        var earlyStderr = new StringBuilder();
         // Log QEMU stdout/stderr (null Data = stream closed / async reader sentinel — ignore)
         process.OutputDataReceived += (sender, e) => {
             if (!string.IsNullOrEmpty(e.Data))
                 UnityEngine.Debug.Log($"QEMU output: {e.Data}");
         };
         process.ErrorDataReceived += (sender, e) => {
-            if (!string.IsNullOrEmpty(e.Data))
-                UnityEngine.Debug.LogWarning($"QEMU error: {e.Data}");
+            if (string.IsNullOrEmpty(e.Data))
+                return;
+            lock (earlyStderr)
+                earlyStderr.AppendLine(e.Data);
+            UnityEngine.Debug.LogWarning($"QEMU error: {e.Data}");
         };
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
+        bool survivedPortBind = await QemuSurvivedPortBindAsync(earlyStderr);
+        if (this == null)
+            return;
+        if (survivedPortBind)
+        {
+            boundPorts = true;
+            break;
+        }
+
+        UnityEngine.Debug.LogWarning(
+            $"QEMU port bind failed (attempt {portTry + 1}/{MaxPortBindRetries}); " +
+            "reclaiming ports and retrying.");
+        AbortFailedQemuStart();
+        await WaitForActivePortsFreeAsync(1000);
+        if (this == null)
+            return;
+        ReleaseClaimedPorts();
+        } // port-bind retry loop
+
+        if (!boundPorts)
+        {
+            throw new InvalidOperationException(
+                "QEMU failed to bind VNC/QMP/GDB ports after retries. " +
+                "Stop other VirtualMachines or override ports in Advanced.");
+        }
+
         // Wait a moment for QEMU to start and QMP socket to be ready
         await Task.Delay(1000);
+        if (this == null)
+            return;
 
         // Connect VNC client
         await ConnectVncAsync();
+        if (this == null)
+            return;
         
         if (enableQmp) {
             // Connect QMP client
             await ConnectQmpAsync();
+            if (this == null)
+                return;
 
             string incomingStatePath = _pendingIncomingStatePath;
             bool incomingGzip = _pendingIncomingGzip;
@@ -1183,6 +1421,8 @@ public class VirtualMachine : MonoBehaviour
 
                 // Stream the .uqsnap migration file into -incoming, quick-save, resume.
                 await FeedIncomingStateAsync(incomingStatePath, incomingGzip);
+                if (this == null)
+                    return;
                 if (!string.IsNullOrEmpty(LastStateRestoreError) && attempt == 0)
                 {
                     UnityEngine.Debug.LogWarning(
@@ -1201,6 +1441,8 @@ public class VirtualMachine : MonoBehaviour
             {
                 try { await RunQmpAsync("cont"); }
                 catch (Exception e) { UnityEngine.Debug.LogWarning($"QMP cont after GDB attach: {e.Message}"); }
+                if (this == null)
+                    return;
             }
         }
 
@@ -1211,7 +1453,11 @@ public class VirtualMachine : MonoBehaviour
         }
         catch (Exception e)
         {
+            if (this == null)
+                return;
             UnityEngine.Debug.LogException(e);
+            if (!IsRunning)
+                ReleaseClaimedPorts();
         }
         finally
         {
@@ -1246,6 +1492,8 @@ public class VirtualMachine : MonoBehaviour
 
     void Tick()
     {
+        MaybeAutoRestart();
+
         if (_vncClient == null)
             return;
 
@@ -1255,9 +1503,10 @@ public class VirtualMachine : MonoBehaviour
         if (src != null)
         {
             EnsureOutputTexture(src.width, src.height);
-            if (outputTexture != null)
+            RenderTexture dest = OutputTexture;
+            if (dest != null)
             {
-                Graphics.Blit(src, outputTexture);
+                Graphics.Blit(src, dest);
 #if UNITY_EDITOR
                 if (!Application.isPlaying)
                 {
@@ -1277,30 +1526,111 @@ public class VirtualMachine : MonoBehaviour
             inputProvider?.ProcessInput(this);
     }
 
+    /// <summary>
+    /// If <see cref="autoRestart"/> is on and QEMU died while we still want it running,
+    /// clean up and start again (preserving <see cref="sessionCurrent"/> when possible).
+    /// </summary>
+    void MaybeAutoRestart()
+    {
+        if (!autoRestart || _autoRestartInFlight || _starting)
+            return;
+        if (!ShouldRun || !enabled || !gameObject.activeInHierarchy)
+            return;
+        // Intentional StopQemu clears _qemuProcess; a non-null exited handle means unexpected death.
+        if (_qemuProcess == null || !_qemuProcess.HasExited)
+            return;
+        if (Time.realtimeSinceStartup - _lastAutoRestartRealtime < AutoRestartCooldownSeconds)
+            return;
+
+        _lastAutoRestartRealtime = Time.realtimeSinceStartup;
+        int exitCode = -1;
+        try { exitCode = _qemuProcess.ExitCode; } catch { /* process handle may be disposed */ }
+        UnityEngine.Debug.LogWarning(
+            $"UnityQemu: QEMU exited unexpectedly (exit code {exitCode}) on '{name}' — auto-restarting.",
+            this);
+        _ = AutoRestartAfterUnexpectedExitAsync();
+    }
+
+    async Task AutoRestartAfterUnexpectedExitAsync()
+    {
+        if (_autoRestartInFlight || _starting)
+            return;
+        _autoRestartInFlight = true;
+        try
+        {
+            BootableAsset tip = _sessionCurrent;
+            await StopQemuAsync();
+
+            if (!autoRestart || !ShouldRun || !enabled || !gameObject.activeInHierarchy)
+                return;
+
+            if (tip is UqsnapAsset snap)
+                PrepareBoot(snap, loadVmState: true);
+            else if (tip is DiskAsset disk)
+                PrepareBoot(disk);
+
+            await StartQemuAsync();
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogException(e, this);
+        }
+        finally
+        {
+            _autoRestartInFlight = false;
+        }
+    }
+
     void EnsureOutputTexture(int width, int height)
     {
         if (width <= 0 || height <= 0)
             return;
 
-        if (outputTexture == null)
+        if (useCustomRenderTexture)
         {
-            outputTexture = new RenderTexture(width, height, 0);
-            outputTexture.name = "QEMU Output";
-            outputTexture.Create();
-            return;
-        }
+            if (outputTexture == null)
+                return;
 
-        if (outputTexture.width == width && outputTexture.height == height)
-        {
+            if (outputTexture.width != width || outputTexture.height != height)
+            {
+                outputTexture.Release();
+                outputTexture.width = width;
+                outputTexture.height = height;
+            }
+
             if (!outputTexture.IsCreated())
                 outputTexture.Create();
             return;
         }
 
-        outputTexture.Release();
-        outputTexture.width = width;
-        outputTexture.height = height;
-        outputTexture.Create();
+        if (renderTextureSettings == null)
+            renderTextureSettings = new RenderTextureSettings();
+
+        _autoOutputTexture = renderTextureSettings.Ensure(
+            _autoOutputTexture,
+            width,
+            height,
+            $"{name} QEMU Output",
+            ReleaseOwnedRenderTexture);
+    }
+
+    static void ReleaseOwnedRenderTexture(RenderTexture rt)
+    {
+        if (rt == null)
+            return;
+        rt.Release();
+        if (Application.isPlaying)
+            UnityEngine.Object.Destroy(rt);
+        else
+            UnityEngine.Object.DestroyImmediate(rt);
+    }
+
+    void ReleaseAutoOutputTexture()
+    {
+        if (_autoOutputTexture == null)
+            return;
+        ReleaseOwnedRenderTexture(_autoOutputTexture);
+        _autoOutputTexture = null;
     }
 
     // x and y are pixel coordinates from top-left, in actual display resolution (or does the VNC framebuffer have different resolution?)
@@ -1338,6 +1668,8 @@ public class VirtualMachine : MonoBehaviour
     {
         // Fire-and-forget sync stop on destroy (can't await here reliably).
         StopQemu();
+        ReleaseClaimedPorts();
+        ReleaseAutoOutputTexture();
         // Session is over — reclaim the work images (these can be GBs). StopQemu waits up
         // to 3s for exit; if a file is somehow still locked, the delete silently fails
         // and the orphan sweep at the next start picks it up.
@@ -1371,9 +1703,29 @@ public class VirtualMachine : MonoBehaviour
 
     Task ConnectVncAsync()
     {
-        _vncClient = new VncClient();
+        VncAudioPlayer audioPlayer = null;
+        if (playAudioInUnity)
+        {
+            audioPlayer = GetComponent<VncAudioPlayer>();
+            if (audioPlayer == null)
+                audioPlayer = gameObject.AddComponent<VncAudioPlayer>();
+            audioPlayer.enabled = true;
+            audioPlayer.StartPlayback();
+        }
+        else
+        {
+            var existing = GetComponent<VncAudioPlayer>();
+            if (existing != null)
+                existing.StopPlayback();
+        }
+
+        _vncClient = new VncClient
+        {
+            PlayAudioInUnity = playAudioInUnity,
+            AudioPlayer = audioPlayer,
+        };
         EnsureOutputTexture(640, 480);
-        return ConnectVncCoreAsync(_vncClient, vncPort - 5900);
+        return ConnectVncCoreAsync(_vncClient, _activeVncPort - QemuPortAllocator.VncBasePort);
     }
 
     static async Task ConnectVncCoreAsync(VncClient client, int display)
@@ -1392,7 +1744,7 @@ public class VirtualMachine : MonoBehaviour
     Task ConnectQmpAsync()
     {
         _qmpClient = new QmpClient { Verbose = verboseQmp };
-        return ConnectQmpCoreAsync(_qmpClient, qmpPort, verboseQmp);
+        return ConnectQmpCoreAsync(_qmpClient, _activeQmpPort, verboseQmp);
     }
 
     static async Task ConnectQmpCoreAsync(QmpClient client, int port, bool verbose)
@@ -1411,19 +1763,18 @@ public class VirtualMachine : MonoBehaviour
 
     async Task LoadSaveStateAsync(string tag)
     {
+        string command = $"loadvm {tag}";
         try
         {
-            string result = await RunHumanMonitorCommandAsync($"loadvm {tag}");
-            if (string.IsNullOrWhiteSpace(result))
+            string failure = await TryGetHumanMonitorFailureAsync(command);
+            if (failure == null)
             {
                 UnityEngine.Debug.Log($"loadvm {tag} OK");
+                return;
             }
-            else
-            {
-                // HMP reports loadvm failures as output text, not an error response.
-                LastStateRestoreError = result.Trim();
-                UnityEngine.Debug.LogWarning($"Unable to load vm state from snapshot (loadvm {tag}): {result}");
-            }
+
+            // Reply already logged by TryGetHumanMonitorFailureAsync.
+            LastStateRestoreError = failure;
         }
         catch (Exception e)
         {
@@ -1451,10 +1802,9 @@ public class VirtualMachine : MonoBehaviour
             // devices are still inactive, so savevm would be refused.
             await RunQmpAsync("cont");
 
-            string quickSave = await RunHumanMonitorCommandAsync(
-                $"savevm {DiskOverlay.DurableSaveVmTag}");
-            if (!string.IsNullOrWhiteSpace(quickSave))
-                UnityEngine.Debug.LogWarning($"Post-restore quick-save: {quickSave.Trim()}");
+            string saveCmd = $"savevm {DiskOverlay.DurableSaveVmTag}";
+            // Non-empty reply is logged by TryGetHumanMonitorFailureAsync.
+            await TryGetHumanMonitorFailureAsync(saveCmd);
 
             UnityEngine.Debug.Log("machine state restored");
         }
@@ -1511,26 +1861,49 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
+    /// Result of <see cref="CaptureStateAsync"/>: frozen disk layer always; machine
+    /// state only when migrate succeeded (writable vvfat / some devices block it).
+    /// </summary>
+    public readonly struct CaptureStateResult
+    {
+        public readonly string FrozenLayerPath;
+        public readonly bool CapturedMachineState;
+
+        public CaptureStateResult(string frozenLayerPath, bool capturedMachineState)
+        {
+            FrozenLayerPath = frozenLayerPath;
+            CapturedMachineState = capturedMachineState;
+        }
+    }
+
+    /// <summary>
     /// D4 durable save, QEMU side: pause → freeze the current work layer as the session's
     /// disk delta (<c>blockdev-snapshot-sync</c>; a fresh layer becomes active) →
     /// quick-save into the new layer (must precede migrate: the postmigrate runstate
-    /// refuses savevm) → migrate RAM/CPU out into <paramref name="vmstateOutputPath"/>
-    /// → resume. When <paramref name="gzip"/> is true, the file is gzip-compressed.
+    /// refuses savevm) → optionally migrate RAM/CPU out into
+    /// <paramref name="vmstateOutputPath"/> → resume.
+    /// When <paramref name="captureMachineState"/> is false, skips migrate and returns
+    /// disk-only (<see cref="CaptureStateResult.CapturedMachineState"/> false).
+    /// When <paramref name="gzip"/> is true, the file is gzip-compressed.
     /// The migration runs over a pre-connected duplicated socket (<c>migrate fd:</c>);
     /// see <see cref="MigrationRelay"/> for why <c>tcp:</c> can hang.
-    /// Returns the frozen layer path for the offline disk-diff step. QEMU keeps running.
+    /// If migrate fails (e.g. writable vvfat drives), still returns the frozen
+    /// layer so a disk-only tip can be saved; <see cref="CaptureStateResult.CapturedMachineState"/>
+    /// is false. QEMU keeps running.
     /// </summary>
-    public async Task<string> CaptureStateAsync(string vmstateOutputPath, bool gzip = true)
+    public async Task<CaptureStateResult> CaptureStateAsync(
+        string vmstateOutputPath, bool gzip = true, bool captureMachineState = true)
     {
         if (_qmpClient == null || !_qmpClient.IsConnected)
             throw new InvalidOperationException("QMP not connected");
         if (string.IsNullOrEmpty(_workOverlayPath) || !File.Exists(_workOverlayPath))
             throw new InvalidOperationException("No work image — boot with a Disk Asset first");
-        if (string.IsNullOrWhiteSpace(vmstateOutputPath))
+        if (captureMachineState && string.IsNullOrWhiteSpace(vmstateOutputPath))
             throw new ArgumentException("vmstate output path required", nameof(vmstateOutputPath));
 
         string frozenLayer = _workOverlayPath;
         string newLayer = DiskOverlay.WorkLayerPathForSession(WorkSessionId, ++_workLayerCounter);
+        bool capturedMachineState = false;
 
         await PauseAsync();
         try
@@ -1549,51 +1922,70 @@ public class VirtualMachine : MonoBehaviour
             _sessionLayerPaths.Add(frozenLayer);
             _workOverlayPath = newLayer;
 
-            string quickSave = await RunHumanMonitorCommandAsync(
-                $"savevm {DiskOverlay.DurableSaveVmTag}");
-            if (!string.IsNullOrWhiteSpace(quickSave))
-                UnityEngine.Debug.LogWarning($"Quick-save during capture: {quickSave.Trim()}");
+            string saveCmd = $"savevm {DiskOverlay.DurableSaveVmTag}";
+            // Non-empty reply is logged by TryGetHumanMonitorFailureAsync.
+            await TryGetHumanMonitorFailureAsync(saveCmd);
 
-            using (var capture = MigrationRelay.OutgoingCapture.Create(_qemuProcess.Id))
+            if (captureMachineState)
             {
-                var fdArgs = new JObject
-                {
-                    ["info"] = capture.ProtocolInfoBase64,
-                    ["fdname"] = capture.FdName,
-                };
-                await _qmpClient.ExecuteCommandAsync(
-                    "get-win32-socket", fdArgs.ToString(Newtonsoft.Json.Formatting.None));
-                capture.CloseQemuEnd();
-
-                Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath, gzip);
                 try
                 {
-                    await _qmpClient.ExecuteCommandAsync(
-                        "migrate", $"{{\"uri\":\"fd:{capture.FdName}\"}}");
-                    await WaitForMigrationCompletionAsync(TimeSpan.FromMinutes(2));
-                }
-                catch
-                {
-                    // Disposing the capture below aborts the reader; observe its
-                    // fault so Unity doesn't log an unobserved task exception.
-                    _ = receiveTask.ContinueWith(t => _ = t.Exception,
-                        TaskContinuationOptions.OnlyOnFaulted);
-                    throw;
-                }
+                    using (var capture = MigrationRelay.OutgoingCapture.Create(_qemuProcess.Id))
+                    {
+                        var fdArgs = new JObject
+                        {
+                            ["info"] = capture.ProtocolInfoBase64,
+                            ["fdname"] = capture.FdName,
+                        };
+                        await _qmpClient.ExecuteCommandAsync(
+                            "get-win32-socket", fdArgs.ToString(Newtonsoft.Json.Formatting.None));
+                        capture.CloseQemuEnd();
 
-                // Ask QEMU to drop any lingering reference to the duplicated socket,
-                // then let the reader finish on EOF or silence.
-                try
-                {
-                    await _qmpClient.ExecuteCommandAsync(
-                        "closefd", $"{{\"fdname\":\"{capture.FdName}\"}}");
+                        Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath, gzip);
+                        try
+                        {
+                            await _qmpClient.ExecuteCommandAsync(
+                                "migrate", $"{{\"uri\":\"fd:{capture.FdName}\"}}");
+                            await WaitForMigrationCompletionAsync(TimeSpan.FromMinutes(2));
+                        }
+                        catch
+                        {
+                            // Disposing the capture below aborts the reader; observe its
+                            // fault so Unity doesn't log an unobserved task exception.
+                            _ = receiveTask.ContinueWith(t => _ = t.Exception,
+                                TaskContinuationOptions.OnlyOnFaulted);
+                            throw;
+                        }
+
+                        // Ask QEMU to drop any lingering reference to the duplicated socket,
+                        // then let the reader finish on EOF or silence.
+                        try
+                        {
+                            await _qmpClient.ExecuteCommandAsync(
+                                "closefd", $"{{\"fdname\":\"{capture.FdName}\"}}");
+                        }
+                        catch { /* already released by migrate */ }
+                        capture.FinishAfterDrain();
+                        long bytes = await receiveTask;
+                        UnityEngine.Debug.Log(
+                            $"machine state captured: {vmstateOutputPath} " +
+                            $"({bytes / (1024.0 * 1024.0):F1} MB{(gzip ? " gzip" : " raw")})");
+                        capturedMachineState = bytes > 0;
+                    }
                 }
-                catch { /* already released by migrate */ }
-                capture.FinishAfterDrain();
-                long bytes = await receiveTask;
-                UnityEngine.Debug.Log(
-                    $"machine state captured: {vmstateOutputPath} " +
-                    $"({bytes / (1024.0 * 1024.0):F1} MB{(gzip ? " gzip" : " raw")})");
+                catch (Exception migrateError)
+                {
+                    TryDeleteFile(vmstateOutputPath);
+                    string hint = migrateError.Message != null &&
+                                  migrateError.Message.IndexOf("vvfat", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? " Detach vvfat drives before save for a full RAM snapshot, " +
+                          "or keep this as a cold-bootable disk tip."
+                        : "";
+                    UnityEngine.Debug.LogWarning(
+                        $"UnityQemu: machine-state migrate failed ({migrateError.Message}). " +
+                        $"Saving disk tip only.{hint}");
+                    capturedMachineState = false;
+                }
             }
         }
         finally
@@ -1607,19 +1999,182 @@ public class VirtualMachine : MonoBehaviour
             }
         }
 
-        return frozenLayer;
+        return new CaptureStateResult(frozenLayer, capturedMachineState);
+    }
+
+#if UNITY_EDITOR
+    /// <summary>
+    /// Durable tip save: freeze work layer, optionally migrate to <paramref name="uqsnapProjectPath"/>,
+    /// write thin <paramref name="qcow2ProjectPath"/>, import assets, update session tip.
+    /// Pass null/empty uqsnap for a disk-only tip.
+    /// </summary>
+    public Task<BootableAsset> SaveDurableSnapshotAsync(
+        string qcow2ProjectPath,
+        string uqsnapProjectPath,
+        DiskAsset immediateParent,
+        bool compressMachineState = true,
+        bool captureScreenshot = true,
+        Action<string> progress = null) =>
+        DurableSnapshot.SaveAsync(
+            this, qcow2ProjectPath, uqsnapProjectPath, immediateParent,
+            compressMachineState, captureScreenshot, progress);
+
+    /// <summary>Stop, prepare, and start into <paramref name="snap"/>.</summary>
+    public Task LoadDurableSnapshotAsync(UqsnapAsset snap) =>
+        DurableSnapshot.LoadAsync(this, snap);
+
+    /// <summary>Reload the in-session quick-save from the last durable capture.</summary>
+    public Task ReloadDurableStateAsync() =>
+        DurableSnapshot.ReloadSessionStateAsync(this);
+#endif
+
+    static void TryDeleteFile(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return;
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            /* best-effort cleanup of a partial migrate stream */
+        }
     }
 
     /// <summary>
     /// Run an HMP command via the connected QMP session (e.g. savevm / loadvm / info snapshots).
+    /// Returns the raw reply text. Non-empty replies from commands that normally stay silent are
+    /// logged as warnings (for debugging), unless <paramref name="expectTextOutput"/> is set or
+    /// the command is a known query (<c>info</c>, <c>help</c>, …).
+    /// Prefer <see cref="RunHumanMonitorCommandOrThrowAsync"/> for mutating commands.
     /// </summary>
-    public async Task<string> RunHumanMonitorCommandAsync(string commandLine)
+    public async Task<string> RunHumanMonitorCommandAsync(
+        string commandLine, bool expectTextOutput = false)
+    {
+        string result = await RunHumanMonitorCommandCoreAsync(commandLine);
+        SurfaceUnexpectedHmpReply(commandLine, result, expectTextOutput);
+        return result;
+    }
+
+    /// <summary>
+    /// Mutating HMP helper. Success is an empty reply, or a bare <c>OK</c>
+    /// (<c>drive_add if=none</c> prints that; most other HMP commands print nothing).
+    /// Any other text throws. Use <see cref="RunHumanMonitorCommandAsync"/> for queries.
+    /// </summary>
+    public async Task RunHumanMonitorCommandOrThrowAsync(string commandLine)
+    {
+        string result = await RunHumanMonitorCommandCoreAsync(commandLine);
+        if (!IsHmpSuccessReply(result))
+            throw new InvalidOperationException(FormatHmpFailure(commandLine, result));
+    }
+
+    /// <summary>
+    /// Runs HMP and returns trimmed failure text, or <c>null</c> on success
+    /// (empty / bare <c>OK</c>). Non-success replies are also logged.
+    /// </summary>
+    public async Task<string> TryGetHumanMonitorFailureAsync(string commandLine)
+    {
+        string result = await RunHumanMonitorCommandCoreAsync(commandLine);
+        if (IsHmpSuccessReply(result))
+            return null;
+        SurfaceUnexpectedHmpReply(commandLine, result, expectTextOutput: false);
+        return result.Trim();
+    }
+
+    async Task<string> RunHumanMonitorCommandCoreAsync(string commandLine)
     {
         if (_qmpClient == null || !_qmpClient.IsConnected)
         {
             throw new InvalidOperationException("QMP not connected (is enableQmp on, and is QEMU running?)");
         }
-        return await _qmpClient.RunHumanMonitorCommandAsync(commandLine);
+        return await _qmpClient.RunHumanMonitorCommandAsync(commandLine) ?? "";
+    }
+
+    /// <summary>
+    /// Log HMP text that is not an expected query dump or a silent/OK success.
+    /// </summary>
+    static void SurfaceUnexpectedHmpReply(
+        string commandLine, string result, bool expectTextOutput)
+    {
+        if (IsHmpSuccessReply(result))
+            return;
+        if (expectTextOutput || HmpCommandExpectsTextOutput(commandLine))
+            return;
+
+        UnityEngine.Debug.LogWarning(FormatHmpReply(commandLine, result));
+    }
+
+    /// <summary>
+    /// HMP has no single success token. Most mutating commands print nothing;
+    /// <c>drive_add</c> with <c>if=none</c> is a special case that prints <c>OK</c>
+    /// (see QEMU <c>hmp_drive_add</c>). Treat empty and bare OK as success.
+    /// </summary>
+    public static bool IsHmpSuccessReply(string result)
+    {
+        if (string.IsNullOrWhiteSpace(result))
+            return true;
+        return string.Equals(result.Trim(), "OK", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Whether this HMP verb normally prints a text dump (not a silent mutate).</summary>
+    public static bool HmpCommandExpectsTextOutput(string commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+            return false;
+
+        string trimmed = commandLine.TrimStart();
+        int sp = trimmed.IndexOfAny(new[] { ' ', '\t' });
+        string verb = (sp < 0 ? trimmed : trimmed.Substring(0, sp)).ToLowerInvariant();
+        switch (verb)
+        {
+            case "info":
+            case "help":
+            case "?":
+            case "print":
+            case "p":
+            case "x":
+            case "xp":
+            case "sum":
+            case "history":
+            case "qom-list":
+            case "qom-get":
+            case "qom-list-types":
+            case "qom-list-properties":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>Build a short exception / log message for a failed mutating HMP command.</summary>
+    public static string FormatHmpFailure(string commandLine, string failureDetail) =>
+        FormatHmpReply(commandLine, failureDetail, failed: true);
+
+    /// <summary>Format an HMP reply for logs (whether or not we treat it as a hard failure).</summary>
+    public static string FormatHmpReply(
+        string commandLine, string replyDetail, bool failed = false)
+    {
+        string summary = SummarizeHmpCommand(commandLine);
+        string detail = replyDetail?.Trim() ?? "";
+        string label = failed ? "failed" : "reply";
+        return string.IsNullOrEmpty(summary)
+            ? detail
+            : $"HMP `{summary}` {label}:\n{detail}";
+    }
+
+    static string SummarizeHmpCommand(string commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+            return "";
+        // Verb + first arg only — omit long file= paths from titles.
+        string[] parts = commandLine.Split(new[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0)
+            return commandLine.Trim();
+        if (parts.Length == 1)
+            return parts[0];
+        return parts[0] + " " + parts[1];
     }
 
     /// <summary>
@@ -1697,6 +2252,36 @@ public class VirtualMachine : MonoBehaviour
     }
 
     /// <summary>
+    /// Filesystem path (or QEMU file spec) currently inserted in a block device,
+    /// from QMP <c>query-block</c>. Null when empty / unknown.
+    /// </summary>
+    public async Task<string> TryGetInsertedBlockFileAsync(string deviceName)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+            return null;
+        if (_qmpClient == null || !_qmpClient.IsConnected)
+            throw new InvalidOperationException("QMP not connected (is enableQmp on, and is QEMU running?)");
+
+        JObject response = await _qmpClient.ExecuteCommandAsync("query-block");
+        JArray arr = response["return"] as JArray;
+        if (arr == null)
+            return null;
+
+        string want = deviceName.Trim();
+        foreach (JToken entry in arr)
+        {
+            string device = entry["device"]?.Value<string>();
+            if (!string.Equals(device, want, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string file = entry["inserted"]?["file"]?.Value<string>();
+            return string.IsNullOrWhiteSpace(file) ? null : file.Trim();
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Guest RAM size in bytes from QMP <c>query-memory-size-summary</c>
     /// (<c>base-memory</c> + optional <c>plugged-memory</c>).
     /// </summary>
@@ -1730,6 +2315,20 @@ public class VirtualMachine : MonoBehaviour
 
         // So GDB memory sessions don't auto-continue over a QMP pause.
         _gdbClient?.NotifyStoppedExternally();
+    }
+
+    /// <summary>
+    /// True when QMP <c>query-status</c> reports <c>paused</c>.
+    /// False when running or when QMP is not connected.
+    /// </summary>
+    public async Task<bool> IsPausedAsync()
+    {
+        if (_qmpClient == null || !_qmpClient.IsConnected)
+            return false;
+
+        JObject response = await _qmpClient.ExecuteCommandAsync("query-status");
+        string status = response["return"]?["status"]?.Value<string>();
+        return string.Equals(status, "paused", StringComparison.Ordinal);
     }
 
     /// <summary>Resume the guest (QMP <c>cont</c>, or GDB continue if QMP unavailable).</summary>
@@ -1768,13 +2367,17 @@ public class VirtualMachine : MonoBehaviour
     {
         StopQemu();
         // Windows can take a beat to release listen sockets after Kill.
-        await WaitForPortsFreeAsync(2000);
+        await WaitForActivePortsFreeAsync(2000);
+        ReleaseClaimedPorts();
     }
 
     void StopQemu()
     {
         _vncClient?.Dispose();
         _vncClient = null;
+        var audioPlayer = GetComponent<VncAudioPlayer>();
+        if (audioPlayer != null)
+            audioPlayer.StopPlayback();
         
         _qmpClient?.Dispose();
         _qmpClient = null;
@@ -1811,13 +2414,155 @@ public class VirtualMachine : MonoBehaviour
                 _qemuProcess = null;
             }
         }
+#if UNITY_EDITOR
+        RefreshIdleOutputPreview();
+#endif
+        try { OnStopped?.Invoke(); }
+        catch (Exception e) { UnityEngine.Debug.LogException(e); }
     }
 
-    async Task WaitForPortsFreeAsync(int timeoutMs)
+    /// <summary>
+    /// Pick VNC/QMP/GDB ports for this start and hold the OS sockets until
+    /// <see cref="HandOffPortsToQemu"/>. Default: free ports via
+    /// <see cref="QemuPortAllocator"/> (VNC prefers a project-hash display).
+    /// Advanced override: fixed serialized ports.
+    /// </summary>
+    void AllocatePortsForStart()
     {
-        int[] ports = enableQmp
-            ? (enableGdb ? new[] { vncPort, qmpPort, gdbPort } : new[] { vncPort, qmpPort })
-            : (enableGdb ? new[] { vncPort, gdbPort } : new[] { vncPort });
+        ReleaseClaimedPorts();
+        _activeVncPort = 0;
+        _activeQmpPort = 0;
+        _activeGdbPort = 0;
+
+        try
+        {
+            if (overridePorts)
+            {
+                _heldVncPort = QemuPortAllocator.ClaimExact(vncPort);
+                _activeVncPort = _heldVncPort.Port;
+                if (enableQmp)
+                {
+                    _heldQmpPort = QemuPortAllocator.ClaimExact(qmpPort);
+                    _activeQmpPort = _heldQmpPort.Port;
+                }
+
+                if (enableGdb)
+                {
+                    _heldGdbPort = QemuPortAllocator.ClaimExact(gdbPort);
+                    _activeGdbPort = _heldGdbPort.Port;
+                }
+            }
+            else
+            {
+                _heldVncPort = QemuPortAllocator.ClaimVncDisplayPort();
+                _activeVncPort = _heldVncPort.Port;
+                if (enableQmp)
+                {
+                    _heldQmpPort = QemuPortAllocator.ClaimEphemeralPort();
+                    _activeQmpPort = _heldQmpPort.Port;
+                }
+                if (enableGdb)
+                {
+                    _heldGdbPort = QemuPortAllocator.ClaimEphemeralPort();
+                    _activeGdbPort = _heldGdbPort.Port;
+                }
+            }
+        }
+        catch
+        {
+            ReleaseClaimedPorts();
+            throw;
+        }
+    }
+
+    void HandOffPortsToQemu()
+    {
+        _heldVncPort?.HandOff();
+        _heldQmpPort?.HandOff();
+        _heldGdbPort?.HandOff();
+    }
+
+    void ReleaseClaimedPorts()
+    {
+        _heldVncPort?.Dispose();
+        _heldVncPort = null;
+        _heldQmpPort?.Dispose();
+        _heldQmpPort = null;
+        _heldGdbPort?.Dispose();
+        _heldGdbPort = null;
+    }
+
+    /// <summary>
+    /// Kill a QEMU process that failed during start without firing <see cref="OnStopped"/>
+    /// (used for port-bind retries).
+    /// </summary>
+    void AbortFailedQemuStart()
+    {
+        _vncClient?.Dispose();
+        _vncClient = null;
+        _qmpClient?.Dispose();
+        _qmpClient = null;
+        _gdbClient?.Dispose();
+        _gdbClient = null;
+
+        if (_qemuProcess == null)
+            return;
+        try
+        {
+            try { _qemuProcess.CancelOutputRead(); } catch { /* ignore */ }
+            try { _qemuProcess.CancelErrorRead(); } catch { /* ignore */ }
+            if (!_qemuProcess.HasExited)
+            {
+                _qemuProcess.Kill();
+                _qemuProcess.WaitForExit(3000);
+            }
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"Error aborting QEMU start: {e.Message}");
+        }
+        finally
+        {
+            try { _qemuProcess.Dispose(); } catch { /* ignore */ }
+            _qemuProcess = null;
+        }
+    }
+
+    /// <summary>
+    /// True if QEMU is still running, or exited for a non-bind reason.
+    /// False if stderr indicates a TCP address-in-use failure (caller should retry ports).
+    /// </summary>
+    async Task<bool> QemuSurvivedPortBindAsync(StringBuilder earlyStderr)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            if (_qemuProcess == null || _qemuProcess.HasExited)
+            {
+                string text;
+                lock (earlyStderr)
+                    text = earlyStderr.ToString();
+                // Give async stderr a beat to flush after exit.
+                if (string.IsNullOrEmpty(text))
+                {
+                    await Task.Delay(50);
+                    lock (earlyStderr)
+                        text = earlyStderr.ToString();
+                }
+                return !QemuPortAllocator.LooksLikeAddressInUse(text);
+            }
+            await Task.Delay(50);
+        }
+        return true;
+    }
+
+    async Task WaitForActivePortsFreeAsync(int timeoutMs)
+    {
+        var ports = new System.Collections.Generic.List<int>(3);
+        if (_activeVncPort > 0) ports.Add(_activeVncPort);
+        if (_activeQmpPort > 0) ports.Add(_activeQmpPort);
+        if (_activeGdbPort > 0) ports.Add(_activeGdbPort);
+        if (ports.Count == 0)
+            return;
 
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < timeoutMs)
@@ -1825,7 +2570,7 @@ public class VirtualMachine : MonoBehaviour
             bool allFree = true;
             foreach (int port in ports)
             {
-                if (!IsPortFree(port))
+                if (!QemuPortAllocator.IsPortFree(port))
                 {
                     allFree = false;
                     break;
@@ -1836,27 +2581,9 @@ public class VirtualMachine : MonoBehaviour
             await Task.Delay(50);
         }
         UnityEngine.Debug.LogWarning(
-            $"Timed out waiting for QEMU ports to free (vnc={vncPort}, qmp={qmpPort}, gdb={gdbPort}). " +
+            $"Timed out waiting for QEMU ports to free " +
+            $"(vnc={_activeVncPort}, qmp={_activeQmpPort}, gdb={_activeGdbPort}). " +
             "Restart may fail if an old qemu-system process is still running.");
-    }
-
-    static bool IsPortFree(int port)
-    {
-        TcpListener listener = null;
-        try
-        {
-            listener = new TcpListener(IPAddress.Loopback, port);
-            listener.Start();
-            return true;
-        }
-        catch (SocketException)
-        {
-            return false;
-        }
-        finally
-        {
-            try { listener?.Stop(); } catch { /* ignore */ }
-        }
     }
 
     void ConnectGdb()
@@ -1865,7 +2592,7 @@ public class VirtualMachine : MonoBehaviour
         {
             _gdbClient?.Dispose();
             _gdbClient = new GdbClient { Verbose = verboseGdb };
-            _gdbClient.Connect("127.0.0.1", gdbPort, gdbPhysicalMemory);
+            _gdbClient.Connect("127.0.0.1", _activeGdbPort, gdbPhysicalMemory);
         }
         catch (Exception e)
         {

@@ -2,7 +2,8 @@
     "name": "UnityQemu",
     "rootNamespace": "UnityQemu",
     "references": [
-        "GUID:324caed91501a9c47a04ebfd87b68794"
+        "GUID:324caed91501a9c47a04ebfd87b68794",
+        "GUID:e4a7b2c19f834d6a8e5c1b0d9a7f6e3c"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

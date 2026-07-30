@@ -1,9 +1,11 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
-using RemoteViewing.Vnc;
+using Plunderludics.RemoteViewing.Vnc;
 using TriInspector;
 using System.Diagnostics;
+using RemoteVncClient = Plunderludics.RemoteViewing.Vnc.VncClient;
 
 /// <summary>
 /// VNC client wrapper using RemoteViewing library for QEMU
@@ -13,11 +15,18 @@ public class VncClient : IDisposable
 {
     private string _host;
     private int _display;
-    private RemoteViewing.Vnc.VncClient _vncClient;
+    private RemoteVncClient _vncClient;
     private Texture2D _texture;
+    private Color32[] _colorBuffer;
     private bool _connected = false;
     private bool _needsUpdate = false;
     private object _updateLock = new object();
+
+    /// <summary>When true, negotiate QEMU audio and feed PCM to <see cref="AudioPlayer"/>.</summary>
+    public bool PlayAudioInUnity { get; set; }
+
+    /// <summary>Optional Unity playback sink (required when <see cref="PlayAudioInUnity"/> is on).</summary>
+    public VncAudioPlayer AudioPlayer { get; set; }
 
     // Reconnect state. RemoteViewing's message-loop thread swallows protocol/socket errors
     // and silently raises Closed, so we log it ourselves and retry from Update().
@@ -28,12 +37,28 @@ public class VncClient : IDisposable
     private DateTime _nextReconnectAt = DateTime.MinValue;
     private DateTime _connectedAt;
 
+    // Frame pacing: NotifyFps = FramebufferChanged events from RemoteViewing's thread;
+    // ApplyFps = textures actually uploaded on the Unity main thread. A large gap means
+    // Unity is coalescing / falling behind on the CPU upload path.
+    readonly Stopwatch _fpsWatch = Stopwatch.StartNew();
+    int _notifyCountInWindow;
+    int _applyCountInWindow;
+    volatile float _notifyFps;
+    volatile float _applyFps;
+    const double FpsWindowSeconds = 1.0;
+
     const double BaseReconnectDelaySeconds = 2.0;
     const double MaxReconnectDelaySeconds = 10.0;
 
     public bool IsConnected => _connected && _vncClient != null && _vncClient.IsConnected;
     public bool IsInternalClientConnected => _vncClient != null && _vncClient.IsConnected;
     public Texture2D Texture => _texture;
+
+    /// <summary>VNC framebuffer-changed notifications per second (incoming).</summary>
+    public float NotifyFps => _notifyFps;
+
+    /// <summary>Texture uploads completed per second (what Unity actually presents).</summary>
+    public float ApplyFps => _applyFps;
 
     public async Task ConnectAsync(string host, int display)
     {
@@ -58,28 +83,31 @@ public class VncClient : IDisposable
     {
         int port = 5900 + _display;
 
-        var client = new RemoteViewing.Vnc.VncClient();
+        var client = new RemoteVncClient();
+        // RemoteViewing defaults to 15 — that alone was capping us at ~14 FPS.
+        // This only throttles FramebufferUpdateRequest; pointer/key events are unthrottled.
+        client.MaxUpdateRate = 60;
 
         // Set up framebuffer changed event to update texture
         client.FramebufferChanged += OnFramebufferChanged;
         client.Closed += OnClientClosed;
+        if (PlayAudioInUnity)
+        {
+            client.QemuAudioNegotiated += OnQemuAudioNegotiated;
+            client.AudioDataReceived += OnAudioDataReceived;
+            AudioPlayer?.RequestStartPlayback();
+        }
 
-        // Set up connection options
+        int audioHz = AudioSettings.outputSampleRate > 0
+            ? Mathf.Min(48000, AudioSettings.outputSampleRate)
+            : 44100;
+
         var options = new VncClientConnectOptions
         {
             ShareDesktop = true,
-            PixelFormat = new VncPixelFormat(
-                bitsPerPixel: 32,
-                bitDepth: 24,
-                redBits: 8,
-                redShift: 16,
-                greenBits: 8,
-                greenShift: 8,
-                blueBits: 8,
-                blueShift: 0,
-                isLittleEndian: true,
-                isPalettized: false
-            )
+            EnableQemuAudio = PlayAudioInUnity,
+            AdvertiseQemuAudio = PlayAudioInUnity,
+            QemuAudioFormat = new QemuAudioFormat(QemuAudioSampleFormat.S16, 2, audioHz),
         };
 
         // Connect to VNC server (synchronous method, run in task)
@@ -89,6 +117,8 @@ public class VncClient : IDisposable
         {
             client.FramebufferChanged -= OnFramebufferChanged;
             client.Closed -= OnClientClosed;
+            client.QemuAudioNegotiated -= OnQemuAudioNegotiated;
+            client.AudioDataReceived -= OnAudioDataReceived;
             try { client.Close(); } catch { /* ignore */ }
             return;
         }
@@ -115,13 +145,40 @@ public class VncClient : IDisposable
         _unexpectedClose = true;
     }
 
+    void OnQemuAudioNegotiated(object sender, EventArgs e)
+    {
+        // VNC thread — do not touch AudioSource here.
+        AudioPlayer?.RequestStartPlayback();
+    }
+
+    void OnAudioDataReceived(object sender, QemuAudioDataEventArgs e)
+    {
+        if (!PlayAudioInUnity || AudioPlayer == null || e?.Data == null)
+            return;
+        AudioPlayer.PushPcm(e.Data, e.Format);
+    }
+
     private void OnFramebufferChanged(object sender, FramebufferChangedEventArgs e)
     {
+        Interlocked.Increment(ref _notifyCountInWindow);
         // Mark that we need an update - actual texture update happens on main thread
         lock (_updateLock)
         {
             _needsUpdate = true;
         }
+    }
+
+    void RollFpsWindow()
+    {
+        double elapsed = _fpsWatch.Elapsed.TotalSeconds;
+        if (elapsed < FpsWindowSeconds)
+            return;
+
+        int notifies = Interlocked.Exchange(ref _notifyCountInWindow, 0);
+        _notifyFps = (float)(notifies / elapsed);
+        _applyFps = (float)(_applyCountInWindow / elapsed);
+        _applyCountInWindow = 0;
+        _fpsWatch.Restart();
     }
     
     /// <summary>
@@ -141,9 +198,11 @@ public class VncClient : IDisposable
         }
         
         var framebuffer = _vncClient.Framebuffer;
+        int width = framebuffer.Width;
+        int height = framebuffer.Height;
         
         // Ensure texture size matches (this must be on main thread)
-        if (_texture == null || _texture.width != framebuffer.Width || _texture.height != framebuffer.Height)
+        if (_texture == null || _texture.width != width || _texture.height != height)
         {
             if (_texture != null)
             {
@@ -152,47 +211,57 @@ public class VncClient : IDisposable
                 else
                     UnityEngine.Object.DestroyImmediate(_texture);
             }
-            _texture = new Texture2D(framebuffer.Width, framebuffer.Height, TextureFormat.RGB24, false);
+            _texture = new Texture2D(width, height, TextureFormat.RGB24, false);
+            _colorBuffer = null;
         }
-        
-        // Get pixel data from framebuffer
-        // VncFramebuffer.GetPixels() returns int[] where each int represents a pixel
-        var pixels = framebuffer.GetPixels();
-        
-        // Convert to Color32 array
-        // RemoteViewing returns pixels as int[] where each int is ARGB (32-bit)
-        Color32[] colors = new Color32[framebuffer.Width * framebuffer.Height];
-        
-        for (int y = 0; y < framebuffer.Height; y++)
+
+        int pixelCount = width * height;
+        if (_colorBuffer == null || _colorBuffer.Length != pixelCount)
+            _colorBuffer = new Color32[pixelCount];
+
+        // Server pixel format after connect; QEMU is typically 32bpp LE truecolor.
+        var pf = framebuffer.PixelFormat;
+        lock (framebuffer.SyncRoot)
         {
-            for (int x = 0; x < framebuffer.Width; x++)
+            byte[] buffer = framebuffer.GetBuffer();
+            if (pf.BytesPerPixel != 4 || pf.BitDepth < 24)
+                return;
+
+            for (int y = 0; y < height; y++)
             {
-                int pixelIndex = y * framebuffer.Width + x;
-                int textureIndex = ((framebuffer.Height - 1 - y) * framebuffer.Width) + x; // Flip Y for Unity
-                
-                if (pixelIndex < pixels.Length)
+                int srcRow = y * width * 4;
+                int dstRow = (height - 1 - y) * width; // Flip Y for Unity
+                for (int x = 0; x < width; x++)
                 {
-                    // Extract ARGB components from int (assuming little-endian ARGB format)
-                    int pixel = pixels[pixelIndex];
-                    byte a = (byte)((pixel >> 24) & 0xFF);
-                    byte r = (byte)((pixel >> 16) & 0xFF);
-                    byte g = (byte)((pixel >> 8) & 0xFF);
-                    byte b = (byte)(pixel & 0xFF);
-                    
-                    colors[textureIndex] = new Color32(r, g, b, a == 0 ? (byte)255 : a);
+                    int src = srcRow + x * 4;
+                    uint pixel = pf.IsLittleEndian
+                        ? (uint)(buffer[src]
+                            | (buffer[src + 1] << 8)
+                            | (buffer[src + 2] << 16)
+                            | (buffer[src + 3] << 24))
+                        : (uint)((buffer[src] << 24)
+                            | (buffer[src + 1] << 16)
+                            | (buffer[src + 2] << 8)
+                            | buffer[src + 3]);
+                    byte r = (byte)((pixel >> pf.RedShift) & 0xFF);
+                    byte g = (byte)((pixel >> pf.GreenShift) & 0xFF);
+                    byte b = (byte)((pixel >> pf.BlueShift) & 0xFF);
+                    _colorBuffer[dstRow + x] = new Color32(r, g, b, 255);
                 }
             }
         }
         
-        // Update texture (must be on main thread)
-        _texture.SetPixels32(colors);
-        _texture.Apply();
+        _texture.SetPixels32(_colorBuffer);
+        _texture.Apply(false, false);
+        _applyCountInWindow++;
     }
 
     public void Update()
     {
+        AudioPlayer?.MainThreadTick();
         // Update texture on main thread when framebuffer changes
         UpdateTexture();
+        RollFpsWindow();
 
         // Detect a dead connection even if the Closed event never fired.
         bool lostConnection = _unexpectedClose ||
@@ -225,6 +294,8 @@ public class VncClient : IDisposable
         {
             old.FramebufferChanged -= OnFramebufferChanged;
             old.Closed -= OnClientClosed;
+            old.QemuAudioNegotiated -= OnQemuAudioNegotiated;
+            old.AudioDataReceived -= OnAudioDataReceived;
             try { old.Close(); } catch { /* ignore */ }
         }
 
@@ -292,7 +363,7 @@ public class VncClient : IDisposable
 
         try
         {
-            _vncClient.SendKeyEvent(keysym, pressed);
+            _vncClient.SendKeyEvent((KeySym)keysym, pressed);
         }
         catch (Exception e)
         {
@@ -311,6 +382,8 @@ public class VncClient : IDisposable
         {
             _vncClient.FramebufferChanged -= OnFramebufferChanged;
             _vncClient.Closed -= OnClientClosed;
+            _vncClient.QemuAudioNegotiated -= OnQemuAudioNegotiated;
+            _vncClient.AudioDataReceived -= OnAudioDataReceived;
             _vncClient.Close();
             _vncClient = null;
         }

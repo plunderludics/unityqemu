@@ -35,12 +35,25 @@ public class UqsnapAsset : BootableAsset
         return Path.ChangeExtension(uqsnapProjectPath.Replace('\\', '/'), ".png");
     }
 
+    /// <summary>
+    /// True when the <c>.uqsnap</c> holds a non-empty migration stream.
+    /// Empty files are disk-only placeholders (e.g. save while writable vvfat blocked migrate).
+    /// </summary>
     public bool HasMachineState
     {
         get
         {
             string path = GetMachineStateFilesystemPath();
-            return !string.IsNullOrEmpty(path) && File.Exists(path);
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                return false;
+            try
+            {
+                return new FileInfo(path).Length > 0;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
         }
     }
 
@@ -61,9 +74,7 @@ public class UqsnapAsset : BootableAsset
 #endif
         if (string.IsNullOrEmpty(rel))
             return null;
-        if (Path.IsPathRooted(rel))
-            return rel;
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "..", rel));
+        return Paths.ResolveProjectRelativeFile(rel);
     }
 
     public bool MachineStateIsCompressed =>
@@ -75,7 +86,7 @@ public class UqsnapAsset : BootableAsset
 #if UNITY_EDITOR
     /// <summary>
     /// One project-wide scan: disk tip → snapshots that reference it.
-    /// Prefer this for tree/inspector draws instead of repeated <see cref="FindForDisk"/>.
+    /// Prefer this for tree/inspector draws (one scan per paint).
     /// </summary>
     public static System.Collections.Generic.Dictionary<DiskAsset, System.Collections.Generic.List<UqsnapAsset>>
         BuildIndexByDisk()
@@ -100,16 +111,6 @@ public class UqsnapAsset : BootableAsset
                 a.DisplayLabel, b.DisplayLabel, StringComparison.OrdinalIgnoreCase));
         }
         return map;
-    }
-
-    public static System.Collections.Generic.List<UqsnapAsset> FindForDisk(DiskAsset diskTip)
-    {
-        var list = new System.Collections.Generic.List<UqsnapAsset>();
-        if (diskTip == null)
-            return list;
-        if (BuildIndexByDisk().TryGetValue(diskTip, out var found))
-            list.AddRange(found);
-        return list;
     }
 #endif
 

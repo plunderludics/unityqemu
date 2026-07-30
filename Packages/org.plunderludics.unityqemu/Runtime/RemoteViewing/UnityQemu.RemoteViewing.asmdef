@@ -1,0 +1,14 @@
+{
+    "name": "UnityQemu.RemoteViewing",
+    "rootNamespace": "Plunderludics.RemoteViewing",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": true
+}

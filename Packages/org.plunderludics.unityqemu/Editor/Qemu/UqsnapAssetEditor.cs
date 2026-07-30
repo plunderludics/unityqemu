@@ -9,11 +9,14 @@ public class UqsnapAssetEditor : UnityEditor.Editor
     {
         var snap = (UqsnapAsset)target;
         var prev = GUI.backgroundColor;
-        GUI.backgroundColor = new Color(0.55f, 0.85f, 0.55f, 1f);
+        GUI.backgroundColor = new Color(0.45f, 0.65f, 0.95f, 1f);
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
             GUI.backgroundColor = prev;
             var titleStyle = new GUIStyle(EditorStyles.boldLabel) { fontSize = 12 };
+            titleStyle.normal.textColor = EditorGUIUtility.isProSkin
+                ? new Color(0.7f, 0.86f, 1f)
+                : new Color(0.12f, 0.32f, 0.62f);
             EditorGUILayout.LabelField("○  Snapshot", titleStyle);
             EditorGUILayout.LabelField(
                 "Machine state + linked disk tip. Assign this on a VirtualMachine Snapshot slot.",
@@ -34,7 +37,7 @@ public class UqsnapAssetEditor : UnityEditor.Editor
         bool prevEnabled = GUI.enabled;
         GUI.enabled = true;
         if (snap.disk != null)
-            SnapshotTreeGUI.Draw(snap.disk);
+            SnapshotTreeGUI.Draw(snap.disk, SnapshotTreeCache.SnapsByDisk());
         GUI.enabled = prevEnabled;
 
         DrawDefaultInspector();

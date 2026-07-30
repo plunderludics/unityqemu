@@ -159,7 +159,7 @@ absolute (already the convention for work images).
 - Device topology must match at load, as with `loadvm`. Unlike `savevm`, the *save*
   side has no "all writable devices must support snapshots" rule (though our quick-save
   keeps that constraint satisfied anyway, as today). Writable vvfat would block
-  migration, but host folders/floppies are already mounted read-only.
+  migration; detach USB vvfat before a full RAM save.
 - Retest `file:` migration on future QEMU upgrades; if fixed, saving could use it
   directly with zero format changes (minus compression). Likewise retest whether the
   i8257 idle-source wedge (§2) still exists — if QEMU ever stops re-arming the DMA

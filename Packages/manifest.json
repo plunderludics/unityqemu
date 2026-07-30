@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "com.boxqkrtm.ide.cursor": "https://github.com/boxqkrtm/com.unity.ide.cursor.git",
     "com.codewriter.triinspector": "1.15.1",
     "com.gurngroup.unityagentbridge": "file:../../../agent-api-demo/Packages/com.gurngroup.unityagentbridge",
     "com.singularitygroup.hotreload": "git+https://gitlab.hotreload.net/root/hot-reload-releases.git#1.13.11",
@@ -18,6 +19,9 @@
     "com.unity.modules.ui": "1.0.0",
     "com.unity.modules.vectorgraphics": "1.0.0"
   },
+  "testables": [
+    "org.plunderludics.unityqemu"
+  ],
   "scopedRegistries": [
     {
       "name": "package.openupm.com",

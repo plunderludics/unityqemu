@@ -14,6 +14,8 @@ public class GuestProcessMemoryMap : ScriptableObject
     public uint pid;
     public uint directoryTableBase;
     public long eprocessVirtual;
+    [Tooltip("Main EXE image base VA (SectionBaseAddress) when the map was saved")]
+    public uint imageBase;
     [Tooltip("Cached System EPROCESS physical address (skips RAM scan on refresh)")]
     public long systemEprocessPhysical;
 
@@ -70,12 +72,14 @@ public class GuestProcessMemoryMap : ScriptableObject
     public void SetFrom(
         Win32X86GuestMemory.GuestProcess proc,
         IReadOnlyList<Win32X86GuestMemory.PhysicalRange> physicalRanges,
-        long systemEprocessPhys = 0)
+        long systemEprocessPhys = 0,
+        uint imageBaseVa = 0)
     {
         processName = proc.Name;
         pid = proc.Pid;
         directoryTableBase = proc.DirectoryTableBase;
         eprocessVirtual = proc.EprocessVirtual;
+        imageBase = imageBaseVa;
         systemEprocessPhysical = systemEprocessPhys;
         ranges.Clear();
         for (int i = 0; i < physicalRanges.Count; i++)

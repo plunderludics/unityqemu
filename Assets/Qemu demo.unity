@@ -276,162 +276,6 @@ RectTransform:
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: 0, y: 0}
   m_Pivot: {x: 0, y: 0}
---- !u!1 &543766794
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 543766796}
-  - component: {fileID: 543766795}
-  - component: {fileID: 543766797}
-  m_Layer: 0
-  m_Name: Win2000
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 0
---- !u!114 &543766795
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 543766794}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 342ef9f6392686042b69667bd374eb45, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  enableQmp: 1
-  enableGdb: 0
-  verboseQmp: 0
-  verboseGdb: 0
-  showGui: 1
-  inputProvider: {fileID: 0}
-  runInEditMode: 0
-  snapshot: {fileID: 0}
-  diskAsset: {fileID: 0}
-  autoLoadVmState: 1
-  overrideSnapshotLaunchConfig: 0
-  launchConfig:
-    memoryMb: 64
-    extraQemuArgs: "    -vga cirrus\r\n    -device ac97,audiodev=snd0\r\n    -audiodev
-      dsound,id=snd0\n    -usb -device usb-tablet"
-    cdroms: []
-    floppies: []
-    hostFolders: []
-    smbShareFolder: {fileID: 0}
-  useEphemeralWorkOverlay: 1
-  vncPort: 5901
-  qmpPort: 4445
-  gdbPort: 1234
-  gdbPhysicalMemory: 1
-  outputTexture: {fileID: 8400000, guid: 3010e189faec4e44ebbe420ee3a23d53, type: 2}
---- !u!4 &543766796
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 543766794}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 6.967082, y: 2.4543538, z: -41.089787}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &543766797
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 543766794}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 7c4e9b2a1f8d4e6a9b0c3d5e7f1a2b3c, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: UnityQemu::UnityQemu.LegacySnapshotUI
-  virtualMachine: {fileID: 543766795}
-  refreshOnReady: 1
-  snapshots:
-  - name: Desktop
-  - name: Trash
---- !u!1 &1215668512
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1215668513}
-  - component: {fileID: 1215668514}
-  m_Layer: 0
-  m_Name: Win95
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 0
---- !u!4 &1215668513
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1215668512}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 6.967082, y: 2.4543538, z: -41.089787}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1215668514
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1215668512}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 342ef9f6392686042b69667bd374eb45, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  enableQmp: 1
-  enableGdb: 1
-  verboseQmp: 0
-  verboseGdb: 0
-  showGui: 1
-  inputProvider: {fileID: 0}
-  runInEditMode: 0
-  snapshot: {fileID: 0}
-  diskAsset: {fileID: 0}
-  autoLoadVmState: 1
-  overrideSnapshotLaunchConfig: 0
-  launchConfig:
-    memoryMb: 64
-    extraQemuArgs: "    -cpu pentium\n    -vga cirrus\r\n    -device sb16,audiodev=snd0\r\n   
-      -audiodev dsound,id=snd0\r\n    -loadvm desktop"
-    cdroms: []
-    floppies: []
-    hostFolders: []
-    smbShareFolder: {fileID: 0}
-  useEphemeralWorkOverlay: 1
-  vncPort: 5900
-  qmpPort: 4444
-  gdbPort: 1234
-  gdbPhysicalMemory: 1
-  outputTexture: {fileID: 8400000, guid: 3010e189faec4e44ebbe420ee3a23d53, type: 2}
 --- !u!1 &1707530063
 GameObject:
   m_ObjectHideFlags: 0
@@ -594,33 +438,40 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 342ef9f6392686042b69667bd374eb45, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  enableQmp: 1
-  enableGdb: 0
-  verboseQmp: 0
-  verboseGdb: 0
   showGui: 1
+  autoRestart: 0
+  playAudioInUnity: 0
   inputProvider: {fileID: 0}
-  runInEditMode: 0
-  snapshot: {fileID: -6750239444755058063, guid: 5b954b17d3e906444bea5d4ab49a27e0, type: 3}
-  diskAsset: {fileID: -6750239444755058063, guid: 2a2f90d1459d64544b43e90a4ba3ef71, type: 3}
+  runVmInEditMode: 0
+  snapshot: {fileID: -6750239444755058063, guid: 3d42d9421188a964ba575de87a629e14, type: 3}
+  diskAsset: {fileID: -6750239444755058063, guid: c614a2475974a0346a2b8a471561f58c, type: 3}
   autoLoadVmState: 1
   overrideSnapshotLaunchConfig: 0
   launchConfig:
     memoryMb: 256
-    extraQemuArgs: "-cpu pentium3\r\n    -vga cirrus\r\n    -device sb16,audiodev=snd0\r\n   
-      -audiodev sdl,id=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
+    usbEhci: 1
+    usbEhciId: uq-ehci
+    usbEhciPciAddr: 0x4
+    extraQemuArgs: "-cpu pentium3\r\n    -vga cirrus\r\n    -audiodev sdl,id=snd0\r\n   
+      -device sb16,audiodev=snd0\r\n    -netdev user,id=net0\r\n    -device rtl8139,netdev=net0\r\n   
       -usb -device usb-tablet"
-    cdroms:
-    - {fileID: -6750239444755058063, guid: 5b1cfe14e542a944c8dc833f0a1fac88, type: 3}
+    cdroms: []
     floppies: []
-    hostFolders: []
-    smbShareFolder: {fileID: 0}
+  useCustomRenderTexture: 0
+  outputTexture: {fileID: 8400000, guid: 3010e189faec4e44ebbe420ee3a23d53, type: 2}
+  renderTextureSettings:
+    autoResize: 1
+    filterMode: 0
   useEphemeralWorkOverlay: 1
+  overridePorts: 0
   vncPort: 5901
   qmpPort: 4445
   gdbPort: 1235
+  enableQmp: 1
+  enableGdb: 0
   gdbPhysicalMemory: 1
-  outputTexture: {fileID: 8400000, guid: 3010e189faec4e44ebbe420ee3a23d53, type: 2}
+  verboseQmp: 0
+  verboseGdb: 0
 --- !u!4 &1795018731
 Transform:
   m_ObjectHideFlags: 0
@@ -710,7 +561,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: UnityQemu::UnityQemu.SnapshotUI
   virtualMachine: {fileID: 1795018730}
-  currentSnapshot: {fileID: -6750239444755058063, guid: 2a2f90d1459d64544b43e90a4ba3ef71, type: 3}
+  includeMachineState: 1
+  compressMachineState: 1
+  captureScreenshot: 1
 --- !u!114 &1795018736
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -724,8 +577,6 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: UnityQemu::UnityQemu.PeripheralsUI
   virtualMachine: {fileID: 1795018730}
-  cdromDevice: unityqemu-cd0
-  floppyDevice: 
   alsoAddToLaunchConfig: 1
 --- !u!1 &2024899171
 GameObject:
@@ -964,8 +815,6 @@ SceneRoots:
   m_ObjectHideFlags: 0
   m_Roots:
   - {fileID: 1795018731}
-  - {fileID: 1215668513}
-  - {fileID: 543766796}
   - {fileID: 2042615399}
   - {fileID: 79317457}
   - {fileID: 1707530066}

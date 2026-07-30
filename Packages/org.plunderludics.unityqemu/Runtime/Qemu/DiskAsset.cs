@@ -14,7 +14,6 @@ namespace UnityQemu {
 /// Machine state lives on <see cref="UqsnapAsset"/>, which references a disk tip.
 /// </summary>
 [Icon("Packages/org.plunderludics.unityqemu/Editor/Icons/DiskAssetIcon.png")]
-[CreateAssetMenu(fileName = "Disk", menuName = "UnityQemu/Disk Asset", order = 10)]
 public class DiskAsset : BootableAsset
 {
     [Tooltip("Project-relative path to the image (e.g. Assets/Qemu/win95.qcow2).")]
@@ -46,9 +45,7 @@ public class DiskAsset : BootableAsset
 #endif
         if (string.IsNullOrEmpty(rel))
             return null;
-        if (Path.IsPathRooted(rel))
-            return rel;
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "..", rel));
+        return Paths.ResolveProjectRelativeFile(rel);
     }
 
     public static bool IsQemuImageAssetPath(string assetPath)

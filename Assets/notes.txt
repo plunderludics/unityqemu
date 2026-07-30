@@ -49,8 +49,10 @@
  -netdev user,id=net0
 -device rtl8139,netdev=net0
 
-# For better mouse tracking:
+# For better mouse tracking (UHCI tablet). EHCI is for vvfat USB hotplug
+# so storage does not share the tablet's hub:
     -usb -device usb-tablet
+    -device usb-ehci,id=uq-ehci
 
 # Grow a durable snapshot's virtual disk (QEMU must be stopped). Guest still needs
 # GParted (or similar) afterward to expand the NTFS partition into the new space.

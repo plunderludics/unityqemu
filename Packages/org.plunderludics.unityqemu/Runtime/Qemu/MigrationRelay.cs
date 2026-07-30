@@ -269,5 +269,109 @@ public static class MigrationRelay
             destination.Write(buffer, 0, read);
         }
     }
+
+    // QEMUFile: put_byte(len) + id ("pc.ram") then be64 RAM size. Appears early
+    // in the migration stream (well before page data), so we only need a small prefix.
+    static readonly byte[] PcRamIdMarker =
+        { 6, (byte)'p', (byte)'c', (byte)'.', (byte)'r', (byte)'a', (byte)'m' };
+
+    /// <summary>
+    /// Guest RAM size in bytes from a migration stream's first <c>pc.ram</c> section.
+    /// Decompresses only enough of a gzip file to find the early header (not the whole stream).
+    /// </summary>
+    public static bool TryProbePcRamBytes(string vmstatePath, bool gzip, out long ramBytes)
+    {
+        ramBytes = 0;
+        if (string.IsNullOrEmpty(vmstatePath) || !File.Exists(vmstatePath))
+            return false;
+
+        try
+        {
+            using (FileStream file = File.OpenRead(vmstatePath))
+            {
+                Stream input = file;
+                GZipStream gz = null;
+                try
+                {
+                    if (gzip)
+                    {
+                        gz = new GZipStream(file, CompressionMode.Decompress);
+                        input = gz;
+                    }
+
+                    // Cap how much we decompress: pc.ram is near the start (~tens of bytes).
+                    const int maxScan = 256 * 1024;
+                    var window = new byte[PcRamIdMarker.Length + 8];
+                    int windowLen = 0;
+                    var chunk = new byte[16 * 1024];
+                    int scanned = 0;
+                    while (scanned < maxScan)
+                    {
+                        int toRead = Math.Min(chunk.Length, maxScan - scanned);
+                        int n = input.Read(chunk, 0, toRead);
+                        if (n <= 0)
+                            break;
+                        scanned += n;
+
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (windowLen < window.Length)
+                            {
+                                window[windowLen++] = chunk[i];
+                            }
+                            else
+                            {
+                                Buffer.BlockCopy(window, 1, window, 0, window.Length - 1);
+                                window[window.Length - 1] = chunk[i];
+                            }
+
+                            if (windowLen < window.Length)
+                                continue;
+                            if (!StartsWithPcRamId(window))
+                                continue;
+
+                            // BE64 size immediately after the id marker.
+                            ramBytes =
+                                ((long)window[7] << 56) |
+                                ((long)window[8] << 48) |
+                                ((long)window[9] << 40) |
+                                ((long)window[10] << 32) |
+                                ((long)window[11] << 24) |
+                                ((long)window[12] << 16) |
+                                ((long)window[13] << 8) |
+                                window[14];
+                            // Sanity: at least 1 MiB, at most 64 GiB, page-aligned.
+                            if (ramBytes >= (1L << 20) &&
+                                ramBytes <= (64L << 30) &&
+                                (ramBytes & 0xFFF) == 0)
+                                return true;
+                            ramBytes = 0;
+                        }
+                    }
+                }
+                finally
+                {
+                    gz?.Dispose();
+                }
+            }
+        }
+        catch
+        {
+            ramBytes = 0;
+            return false;
+        }
+
+        return false;
+    }
+
+    static bool StartsWithPcRamId(byte[] window)
+    {
+        for (int i = 0; i < PcRamIdMarker.Length; i++)
+        {
+            if (window[i] != PcRamIdMarker[i])
+                return false;
+        }
+        return true;
+    }
 }
 }

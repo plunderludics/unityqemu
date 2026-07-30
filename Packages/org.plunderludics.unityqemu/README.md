@@ -5,8 +5,8 @@ Run QEMU guests inside Unity (VNC framebuffer, QMP control, GDB memory access).
 ## Layout
 
 - `Runtime/Qemu/` — VirtualMachine + VNC/QMP/GDB clients, input providers, RAM search tools
+- `Runtime/RemoteViewing/` — vendored VNC client (`UnityQemu.RemoteViewing` assembly)
 - `Editor/Qemu/` — editor shortcuts
-- `Plugins/RemoteViewing.dll` — VNC
 - `qemu~/` — QEMU Windows binaries (full upstream tree for now; can be trimmed later)
 
 ## Usage
@@ -15,8 +15,14 @@ Add a `VirtualMachine` component. Assign either:
 - a `DiskAsset` (`.qcow2`) for a cold boot, or
 - a `UqsnapAsset` (`snapshot`, `.uqsnap`) to resume saved machine state
   (`autoLoadVmState` on by default; `diskAsset` is filled from the snapshot's linked disk).
-Drop `.iso` files into the project (imported as `CdRomAsset`) and assign them under
-launch config CD-ROMs. Then press Play or enable edit-mode run.
+Drop `.iso` files into the project (imported as `CdRomAsset`) and `.img`/`.ima`
+floppy images (imported as `FloppyAsset`), then assign them under launch config.
+vvfat drives are attached from `PeripheralsUI` (not launch config).
+Then press Play or enable edit-mode run.
+
+Project Settings → **UnityQemu** sets the default **QEMU Directory** (e.g. `Assets/qemu`)
+used as the starting folder for media pickers. Snapshot save/load still uses the
+current snap/disk folder.
 
 ### Input
 
@@ -32,3 +38,31 @@ For custom input, subclass `InputProvider`, override `PollInput`, and use:
 
 Assign the component to `VirtualMachine.inputProvider`, or attach it to the same
 GameObject and leave the field empty for automatic discovery.
+
+## Player builds (Windows)
+
+`BuildProcessing` (same idea as UnityHawk) runs on player build:
+
+1. Scans build scenes for `DiskAsset` / `UqsnapAsset` / `CdRomAsset` / `FloppyAsset` (and nested
+   launch-config CDs), walks qcow2 backing chains, and copies those files into
+   `{exe}_Data/QemuAssets/` (Assets-relative layout; package samples under
+   `{exe}_Data/Packages/…`).
+2. If any were found, copies `qemu~`:
+   - **Default:** entire `qemu~` tree (~1.2 GB).
+   - **Trimmed:** add a `QemuBuildSettings` component and enable
+     `trimQemuToI386` to copy only `qemu-i386.manifest`
+     (~123 MB: `qemu-system-i386` + `qemu-img` + DLL closure + SeaBIOS PC
+     firmware / option-ROMs / keymaps). Regenerate the manifest with
+     `python Editor/Qemu/GenerateQemuI386Manifest.py` after updating QEMU.
+
+Runtime path roots (`Paths`):
+
+| | Editor | Player |
+|--|--------|--------|
+| QEMU binaries | `Packages/…/qemu~` | `{exe}_Data/org.plunderludics.unityqemu/qemu~` |
+| Disk / uqsnap / ISO / floppy | project files | `{exe}_Data/QemuAssets/…` |
+| Work overlays | `Library/UnityQemu/work` | `persistentDataPath/UnityQemu/work` |
+
+Guest images stay as real files on disk (not TextAssets) — QEMU needs filesystem
+paths, and disks are often multi‑GB.
+

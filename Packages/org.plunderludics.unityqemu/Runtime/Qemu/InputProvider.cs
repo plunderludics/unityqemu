@@ -63,7 +63,11 @@ public abstract class InputProvider : MonoBehaviour
         _hasMouseEvent = true;
     }
 
-    internal void ProcessInput(VirtualMachine machine)
+    /// <summary>
+    /// Poll this provider and send any queued key/mouse events to <paramref name="machine"/>.
+    /// Safe to call from a composite provider that fans out to several sources.
+    /// </summary>
+    public void ProcessInput(VirtualMachine machine)
     {
         if (!isActiveAndEnabled || machine.Texture == null)
             return;

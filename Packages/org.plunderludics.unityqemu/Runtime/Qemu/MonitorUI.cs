@@ -66,8 +66,11 @@ public class MonitorUI : MonoBehaviour
 
         try
         {
-            string result = await virtualMachine.RunHumanMonitorCommandAsync(commandLine.Trim());
-            lastOutput = string.IsNullOrWhiteSpace(result) ? "(ok, empty reply)" : result.TrimEnd();
+            string result = await virtualMachine.RunHumanMonitorCommandAsync(
+                commandLine.Trim(), expectTextOutput: true);
+            lastOutput = VirtualMachine.IsHmpSuccessReply(result)
+                ? "(ok)"
+                : result.TrimEnd();
             Debug.Log($"HMP `{commandLine.Trim()}`:\n{lastOutput}");
             return lastOutput;
         }

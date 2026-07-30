@@ -11,7 +11,6 @@ namespace UnityQemu {
 /// reference instead of a generic <see cref="UnityEngine.Object"/>.
 /// </summary>
 [Icon("Packages/org.plunderludics.unityqemu/Editor/Icons/CdRomAssetIcon.png")]
-[CreateAssetMenu(fileName = "CdRom", menuName = "UnityQemu/CD-ROM Asset", order = 12)]
 public class CdRomAsset : ScriptableObject
 {
     [Tooltip("Display name (defaults to asset name)")]
@@ -45,9 +44,7 @@ public class CdRomAsset : ScriptableObject
 #endif
         if (string.IsNullOrEmpty(rel))
             return null;
-        if (Path.IsPathRooted(rel))
-            return rel;
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "..", rel));
+        return Paths.ResolveProjectRelativeFile(rel);
     }
 
     public string DisplayLabel =>

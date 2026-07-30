@@ -156,17 +156,17 @@ public class LegacySnapshotUI : MonoBehaviour
 
     public async Task SaveVmAsync(string tag)
     {
-        await RunHmpAsync($"savevm {tag}");
+        await RunHmpOrThrowAsync($"savevm {tag}");
     }
 
     public async Task LoadVmAsync(string tag)
     {
-        await RunHmpAsync($"loadvm {tag}");
+        await RunHmpOrThrowAsync($"loadvm {tag}");
     }
 
     public async Task DeleteVmAsync(string tag)
     {
-        await RunHmpAsync($"delvm {tag}");
+        await RunHmpOrThrowAsync($"delvm {tag}");
     }
 
     async Task LoadEntryAsync(SnapshotEntry entry)
@@ -196,6 +196,13 @@ public class LegacySnapshotUI : MonoBehaviour
         if (virtualMachine == null)
             throw new InvalidOperationException("No VirtualMachine assigned");
         return await virtualMachine.RunHumanMonitorCommandAsync(command);
+    }
+
+    Task RunHmpOrThrowAsync(string command)
+    {
+        if (virtualMachine == null)
+            throw new InvalidOperationException("No VirtualMachine assigned");
+        return virtualMachine.RunHumanMonitorCommandOrThrowAsync(command);
     }
 
     static List<string> ParseSnapshotNames(string infoSnapshotsOutput)

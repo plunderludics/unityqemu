@@ -11,6 +11,9 @@
 b.sh
 UnityAgentBridge/
 
+#
+software-staging/
+
 # Ignore any artifacts
 /[Aa]rtifacts/
 

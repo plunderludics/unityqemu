@@ -27,8 +27,7 @@ public static class DiskOverlay
     {
         get
         {
-            string dir = Path.GetFullPath(
-                Path.Combine(Application.dataPath, "..", "Library", "UnityQemu", "work"));
+            string dir = Paths.WorkDirectory;
             Directory.CreateDirectory(dir);
             return dir;
         }
@@ -44,12 +43,7 @@ public static class DiskOverlay
         return Path.GetFullPath(path).StartsWith(workDir, StringComparison.OrdinalIgnoreCase);
     }
 
-    public static string GetQemuImgPath()
-    {
-        return Path.GetFullPath(Path.Combine(
-            Application.dataPath, "..",
-            "Packages", "org.plunderludics.unityqemu", "qemu~", "qemu-img.exe"));
-    }
+    public static string GetQemuImgPath() => Paths.QemuImgPath;
 
     /// <summary>
     /// Create a qcow2 overlay backed by <paramref name="baseQcow2Path"/>.
@@ -320,7 +314,7 @@ public static class DiskOverlay
             $"qcow2 header='{actualBackingPath ?? "<none>"}', expected='{expectedBackingPath}'. " +
             "Rewriting header with qemu-img rebase -u.");
 
-        RebaseOnto(overlayPath, expectedBackingPath, unsafeHeaderOnly: true);
+        RebaseHeaderOnto(overlayPath, expectedBackingPath);
         string repaired = GetBackingPath(overlayPath);
         if (!PathsEqual(repaired, expectedBackingPath))
             throw new InvalidOperationException(
@@ -329,37 +323,24 @@ public static class DiskOverlay
     }
 
     /// <summary>
-    /// Change <paramref name="overlayPath"/>'s backing file.
-    /// Full rebase compares clusters; <paramref name="unsafeHeaderOnly"/> only rewrites the path.
-    /// QEMU must not have the image open.
+    /// Header-only rewrite of <paramref name="overlayPath"/>'s backing path
+    /// (<c>qemu-img rebase -u</c>). QEMU must not have the image open.
     /// </summary>
-    public static void RebaseOnto(
-        string overlayPath, string newBackingPath, bool unsafeHeaderOnly = false)
+    public static void RebaseHeaderOnto(string overlayPath, string newBackingPath)
     {
         if (string.IsNullOrEmpty(overlayPath) || !File.Exists(overlayPath))
             throw new FileNotFoundException("Overlay qcow2 not found", overlayPath);
         if (string.IsNullOrEmpty(newBackingPath) || !File.Exists(newBackingPath))
             throw new FileNotFoundException("New backing qcow2 not found", newBackingPath);
 
-        // Refuse obvious self-backing (full rebase stack-overflows on Windows).
         if (PathsEqual(overlayPath, newBackingPath))
             throw new InvalidOperationException(
                 $"Cannot rebase '{overlayPath}' onto itself.");
 
         overlayPath = Path.GetFullPath(overlayPath);
         string backingArg = PreferBackingFileArgument(overlayPath, newBackingPath);
-
-        if (unsafeHeaderOnly)
-        {
-            RunQemuImg(
-                "rebase", "-u", "-f", "qcow2",
-                "-b", backingArg, "-F", "qcow2", overlayPath);
-            return;
-        }
-
         RunQemuImg(
-            600_000,
-            "rebase", "-f", "qcow2",
+            "rebase", "-u", "-f", "qcow2",
             "-b", backingArg, "-F", "qcow2", overlayPath);
     }
 
@@ -509,6 +490,7 @@ public static class DiskOverlay
         var psi = new ProcessStartInfo
         {
             FileName = qemuImg,
+            WorkingDirectory = Paths.QemuDir,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
