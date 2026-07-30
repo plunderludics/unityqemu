@@ -9,11 +9,24 @@ namespace UnityQemu.Tests {
 /// <summary>Shared helpers for minting tiny throwaway qcow2 images.</summary>
 static class TestDiskUtil
 {
+    /// <summary>
+    /// Prefer Library (no spaces) over Application.temporaryCachePath, which includes
+    /// the company name and breaks some QEMU backing-file opens on Windows.
+    /// </summary>
+    public static string TestFixtureDirectory
+    {
+        get
+        {
+            string dir = Path.GetFullPath(
+                Path.Combine(Application.dataPath, "..", "Library", "UnityQemu", "Tests"));
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+    }
+
     public static string CreateEmptyQcow2(string fileName, string size = "64M")
     {
-        string dir = Path.Combine(Application.temporaryCachePath, "UnityQemuTests");
-        Directory.CreateDirectory(dir);
-        string path = Path.Combine(dir, fileName);
+        string path = Path.Combine(TestFixtureDirectory, fileName);
         if (File.Exists(path))
             File.Delete(path);
 

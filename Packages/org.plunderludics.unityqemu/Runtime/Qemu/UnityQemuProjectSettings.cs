@@ -17,6 +17,12 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
              "(ISO, floppy, vvfat). Snapshot save/load still uses the snap/disk folder.")]
     string qemuDirectory = DefaultQemuDirectory;
 
+    [SerializeField]
+    [Tooltip(
+        "When on (default), player builds copy only qemu-i386.manifest (~120 MB). " +
+        "When off, copy the entire qemu~ tree (~1.2 GB).")]
+    bool trimQemuToI386 = true;
+
     /// <summary>Project-relative media root (e.g. <c>Assets/qemu</c>).</summary>
     public string QemuDirectory
     {
@@ -31,6 +37,20 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
             qemuDirectory = string.IsNullOrWhiteSpace(value)
                 ? DefaultQemuDirectory
                 : value.Replace('\\', '/').Trim().TrimEnd('/');
+            Save(true);
+        }
+    }
+
+    /// <summary>
+    /// When true, player builds package only <c>qemu-i386.manifest</c>; otherwise the full
+    /// <c>qemu~</c> tree.
+    /// </summary>
+    public bool TrimQemuToI386
+    {
+        get => trimQemuToI386;
+        set
+        {
+            trimQemuToI386 = value;
             Save(true);
         }
     }
@@ -55,8 +75,8 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
             guiHandler = _ =>
             {
                 var settings = instance;
-                EditorGUI.BeginChangeCheck();
 
+                EditorGUI.BeginChangeCheck();
                 DefaultAsset folder = AssetDatabase.LoadAssetAtPath<DefaultAsset>(
                     settings.QemuDirectory);
                 folder = (DefaultAsset)EditorGUILayout.ObjectField(
@@ -66,7 +86,6 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
                     folder,
                     typeof(DefaultAsset),
                     false);
-
                 if (EditorGUI.EndChangeCheck())
                 {
                     string path = folder != null ? AssetDatabase.GetAssetPath(folder) : "";
@@ -83,9 +102,22 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
                     }
                 }
 
+                EditorGUI.BeginChangeCheck();
+                bool trim = EditorGUILayout.Toggle(
+                    new GUIContent(
+                        "Trim QEMU To i386",
+                        "Player builds: copy only qemu-i386.manifest (~120 MB) instead of " +
+                        "the full qemu~ tree (~1.2 GB)."),
+                    settings.TrimQemuToI386);
+                if (EditorGUI.EndChangeCheck())
+                    settings.TrimQemuToI386 = trim;
+
                 EditorGUILayout.HelpBox(
-                    "Used as the starting folder for PeripheralsUI file/folder pickers. " +
-                    "Snapshot save/load keeps using the current snap or disk location.",
+                    "QEMU Directory is the starting folder for PeripheralsUI media pickers. " +
+                    "Snapshot save/load keeps using the current snap or disk location.\n\n" +
+                    "Trim QEMU To i386 packages qemu-system-i386 + qemu-img + DLL closure + " +
+                    "SeaBIOS (regenerate qemu-i386.manifest after updating QEMU). " +
+                    "Turn off only if you need other softmmu arches or the full share/ tree.",
                     MessageType.Info);
             },
         };

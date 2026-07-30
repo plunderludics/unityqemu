@@ -1,0 +1,12 @@
+fileFormatVersion: 2
+guid: e19d0787a7f243d1b9df6129be6b6bfa
+ScriptedImporter:
+  internalIDToNameTable: []
+  externalObjects: {}
+  serializedVersion: 2
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+  script: {fileID: 11500000, guid: ee7ec2b05ad8df94aa76fbe4f291c5e4, type: 3}
+  backingDisk: {instanceID: 0}
+  note: Smoke-test empty disk (no OS).

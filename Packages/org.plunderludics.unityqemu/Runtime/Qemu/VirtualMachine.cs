@@ -93,6 +93,13 @@ public class VirtualMachine : MonoBehaviour
     [FormerlySerializedAs("runInEditMode")]
     public bool runVmInEditMode = false;
 
+    /// <summary>
+    /// Last seen <see cref="runVmInEditMode"/> for detecting inspector toggles.
+    /// Explicit <see cref="StartGuestProcessAsync"/> in edit mode (snapshots, tests) must
+    /// not be killed by unrelated OnValidate traffic.
+    /// </summary>
+    bool _runVmInEditModeCached;
+
     [Header("Disk")]
     [Tooltip(
         "Durable snapshot (.uqsnap) to boot on Play / auto-start. " +
@@ -1010,6 +1017,7 @@ public class VirtualMachine : MonoBehaviour
     void OnEnable()
     {
 #if UNITY_EDITOR
+        _runVmInEditModeCached = runVmInEditMode;
         // Keep the tick subscription outside the undo guard: deleting a VM still runs
         // OnDisable with Undo.isProcessing, and skipping unsubscribe leaves a destroyed
         // instance hooked to EditorApplication.update.
@@ -1096,7 +1104,11 @@ public class VirtualMachine : MonoBehaviour
         if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             return;
 
-        if (!runVmInEditMode && !Application.isPlaying && IsRunning)
+        // Only stop when the user turns edit-mode run off — not on every OnValidate
+        // (disk/snapshot field writes, scene open, tests calling StartGuestProcessAsync).
+        bool editModeToggledOff = _runVmInEditModeCached && !runVmInEditMode;
+        _runVmInEditModeCached = runVmInEditMode;
+        if (editModeToggledOff && !Application.isPlaying && (IsRunning || _starting))
         {
             StopQemu();
             ReleaseClaimedPorts();
@@ -2528,10 +2540,6 @@ public class VirtualMachine : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// True if QEMU is still running, or exited for a non-bind reason.
-    /// False if stderr indicates a TCP address-in-use failure (caller should retry ports).
-    /// </summary>
     async Task<bool> QemuSurvivedPortBindAsync(StringBuilder earlyStderr)
     {
         for (int i = 0; i < 10; i++)

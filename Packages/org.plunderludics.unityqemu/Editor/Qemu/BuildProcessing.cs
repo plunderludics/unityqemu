@@ -40,7 +40,7 @@ public class BuildProcessing :
 
         FilesForScene.Clear();
         _lastProcessedScenePath = null;
-        _trimQemuToI386 = false;
+        _trimQemuToI386 = UnityQemuProjectSettings.instance.TrimQemuToI386;
     }
 
     public void OnProcessScene(Scene scene, BuildReport report)
@@ -50,18 +50,12 @@ public class BuildProcessing :
 
         CollectSceneFiles(scene);
         _lastProcessedScenePath = scene.path;
-
-        QemuBuildSettings settings = FindBuildSettings();
-        if (settings != null)
-            _trimQemuToI386 = settings.trimQemuToI386;
     }
 
     public void OnPostprocessBuild(BuildReport report)
     {
-        // Scene process may be skipped when Unity rebuilds without re-processing scenes.
-        QemuBuildSettings settings = FindBuildSettings();
-        if (settings != null)
-            _trimQemuToI386 = settings.trimQemuToI386;
+        // Re-read in case settings changed, or scene process was skipped on rebuild.
+        _trimQemuToI386 = UnityQemuProjectSettings.instance.TrimQemuToI386;
 
         string exePath = report.summary.outputPath;
         int nCopied = CopyFilesToBuild(exePath);
@@ -274,11 +268,11 @@ public class BuildProcessing :
             roots.Add(component);
         }
 
-        // Explicit extra assets from optional build settings.
-        QemuBuildSettings settings = FindBuildSettings();
-        if (settings != null && settings.extraAssets != null)
+        // Explicit extras from optional QemuExtraBuildAssets.
+        QemuExtraBuildAssets extras = FindExtraBuildAssets();
+        if (extras != null && extras.extraAssets != null)
         {
-            foreach (UnityEngine.Object extra in settings.extraAssets)
+            foreach (UnityEngine.Object extra in extras.extraAssets)
             {
                 if (extra != null)
                 {
@@ -303,16 +297,16 @@ public class BuildProcessing :
         return items;
     }
 
-    static QemuBuildSettings FindBuildSettings()
+    static QemuExtraBuildAssets FindExtraBuildAssets()
     {
-        var all = UnityEngine.Object.FindObjectsByType<QemuBuildSettings>(
+        var all = UnityEngine.Object.FindObjectsByType<QemuExtraBuildAssets>(
             FindObjectsInactive.Exclude, FindObjectsSortMode.None);
         if (all.Length == 0)
             return null;
         if (all.Length > 1)
         {
             Debug.LogWarning(
-                $"[UnityQemu] {all.Length} QemuBuildSettings in scene — using the first.");
+                $"[UnityQemu] {all.Length} QemuExtraBuildAssets in scene — using the first.");
         }
         return all[0];
     }

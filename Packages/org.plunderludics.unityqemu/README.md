@@ -7,7 +7,7 @@ Run QEMU guests inside Unity (VNC framebuffer, QMP control, GDB memory access).
 - `Runtime/Qemu/` — VirtualMachine + VNC/QMP/GDB clients, input providers, RAM search tools
 - `Runtime/RemoteViewing/` — vendored VNC client (`UnityQemu.RemoteViewing` assembly)
 - `Editor/Qemu/` — editor shortcuts
-- `qemu~/` — QEMU Windows binaries (full upstream tree for now; can be trimmed later)
+- `qemu~/` — QEMU Windows binaries (full tree in-package; player builds trim by default)
 
 ## Usage
 
@@ -21,8 +21,8 @@ vvfat drives are attached from `PeripheralsUI` (not launch config).
 Then press Play or enable edit-mode run.
 
 Project Settings → **UnityQemu** sets the default **QEMU Directory** (e.g. `Assets/qemu`)
-used as the starting folder for media pickers. Snapshot save/load still uses the
-current snap/disk folder.
+used as the starting folder for media pickers, and **Trim QEMU To i386** for player
+builds. Snapshot save/load still uses the current snap/disk folder.
 
 ### Input
 
@@ -47,13 +47,15 @@ GameObject and leave the field empty for automatic discovery.
    launch-config CDs), walks qcow2 backing chains, and copies those files into
    `{exe}_Data/QemuAssets/` (Assets-relative layout; package samples under
    `{exe}_Data/Packages/…`).
-2. If any were found, copies `qemu~`:
-   - **Default:** entire `qemu~` tree (~1.2 GB).
-   - **Trimmed:** add a `QemuBuildSettings` component and enable
-     `trimQemuToI386` to copy only `qemu-i386.manifest`
+2. If any were found, copies `qemu~` per Project Settings → **UnityQemu** →
+   **Trim QEMU To i386** (on by default):
+   - **Trimmed:** only `qemu-i386.manifest`
      (~123 MB: `qemu-system-i386` + `qemu-img` + DLL closure + SeaBIOS PC
      firmware / option-ROMs / keymaps). Regenerate the manifest with
      `python Editor/Qemu/GenerateQemuI386Manifest.py` after updating QEMU.
+   - **Full tree (~1.2 GB):** turn trim off.
+3. Optional: add a `QemuExtraBuildAssets` component to force guest assets into the
+   build even when nothing in the scene references them.
 
 Runtime path roots (`Paths`):
 
