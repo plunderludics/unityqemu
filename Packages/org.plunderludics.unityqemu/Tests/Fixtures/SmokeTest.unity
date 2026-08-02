@@ -163,7 +163,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 342ef9f6392686042b69667bd374eb45, type: 3}
   m_Name: 
   m_EditorClassIdentifier: UnityQemu::UnityQemu.VirtualMachine
-  showGui: 0
+  showGuiInEditor: 0
   autoRestart: 0
   playAudioInUnity: 0
   inputProvider: {fileID: 0}
@@ -185,6 +185,7 @@ MonoBehaviour:
   renderTextureSettings:
     autoResize: 1
     filterMode: 0
+  showGuiInBuild: 0
   useEphemeralWorkOverlay: 1
   overridePorts: 0
   vncPort: 5900

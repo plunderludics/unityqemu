@@ -21,13 +21,18 @@ namespace UnityQemu {
 [DeclareFoldoutGroup("Status", Expanded = false)]
 [DeclareHorizontalGroup("guest/restart")]
 [DeclareHorizontalGroup("guest/pause")]
-public class VirtualMachine : MonoBehaviour
+public partial class VirtualMachine : MonoBehaviour
 {
     Process _qemuProcess;
     VncClient _vncClient;
     QmpClient _qmpClient;
     GdbClient _gdbClient;
     bool _starting;
+    /// <summary>
+    /// Bumped by <see cref="AbortInFlightStart"/> so a hung/abandoned
+    /// <see cref="StartQemuAsync"/> stops mutating state after awaits.
+    /// </summary>
+    int _startEpoch;
     bool _autoRestartInFlight;
     float _lastAutoRestartRealtime = float.NegativeInfinity;
     const float AutoRestartCooldownSeconds = 2f;
@@ -69,8 +74,9 @@ public class VirtualMachine : MonoBehaviour
     /// <summary>Block device name of the <c>-hda</c> drive on the pc machine type.</summary>
     public const string HdaBlockDeviceName = "ide0-hd0";
 
-    [Tooltip("Also open QEMU's native SDL window (independent of snapshot launch config).")]
-    public bool showGui = false;
+    [Tooltip("Also open QEMU's native SDL window while running in the Unity editor.")]
+    [FormerlySerializedAs("showGui")]
+    public bool showGuiInEditor = false;
 
     [Tooltip(
         "When on, if the QEMU process exits unexpectedly (crash, Task Manager kill, OS " +
@@ -165,6 +171,12 @@ public class VirtualMachine : MonoBehaviour
 
     [Group("Advanced")]
     [Tooltip(
+        "Also open QEMU's native SDL window in player builds. Off by default — " +
+        "builds normally use the Unity VNC texture only.")]
+    [SerializeField] bool showGuiInBuild = false;
+
+    [Group("Advanced")]
+    [Tooltip(
         "Keep the assigned disk immutable by writing into a Library/ work overlay. " +
         "Leave on unless you intentionally want QEMU to write the Disk Asset file.")]
     public bool useEphemeralWorkOverlay = true;
@@ -212,6 +224,14 @@ public class VirtualMachine : MonoBehaviour
     [Group("Advanced")]
     [Tooltip("Log GDB attach/interrupt/packet chatter")]
     public bool verboseGdb = false;
+
+    [Group("Advanced")]
+    [Tooltip(
+        "OS priority for the qemu-system process after spawn. " +
+        "AboveNormal/High can help when Unity Play Mode is CPU-heavy (e.g. fluid sim). " +
+        "RealTime usually needs elevation and can starve the host — avoid unless experimenting.")]
+    [OnValueChanged(nameof(OnProcessPriorityChanged))]
+    [SerializeField] ProcessPriorityClass processPriority = ProcessPriorityClass.Normal;
 
     // --- Status (collapsed) ---------------------------------------------------
 
@@ -424,6 +444,37 @@ public class VirtualMachine : MonoBehaviour
         RefreshIdleOutputPreview();
 #endif
     }
+
+    void OnProcessPriorityChanged()
+    {
+        if (IsRunning)
+            ApplyProcessPriority(_qemuProcess);
+    }
+
+    void ApplyProcessPriority(Process process)
+    {
+        if (process == null)
+            return;
+        try
+        {
+            if (process.HasExited)
+                return;
+            process.PriorityClass = processPriority;
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"Failed to set QEMU process priority to {processPriority}: {e.Message}");
+        }
+    }
+
+    /// <summary>Whether to open QEMU's native SDL window for this environment.</summary>
+    bool ShowGui =>
+#if UNITY_EDITOR
+        showGuiInEditor;
+#else
+        showGuiInBuild;
+#endif
 
     /// <summary>Keep <see cref="diskAsset"/> mirrored from <see cref="snapshot"/> when set.</summary>
     void SyncDiskFromSnapshot()
@@ -964,6 +1015,8 @@ public class VirtualMachine : MonoBehaviour
                 return;
             }
 #endif
+            // StopQemu aborts any in-flight StartQemuAsync (epoch + _starting) so a
+            // hung start can't leave Restart as a silent no-op.
             await StopQemuAsync();
             await StartQemuAsync();
         }
@@ -1149,10 +1202,29 @@ public class VirtualMachine : MonoBehaviour
         _ = StartQemuAsync();
     }
 
+    /// <summary>
+    /// Invalidate a running <see cref="StartQemuAsync"/> and clear the gate so
+    /// Stop/Restart can start again. Stale starts check <see cref="_startEpoch"/>
+    /// after awaits and bail without touching the new session.
+    /// </summary>
+    void AbortInFlightStart()
+    {
+        _startEpoch++;
+        _starting = false;
+    }
+
+    bool StartAborted(int epoch) => this == null || _startEpoch != epoch;
+
     async Task StartQemuAsync()
     {
         if (_starting)
+        {
+            UnityEngine.Debug.LogWarning(
+                $"UnityQemu: StartQemu skipped on '{name}' — start already in progress.",
+                this);
             return;
+        }
+        int epoch = ++_startEpoch;
         _starting = true;
         LastStateRestoreError = null;
         try
@@ -1165,8 +1237,9 @@ public class VirtualMachine : MonoBehaviour
         // Ensure a previous instance isn't still holding VNC/QMP/GDB ports.
         if (_qemuProcess != null)
         {
-            await StopQemuAsync();
-            if (this == null)
+            // Don't abort our own epoch — this stop is part of the current start.
+            await StopQemuAsync(abortInFlightStart: false);
+            if (StartAborted(epoch))
                 return;
         }
 
@@ -1269,7 +1342,7 @@ public class VirtualMachine : MonoBehaviour
 
         EffectiveLaunchConfig?.AppendUsbEhciArgs(process.StartInfo.ArgumentList);
 
-        if (showGui)
+        if (ShowGui)
         {
             process.StartInfo.ArgumentList.Add("-display");
             process.StartInfo.ArgumentList.Add("sdl");
@@ -1346,10 +1419,14 @@ public class VirtualMachine : MonoBehaviour
 
         UnityEngine.Debug.Log($"{qemuExe} {string.Join(' ', process.StartInfo.ArgumentList)}");
 
+        if (StartAborted(epoch))
+            return;
+
         // Drop OS holds immediately before spawn so qemu-system can bind the same ports.
         HandOffPortsToQemu();
         process.Start();
         _qemuProcess = process;
+        ApplyProcessPriority(process);
 
         UnityEngine.Debug.Log(
             $"Started QEMU process (PID: {process.Id}) with VNC on port {_activeVncPort}" +
@@ -1374,7 +1451,7 @@ public class VirtualMachine : MonoBehaviour
         process.BeginErrorReadLine();
 
         bool survivedPortBind = await QemuSurvivedPortBindAsync(earlyStderr);
-        if (this == null)
+        if (StartAborted(epoch))
             return;
         if (survivedPortBind)
         {
@@ -1387,7 +1464,7 @@ public class VirtualMachine : MonoBehaviour
             "reclaiming ports and retrying.");
         AbortFailedQemuStart();
         await WaitForActivePortsFreeAsync(1000);
-        if (this == null)
+        if (StartAborted(epoch))
             return;
         ReleaseClaimedPorts();
         } // port-bind retry loop
@@ -1401,18 +1478,18 @@ public class VirtualMachine : MonoBehaviour
 
         // Wait a moment for QEMU to start and QMP socket to be ready
         await Task.Delay(1000);
-        if (this == null)
+        if (StartAborted(epoch))
             return;
 
         // Connect VNC client
         await ConnectVncAsync();
-        if (this == null)
+        if (StartAborted(epoch))
             return;
         
         if (enableQmp) {
             // Connect QMP client
             await ConnectQmpAsync();
-            if (this == null)
+            if (StartAborted(epoch))
                 return;
 
             string incomingStatePath = _pendingIncomingStatePath;
@@ -1433,7 +1510,7 @@ public class VirtualMachine : MonoBehaviour
 
                 // Stream the .uqsnap migration file into -incoming, quick-save, resume.
                 await FeedIncomingStateAsync(incomingStatePath, incomingGzip);
-                if (this == null)
+                if (StartAborted(epoch))
                     return;
                 if (!string.IsNullOrEmpty(LastStateRestoreError) && attempt == 0)
                 {
@@ -1453,11 +1530,14 @@ public class VirtualMachine : MonoBehaviour
             {
                 try { await RunQmpAsync("cont"); }
                 catch (Exception e) { UnityEngine.Debug.LogWarning($"QMP cont after GDB attach: {e.Message}"); }
-                if (this == null)
+                if (StartAborted(epoch))
                     return;
             }
         }
 
+#if UNITY_EDITOR
+        ClearVvfatSessionTracking();
+#endif
         try { OnReady?.Invoke(); }
         catch (Exception e) { UnityEngine.Debug.LogException(e); }
         break;
@@ -1465,7 +1545,7 @@ public class VirtualMachine : MonoBehaviour
         }
         catch (Exception e)
         {
-            if (this == null)
+            if (StartAborted(epoch))
                 return;
             UnityEngine.Debug.LogException(e);
             if (!IsRunning)
@@ -1473,7 +1553,10 @@ public class VirtualMachine : MonoBehaviour
         }
         finally
         {
-            _starting = false;
+            // Only the active start clears the gate — a superseded start must not
+            // clear _starting for a newer Restart/Start that already took over.
+            if (_startEpoch == epoch)
+                _starting = false;
         }
     }
 
@@ -2014,32 +2097,6 @@ public class VirtualMachine : MonoBehaviour
         return new CaptureStateResult(frozenLayer, capturedMachineState);
     }
 
-#if UNITY_EDITOR
-    /// <summary>
-    /// Durable tip save: freeze work layer, optionally migrate to <paramref name="uqsnapProjectPath"/>,
-    /// write thin <paramref name="qcow2ProjectPath"/>, import assets, update session tip.
-    /// Pass null/empty uqsnap for a disk-only tip.
-    /// </summary>
-    public Task<BootableAsset> SaveDurableSnapshotAsync(
-        string qcow2ProjectPath,
-        string uqsnapProjectPath,
-        DiskAsset immediateParent,
-        bool compressMachineState = true,
-        bool captureScreenshot = true,
-        Action<string> progress = null) =>
-        DurableSnapshot.SaveAsync(
-            this, qcow2ProjectPath, uqsnapProjectPath, immediateParent,
-            compressMachineState, captureScreenshot, progress);
-
-    /// <summary>Stop, prepare, and start into <paramref name="snap"/>.</summary>
-    public Task LoadDurableSnapshotAsync(UqsnapAsset snap) =>
-        DurableSnapshot.LoadAsync(this, snap);
-
-    /// <summary>Reload the in-session quick-save from the last durable capture.</summary>
-    public Task ReloadDurableStateAsync() =>
-        DurableSnapshot.ReloadSessionStateAsync(this);
-#endif
-
     static void TryDeleteFile(string path)
     {
         if (string.IsNullOrEmpty(path))
@@ -2375,16 +2432,19 @@ public class VirtualMachine : MonoBehaviour
         await _qmpClient.ExecuteCommandAsync(command);
     }
 
-    async Task StopQemuAsync()
+    async Task StopQemuAsync(bool abortInFlightStart = true)
     {
-        StopQemu();
+        StopQemu(abortInFlightStart);
         // Windows can take a beat to release listen sockets after Kill.
         await WaitForActivePortsFreeAsync(2000);
         ReleaseClaimedPorts();
     }
 
-    void StopQemu()
+    void StopQemu(bool abortInFlightStart = true)
     {
+        if (abortInFlightStart)
+            AbortInFlightStart();
+
         _vncClient?.Dispose();
         _vncClient = null;
         var audioPlayer = GetComponent<VncAudioPlayer>();
@@ -2428,6 +2488,9 @@ public class VirtualMachine : MonoBehaviour
         }
 #if UNITY_EDITOR
         RefreshIdleOutputPreview();
+#endif
+#if UNITY_EDITOR
+        ClearVvfatSessionTracking();
 #endif
         try { OnStopped?.Invoke(); }
         catch (Exception e) { UnityEngine.Debug.LogException(e); }

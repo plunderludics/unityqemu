@@ -131,11 +131,11 @@ static class EditorShortcuts
     [MenuItem("UnityQemu/Peripherals… %#&a")]
     static void OpenPeripherals()
     {
-        var targets = CollectRunningPeripheralTargets();
+        var targets = CollectRunningMachines();
         if (targets.Count == 0)
         {
             Debug.LogWarning(
-                "[QEMU] Peripherals: no running VirtualMachine with QMP and PeripheralsUI " +
+                "[QEMU] Peripherals: no running VirtualMachine with QMP " +
                 "(stopped guests are ignored).");
             return;
         }
@@ -144,29 +144,34 @@ static class EditorShortcuts
         if (dialog.Choice == PeripheralsDialog.Choice.Cancelled || dialog.Target == null)
             return;
 
-        PeripheralsUI ui = dialog.Target;
-        ui.alsoAddToLaunchConfig = dialog.AlsoAddToLaunchConfig;
-        EditorUtility.SetDirty(ui);
+        VirtualMachine vm = dialog.Target;
+        bool alsoAdd = dialog.AlsoAddToLaunchConfig;
+        PeripheralsUI peripheralsUi = vm.GetComponent<PeripheralsUI>();
+        if (peripheralsUi != null)
+        {
+            peripheralsUi.alsoAddToLaunchConfig = alsoAdd;
+            EditorUtility.SetDirty(peripheralsUi);
+        }
 
         switch (dialog.Choice)
         {
             case PeripheralsDialog.Choice.InsertCd:
-                ui.InsertIsoButton();
+                _ = PeripheralsUI.PromptInsertIsoAsync(vm, alsoAdd);
                 break;
             case PeripheralsDialog.Choice.EjectCd:
-                ui.EjectCdromButton();
+                _ = PeripheralsUI.PromptEjectCdromAsync(vm, alsoAdd);
                 break;
             case PeripheralsDialog.Choice.InsertFloppy:
-                ui.InsertFloppyButton();
+                _ = PeripheralsUI.PromptInsertFloppyAsync(vm, alsoAdd);
                 break;
             case PeripheralsDialog.Choice.EjectFloppy:
-                ui.EjectFloppyButton();
+                _ = PeripheralsUI.PromptEjectFloppyAsync(vm, alsoAdd);
                 break;
             case PeripheralsDialog.Choice.AttachVvfat:
-                ui.AttachVvfatDriveButton();
+                _ = PeripheralsUI.PromptAttachVvfatAsync(vm);
                 break;
             case PeripheralsDialog.Choice.DetachVvfat:
-                ui.DetachVvfatDriveButton();
+                _ = PeripheralsUI.PromptDetachVvfatAsync(vm);
                 break;
         }
     }
@@ -180,11 +185,11 @@ static class EditorShortcuts
 
     static async Task SaveSnapshotAsync()
     {
-        var saveTargets = CollectRunningSaveTargets();
+        var saveTargets = CollectRunningMachines();
         if (saveTargets.Count == 0)
         {
             Debug.LogWarning(
-                "[QEMU] Save Snapshot: no running VirtualMachine with QMP and SnapshotUI " +
+                "[QEMU] Save Snapshot: no running VirtualMachine with QMP " +
                 "(stopped guests are ignored).");
             return;
         }
@@ -193,9 +198,8 @@ static class EditorShortcuts
         try
         {
             // Freeze every saveable guest at shortcut time, not only the one picked later.
-            foreach (SnapshotUI targetUi in saveTargets)
+            foreach (VirtualMachine machine in saveTargets)
             {
-                VirtualMachine machine = targetUi.virtualMachine;
                 if (machine == null || !machine.QmpConnected)
                     continue;
 
@@ -210,25 +214,22 @@ static class EditorShortcuts
             if (dialog.Choice == SnapshotSaveDialog.Choice.Cancelled || dialog.Target == null)
                 return;
 
-            SnapshotUI ui = dialog.Target;
-            ui.includeMachineState = dialog.IncludeMachineState;
-            ui.captureScreenshot = dialog.CaptureScreenshot;
-            ui.compressMachineState = dialog.CompressMachineState;
-            EditorUtility.SetDirty(ui);
+            VirtualMachine vm = dialog.Target;
+            SyncSnapshotUiOptions(vm, dialog);
 
-            bool completed = false;
-            switch (dialog.Choice)
+            bool completed = dialog.Choice switch
             {
-                case SnapshotSaveDialog.Choice.SaveChild:
-                    completed = await ui.SaveChildSnapshotAsync();
-                    break;
-                case SnapshotSaveDialog.Choice.SaveSibling:
-                    completed = await ui.SaveSiblingSnapshotAsync();
-                    break;
-                case SnapshotSaveDialog.Choice.Overwrite:
-                    completed = await ui.OverwriteCurrentSnapshotAsync();
-                    break;
-            }
+                SnapshotSaveDialog.Choice.SaveChild => await SnapshotUI.SaveChildAsync(
+                    vm, dialog.IncludeMachineState, dialog.CompressMachineState,
+                    dialog.CaptureScreenshot),
+                SnapshotSaveDialog.Choice.SaveSibling => await SnapshotUI.SaveSiblingAsync(
+                    vm, dialog.IncludeMachineState, dialog.CompressMachineState,
+                    dialog.CaptureScreenshot),
+                SnapshotSaveDialog.Choice.Overwrite => await SnapshotUI.OverwriteAsync(
+                    vm, dialog.IncludeMachineState, dialog.CompressMachineState,
+                    dialog.CaptureScreenshot),
+                _ => false,
+            };
 
             if (!completed)
                 Debug.Log("[QEMU] Save Snapshot cancelled or failed — resuming paused guests.");
@@ -243,100 +244,27 @@ static class EditorShortcuts
         }
     }
 
-    /// <summary>
-    /// Running guests that have a SnapshotUI (QMP connected). Stopped VMs are skipped.
-    /// </summary>
-    static List<SnapshotUI> CollectRunningSaveTargets()
+    /// <summary>Running guests with QMP connected. Stopped VMs are skipped.</summary>
+    static List<VirtualMachine> CollectRunningMachines()
     {
-        var targets = new List<SnapshotUI>();
+        var targets = new List<VirtualMachine>();
         foreach (VirtualMachine machine in FindVirtualMachines())
         {
-            if (machine == null || !machine.QmpConnected)
-                continue;
-
-            SnapshotUI ui = FindSnapshotUI(machine);
-            if (ui == null)
-            {
-                Debug.LogWarning(
-                    $"[QEMU] Save Snapshot: '{machine.name}' is running but has no SnapshotUI — skipped.",
-                    machine);
-                continue;
-            }
-
-            targets.Add(ui);
+            if (machine != null && machine.QmpConnected)
+                targets.Add(machine);
         }
-
         return targets;
     }
 
-    /// <summary>
-    /// Running guests that have a PeripheralsUI (QMP connected). Stopped VMs are skipped.
-    /// </summary>
-    static List<PeripheralsUI> CollectRunningPeripheralTargets()
+    static void SyncSnapshotUiOptions(VirtualMachine vm, SnapshotSaveDialog.Result dialog)
     {
-        var targets = new List<PeripheralsUI>();
-        foreach (VirtualMachine machine in FindVirtualMachines())
-        {
-            if (machine == null || !machine.QmpConnected)
-                continue;
-
-            PeripheralsUI ui = FindPeripheralsUI(machine);
-            if (ui == null)
-            {
-                Debug.LogWarning(
-                    $"[QEMU] Peripherals: '{machine.name}' is running but has no PeripheralsUI — skipped.",
-                    machine);
-                continue;
-            }
-
-            targets.Add(ui);
-        }
-
-        return targets;
-    }
-
-    static SnapshotUI FindSnapshotUI(VirtualMachine machine) =>
-        FindBoundUi(
-            machine,
-            (SnapshotUI ui) => ui.virtualMachine,
-            (ui, vm) => ui.virtualMachine = vm);
-
-    static PeripheralsUI FindPeripheralsUI(VirtualMachine machine) =>
-        FindBoundUi(
-            machine,
-            (PeripheralsUI ui) => ui.virtualMachine,
-            (ui, vm) => ui.virtualMachine = vm);
-
-    static T FindBoundUi<T>(
-        VirtualMachine machine,
-        Func<T, VirtualMachine> getVm,
-        Action<T, VirtualMachine> setVm)
-        where T : Component
-    {
-        if (machine == null)
-            return null;
-
-        T onSameObject = machine.GetComponent<T>();
-        if (onSameObject != null)
-        {
-            if (getVm(onSameObject) == null)
-                setVm(onSameObject, machine);
-            return onSameObject;
-        }
-
-        foreach (T candidate in UnityEngine.Object.FindObjectsByType<T>(
-                     FindObjectsInactive.Exclude,
-                     FindObjectsSortMode.None))
-        {
-            if (candidate == null)
-                continue;
-            if (getVm(candidate) == null)
-                setVm(candidate, candidate.GetComponent<VirtualMachine>());
-            if (ReferenceEquals(getVm(candidate), machine))
-                return candidate;
-        }
-
-        return null;
+        SnapshotUI ui = vm != null ? vm.GetComponent<SnapshotUI>() : null;
+        if (ui == null)
+            return;
+        ui.includeMachineState = dialog.IncludeMachineState;
+        ui.captureScreenshot = dialog.CaptureScreenshot;
+        ui.compressMachineState = dialog.CompressMachineState;
+        EditorUtility.SetDirty(ui);
     }
 
     static async Task ResumePausedByShortcutAsync(List<VirtualMachine> wePaused)

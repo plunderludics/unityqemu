@@ -8,7 +8,7 @@ namespace UnityQemu.Editor {
 /// Modal picker for peripheral hotplug actions (CD / floppy / vvfat).
 /// Opened by Ctrl+Shift+Alt+A. When multiple VMs are running, pick one at the top
 /// (nothing selected until the user chooses). Actions run on the chosen
-/// <see cref="PeripheralsUI"/> after the dialog closes.
+/// <see cref="VirtualMachine"/> after the dialog closes.
 /// </summary>
 class PeripheralsDialog : EditorWindow
 {
@@ -25,7 +25,7 @@ class PeripheralsDialog : EditorWindow
 
     public readonly struct Result
     {
-        public Result(Choice choice, PeripheralsUI target, bool alsoAddToLaunchConfig)
+        public Result(Choice choice, VirtualMachine target, bool alsoAddToLaunchConfig)
         {
             Choice = choice;
             Target = target;
@@ -33,12 +33,12 @@ class PeripheralsDialog : EditorWindow
         }
 
         public Choice Choice { get; }
-        public PeripheralsUI Target { get; }
+        public VirtualMachine Target { get; }
         public bool AlsoAddToLaunchConfig { get; }
     }
 
     Choice _choice = Choice.Cancelled;
-    PeripheralsUI[] _targets = Array.Empty<PeripheralsUI>();
+    VirtualMachine[] _targets = Array.Empty<VirtualMachine>();
     string[] _vmLabels = Array.Empty<string>();
     int _selectedIndex = -1;
     bool _alsoAddToLaunchConfig = true;
@@ -47,7 +47,7 @@ class PeripheralsDialog : EditorWindow
     bool HasSelection =>
         _selectedIndex >= 0 && _selectedIndex < _targets.Length;
 
-    public static Result Prompt(PeripheralsUI[] targets)
+    public static Result Prompt(VirtualMachine[] targets)
     {
         if (targets == null || targets.Length == 0)
             return new Result(Choice.Cancelled, null, true);
@@ -55,7 +55,7 @@ class PeripheralsDialog : EditorWindow
         var window = CreateInstance<PeripheralsDialog>();
         window.titleContent = new GUIContent("Peripherals");
         window._targets = targets;
-        window._vmLabels = BuildVmLabels(targets);
+        window._vmLabels = QemuEditorDialogs.BuildDisambiguatedVmLabels(targets);
         // Single target: auto-select. Multiple: force an explicit choice.
         window._selectedIndex = targets.Length == 1 ? 0 : -1;
         if (window.HasSelection)
@@ -68,25 +68,19 @@ class PeripheralsDialog : EditorWindow
         QemuEditorDialogs.CenterOnMainWindow(window, 460, height);
         window.ShowModalUtility();
 
-        PeripheralsUI target = window._choice == Choice.Cancelled || !window.HasSelection
+        VirtualMachine target = window._choice == Choice.Cancelled || !window.HasSelection
             ? null
             : window._targets[window._selectedIndex];
         return new Result(window._choice, target, window._alsoAddToLaunchConfig);
     }
 
-    static string[] BuildVmLabels(PeripheralsUI[] targets)
+    void LoadOptionsFrom(VirtualMachine vm)
     {
-        var machines = new VirtualMachine[targets.Length];
-        for (int i = 0; i < targets.Length; i++)
-            machines[i] = targets[i] != null ? targets[i].virtualMachine : null;
-        return QemuEditorDialogs.BuildDisambiguatedVmLabels(machines);
-    }
-
-    void LoadOptionsFrom(PeripheralsUI ui)
-    {
-        if (ui == null)
+        if (vm == null)
             return;
-        _alsoAddToLaunchConfig = ui.alsoAddToLaunchConfig;
+        PeripheralsUI ui = vm.GetComponent<PeripheralsUI>();
+        if (ui != null)
+            _alsoAddToLaunchConfig = ui.alsoAddToLaunchConfig;
     }
 
     void OnGUI()

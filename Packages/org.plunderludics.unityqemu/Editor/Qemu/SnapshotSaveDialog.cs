@@ -24,7 +24,7 @@ class SnapshotSaveDialog : EditorWindow
     {
         public Result(
             Choice choice,
-            SnapshotUI target,
+            VirtualMachine target,
             bool includeMachineState,
             bool captureScreenshot,
             bool compressMachineState)
@@ -37,14 +37,14 @@ class SnapshotSaveDialog : EditorWindow
         }
 
         public Choice Choice { get; }
-        public SnapshotUI Target { get; }
+        public VirtualMachine Target { get; }
         public bool IncludeMachineState { get; }
         public bool CaptureScreenshot { get; }
         public bool CompressMachineState { get; }
     }
 
     Choice _choice = Choice.Cancelled;
-    SnapshotUI[] _targets = Array.Empty<SnapshotUI>();
+    VirtualMachine[] _targets = Array.Empty<VirtualMachine>();
     string[] _vmLabels = Array.Empty<string>();
     int _selectedIndex = -1;
     BootableAsset _current;
@@ -60,7 +60,7 @@ class SnapshotSaveDialog : EditorWindow
     bool HasSelection =>
         _selectedIndex >= 0 && _selectedIndex < _targets.Length;
 
-    public static Result Prompt(SnapshotUI[] targets)
+    public static Result Prompt(VirtualMachine[] targets)
     {
         if (targets == null || targets.Length == 0)
             return new Result(Choice.Cancelled, null, true, true, true);
@@ -68,7 +68,7 @@ class SnapshotSaveDialog : EditorWindow
         var window = CreateInstance<SnapshotSaveDialog>();
         window.titleContent = new GUIContent("Save Snapshot");
         window._targets = targets;
-        window._vmLabels = BuildVmLabels(targets);
+        window._vmLabels = QemuEditorDialogs.BuildDisambiguatedVmLabels(targets);
         // Single target: auto-select. Multiple: force an explicit choice.
         window._selectedIndex = targets.Length == 1 ? 0 : -1;
         if (window.HasSelection)
@@ -89,7 +89,7 @@ class SnapshotSaveDialog : EditorWindow
         window.maxSize = new Vector2(560, height + 40f);
         QemuEditorDialogs.CenterOnMainWindow(window, 440, height);
         window.ShowModalUtility();
-        SnapshotUI target = window._choice == Choice.Cancelled || !window.HasSelection
+        VirtualMachine target = window._choice == Choice.Cancelled || !window.HasSelection
             ? null
             : window._targets[window._selectedIndex];
         return new Result(
@@ -100,16 +100,11 @@ class SnapshotSaveDialog : EditorWindow
             window._compressMachineState);
     }
 
-    static string[] BuildVmLabels(SnapshotUI[] targets)
+    void LoadOptionsFrom(VirtualMachine vm)
     {
-        var machines = new VirtualMachine[targets.Length];
-        for (int i = 0; i < targets.Length; i++)
-            machines[i] = targets[i] != null ? targets[i].virtualMachine : null;
-        return QemuEditorDialogs.BuildDisambiguatedVmLabels(machines);
-    }
-
-    void LoadOptionsFrom(SnapshotUI ui)
-    {
+        if (vm == null)
+            return;
+        SnapshotUI ui = vm.GetComponent<SnapshotUI>();
         if (ui == null)
             return;
         _includeMachineState = ui.includeMachineState;
@@ -117,9 +112,9 @@ class SnapshotSaveDialog : EditorWindow
         _compressMachineState = ui.compressMachineState;
     }
 
-    void RefreshFromTarget(SnapshotUI ui)
+    void RefreshFromTarget(VirtualMachine vm)
     {
-        if (ui == null)
+        if (vm == null)
         {
             _current = null;
             _detail = "";
@@ -130,12 +125,12 @@ class SnapshotSaveDialog : EditorWindow
             return;
         }
 
-        _current = ui.sessionCurrent;
-        DiskAsset tip = ui.SessionDiskTip;
+        _current = vm.sessionCurrent;
+        DiskAsset tip = vm.SessionDiskTip;
         _frozen = tip != null && DiskAsset.HasChildDisks(tip);
-        _canChild = ui.CanSaveChildForShortcut;
-        _canSibling = ui.CanSaveSiblingForShortcut;
-        _canOverwrite = ui.CanOverwriteForShortcut;
+        _canChild = vm.CanSaveChildDurable;
+        _canSibling = vm.CanSaveSiblingDurable;
+        _canOverwrite = vm.CanOverwriteDurable;
 
         string detail = "";
         if (tip != null)

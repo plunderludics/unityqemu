@@ -165,7 +165,7 @@ sealed class SmokeSceneFixture : IDisposable
         vm.runVmInEditMode = false;
         vm.autoRestart = false;
         vm.playAudioInUnity = false;
-        vm.showGui = false;
+        vm.showGuiInEditor = false;
         vm.enableGdb = false;
 
         return Task.FromResult(new SmokeSceneFixture(prior, scene, vm));
