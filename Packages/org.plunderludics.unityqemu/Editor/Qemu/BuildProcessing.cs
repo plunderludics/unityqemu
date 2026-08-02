@@ -23,8 +23,10 @@ public class BuildProcessing :
     const string ManifestFileName = "qemu-i386.manifest";
 
     static readonly Dictionary<string, HashSet<CopyItem>> FilesForScene = new();
+    static readonly HashSet<DiskAsset> DisksForBuild = new();
     static string _lastProcessedScenePath;
     static bool _trimQemuToI386;
+    static bool _obfuscateGuestFileNames;
 
     public int callbackOrder => 0;
 
@@ -39,8 +41,9 @@ public class BuildProcessing :
             Directory.Delete(assetsDir, recursive: true);
 
         FilesForScene.Clear();
+        DisksForBuild.Clear();
         _lastProcessedScenePath = null;
-        _trimQemuToI386 = UnityQemuProjectSettings.instance.TrimQemuToI386;
+        ReadProjectBuildSettings();
     }
 
     public void OnProcessScene(Scene scene, BuildReport report)
@@ -55,11 +58,16 @@ public class BuildProcessing :
     public void OnPostprocessBuild(BuildReport report)
     {
         // Re-read in case settings changed, or scene process was skipped on rebuild.
-        _trimQemuToI386 = UnityQemuProjectSettings.instance.TrimQemuToI386;
+        ReadProjectBuildSettings();
 
         string exePath = report.summary.outputPath;
         int nCopied = CopyFilesToBuild(exePath);
-        Debug.Log($"[UnityQemu] Copied {nCopied} guest image file(s) into build.");
+        Debug.Log(
+            $"[UnityQemu] Copied {nCopied} guest image file(s) into build" +
+            (_obfuscateGuestFileNames ? " (obfuscated names)." : "."));
+
+        if (_obfuscateGuestFileNames && nCopied > 0)
+            RebaseObfuscatedDiskChains(GetQemuAssetsDirInBuild(exePath));
 
         if (nCopied == 0)
         {
@@ -82,6 +90,13 @@ public class BuildProcessing :
             CopyTrimmedQemu(sourceQemu, targetQemu);
         else
             CopyFullQemu(sourceQemu, targetQemu);
+    }
+
+    static void ReadProjectBuildSettings()
+    {
+        var settings = UnityQemuProjectSettings.instance;
+        _trimQemuToI386 = settings.TrimQemuToI386;
+        _obfuscateGuestFileNames = settings.ObfuscateGuestFileNames;
     }
 
     static void CopyFullQemu(string sourceQemu, string targetQemu)
@@ -165,8 +180,11 @@ public class BuildProcessing :
 
     void CollectSceneFiles(Scene scene)
     {
-        var items = new HashSet<CopyItem>(CollectCopyItemsFromOpenScene());
+        var disks = new HashSet<DiskAsset>();
+        var items = new HashSet<CopyItem>(CollectCopyItemsFromOpenScene(disks));
         FilesForScene[scene.path] = items;
+        foreach (DiskAsset disk in disks)
+            DisksForBuild.Add(disk);
         Debug.Log($"[UnityQemu] Collected {items.Count} file(s) for scene '{scene.path}'.");
     }
 
@@ -248,10 +266,46 @@ public class BuildProcessing :
     }
 
     /// <summary>
+    /// After obfuscated copy, rewrite qcow2 backing headers to the hashed sibling names.
+    /// </summary>
+    static void RebaseObfuscatedDiskChains(string assetsRoot)
+    {
+        int rebased = 0;
+        foreach (DiskAsset disk in DisksForBuild)
+        {
+            if (disk == null || disk.backingDisk == null)
+                continue;
+
+            string overlayRel = EffectiveDiskProjectPath(disk);
+            string backingRel = EffectiveDiskProjectPath(disk.backingDisk);
+            if (string.IsNullOrEmpty(overlayRel) || string.IsNullOrEmpty(backingRel))
+                continue;
+
+            string overlayAbs = Path.Combine(
+                assetsRoot, Paths.ToObfuscatedBuildFileName(overlayRel));
+            string backingAbs = Path.Combine(
+                assetsRoot, Paths.ToObfuscatedBuildFileName(backingRel));
+            if (!File.Exists(overlayAbs) || !File.Exists(backingAbs))
+                continue;
+
+            DiskOverlay.RebaseHeaderOnto(overlayAbs, backingAbs);
+            rebased++;
+        }
+
+        if (rebased > 0)
+            Debug.Log($"[UnityQemu] Rebased {rebased} obfuscated qcow2 backing header(s).");
+    }
+
+    /// <summary>
     /// Collect serialized open-scene dependencies for DiskAsset / UqsnapAsset /
     /// CdRomAsset / FloppyAsset and expand qcow2 chains.
     /// </summary>
-    public static IEnumerable<CopyItem> CollectCopyItemsFromOpenScene(bool includeInactive = true)
+    public static IEnumerable<CopyItem> CollectCopyItemsFromOpenScene(bool includeInactive = true) =>
+        CollectCopyItemsFromOpenScene(disksOut: null, includeInactive);
+
+    public static IEnumerable<CopyItem> CollectCopyItemsFromOpenScene(
+        HashSet<DiskAsset> disksOut,
+        bool includeInactive = true)
     {
         var refs = new HashSet<UnityEngine.Object>();
         var components = UnityEngine.Object.FindObjectsByType<Component>(
@@ -293,7 +347,7 @@ public class BuildProcessing :
 
         var items = new HashSet<CopyItem>();
         foreach (UnityEngine.Object obj in refs)
-            ExpandReference(obj, items);
+            ExpandReference(obj, items, disksOut);
         return items;
     }
 
@@ -311,29 +365,88 @@ public class BuildProcessing :
         return all[0];
     }
 
-    static void ExpandReference(UnityEngine.Object obj, HashSet<CopyItem> items)
+    static void ExpandReference(
+        UnityEngine.Object obj,
+        HashSet<CopyItem> items,
+        HashSet<DiskAsset> disksOut)
     {
         switch (obj)
         {
             case UqsnapAsset snap:
-                TryAddProjectFile(snap.projectRelativeUqsnapPath, items);
+                TryAddProjectFile(EffectiveUqsnapProjectPath(snap), items);
                 if (snap.disk != null)
-                    ExpandReference(snap.disk, items);
+                    ExpandReference(snap.disk, items, disksOut);
                 break;
 
             case DiskAsset disk:
                 foreach (DiskAsset link in disk.GetChainFromRoot())
-                    TryAddProjectFile(link.projectRelativeQcow2Path, items);
+                {
+                    disksOut?.Add(link);
+                    TryAddProjectFile(EffectiveDiskProjectPath(link), items);
+                }
                 break;
 
             case CdRomAsset cd:
-                TryAddProjectFile(cd.projectRelativeIsoPath, items);
+                TryAddProjectFile(EffectiveCdRomProjectPath(cd), items);
                 break;
 
             case FloppyAsset floppy:
-                TryAddProjectFile(floppy.projectRelativeImgPath, items);
+                TryAddProjectFile(EffectiveFloppyProjectPath(floppy), items);
                 break;
         }
+    }
+
+    static string EffectiveDiskProjectPath(DiskAsset disk)
+    {
+        if (disk == null)
+            return null;
+        if (!string.IsNullOrEmpty(disk.projectRelativeQcow2Path))
+            return Paths.NormalizeProjectRelativePath(disk.projectRelativeQcow2Path);
+        string assetPath = AssetDatabase.GetAssetPath(disk);
+        return DiskAsset.IsQemuImageAssetPath(assetPath)
+            ? Paths.NormalizeProjectRelativePath(assetPath)
+            : null;
+    }
+
+    static string EffectiveUqsnapProjectPath(UqsnapAsset snap)
+    {
+        if (snap == null)
+            return null;
+        if (!string.IsNullOrEmpty(snap.projectRelativeUqsnapPath))
+            return Paths.NormalizeProjectRelativePath(snap.projectRelativeUqsnapPath);
+        string assetPath = AssetDatabase.GetAssetPath(snap);
+        return !string.IsNullOrEmpty(assetPath) &&
+               assetPath.EndsWith(".uqsnap", StringComparison.OrdinalIgnoreCase)
+            ? Paths.NormalizeProjectRelativePath(assetPath)
+            : null;
+    }
+
+    static string EffectiveCdRomProjectPath(CdRomAsset cd)
+    {
+        if (cd == null)
+            return null;
+        if (!string.IsNullOrEmpty(cd.projectRelativeIsoPath))
+            return Paths.NormalizeProjectRelativePath(cd.projectRelativeIsoPath);
+        string assetPath = AssetDatabase.GetAssetPath(cd);
+        return !string.IsNullOrEmpty(assetPath) &&
+               assetPath.EndsWith(".iso", StringComparison.OrdinalIgnoreCase)
+            ? Paths.NormalizeProjectRelativePath(assetPath)
+            : null;
+    }
+
+    static string EffectiveFloppyProjectPath(FloppyAsset floppy)
+    {
+        if (floppy == null)
+            return null;
+        if (!string.IsNullOrEmpty(floppy.projectRelativeImgPath))
+            return Paths.NormalizeProjectRelativePath(floppy.projectRelativeImgPath);
+        string assetPath = AssetDatabase.GetAssetPath(floppy);
+        if (string.IsNullOrEmpty(assetPath))
+            return null;
+        if (assetPath.EndsWith(".img", StringComparison.OrdinalIgnoreCase) ||
+            assetPath.EndsWith(".ima", StringComparison.OrdinalIgnoreCase))
+            return Paths.NormalizeProjectRelativePath(assetPath);
+        return null;
     }
 
     static void TryAddProjectFile(string projectRelativePath, HashSet<CopyItem> items)
@@ -342,7 +455,9 @@ public class BuildProcessing :
             return;
 
         string abs = Paths.ResolveProjectRelativeFile(projectRelativePath);
-        string loc = Paths.ToBuildRelativeLocation(projectRelativePath);
+        string loc = _obfuscateGuestFileNames
+            ? Paths.ToObfuscatedBuildFileName(projectRelativePath)
+            : Paths.ToBuildRelativeLocation(projectRelativePath);
         if (string.IsNullOrEmpty(abs) || string.IsNullOrEmpty(loc))
             return;
 

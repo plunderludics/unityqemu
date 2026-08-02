@@ -30,6 +30,17 @@ public class PathsTests
     }
 
     [Test]
+    public void ToObfuscatedBuildFileName_IsStableSha256Hex()
+    {
+        const string path = "Assets/qemu/disk/win95/win95.qcow2";
+        string a = Paths.ToObfuscatedBuildFileName(path);
+        string b = Paths.ToObfuscatedBuildFileName(path.Replace('/', '\\'));
+        Assert.AreEqual(64, a.Length);
+        Assert.AreEqual(a, b);
+        Assert.AreEqual(a, Paths.ToObfuscatedBuildFileName("  " + path + "  "));
+    }
+
+    [Test]
     public void BundledQemuBinaries_Exist()
     {
         Assert.IsTrue(Directory.Exists(Paths.QemuDir), $"Missing QEMU dir: {Paths.QemuDir}");

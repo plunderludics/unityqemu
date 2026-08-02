@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using UnityEngine;
 
 namespace UnityQemu {
@@ -66,6 +68,36 @@ public static class Paths
     }
 
     /// <summary>
+    /// Normalize a project-relative path for hashing / comparisons (forward slashes, trimmed).
+    /// </summary>
+    public static string NormalizeProjectRelativePath(string projectRelativePath)
+    {
+        if (string.IsNullOrEmpty(projectRelativePath))
+            return null;
+        return projectRelativePath.Replace('\\', '/').Trim();
+    }
+
+    /// <summary>
+    /// Opaque build filename derived from the project-relative path (SHA-256 hex).
+    /// Used when Project Settings → UnityQemu → Obfuscate Guest File Names is on.
+    /// </summary>
+    public static string ToObfuscatedBuildFileName(string projectRelativePath)
+    {
+        string norm = NormalizeProjectRelativePath(projectRelativePath);
+        if (string.IsNullOrEmpty(norm))
+            return null;
+
+        using (var sha = SHA256.Create())
+        {
+            byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(norm));
+            var sb = new StringBuilder(hash.Length * 2);
+            for (int i = 0; i < hash.Length; i++)
+                sb.Append(hash[i].ToString("x2"));
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
     /// Convert a project-relative path (<c>Assets/…</c> or <c>Packages/…</c>) to the
     /// location used under <see cref="QemuAssetsDirName"/> in a player build
     /// (same convention as UnityHawk: Assets-relative, with <c>../Packages/…</c> for package files).
@@ -75,7 +107,7 @@ public static class Paths
         if (string.IsNullOrEmpty(projectRelativePath))
             return null;
 
-        string p = projectRelativePath.Replace('\\', '/');
+        string p = NormalizeProjectRelativePath(projectRelativePath);
         if (p.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
             return p.Substring("Assets/".Length);
         if (p.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase))
@@ -85,7 +117,8 @@ public static class Paths
 
     /// <summary>
     /// Resolve a project-relative guest-image path to an absolute filesystem path.
-    /// Editor: under the project root. Player: under <see cref="QemuAssetsDirForBuild"/>.
+    /// Editor: under the project root. Player: under <see cref="QemuAssetsDirForBuild"/>
+    /// (plain layout, or SHA-256 filename when the build obfuscated names).
     /// </summary>
     public static string ResolveProjectRelativeFile(string projectRelativePath)
     {
@@ -99,9 +132,22 @@ public static class Paths
             Path.Combine(Application.dataPath, "..", projectRelativePath));
 #else
         string loc = ToBuildRelativeLocation(projectRelativePath);
-        if (string.IsNullOrEmpty(loc))
-            return null;
-        return Path.GetFullPath(Path.Combine(QemuAssetsDirForBuild, loc));
+        string plain = string.IsNullOrEmpty(loc)
+            ? null
+            : Path.GetFullPath(Path.Combine(QemuAssetsDirForBuild, loc));
+        if (!string.IsNullOrEmpty(plain) && File.Exists(plain))
+            return plain;
+
+        string hashedName = ToObfuscatedBuildFileName(projectRelativePath);
+        if (!string.IsNullOrEmpty(hashedName))
+        {
+            string hashed = Path.GetFullPath(Path.Combine(QemuAssetsDirForBuild, hashedName));
+            if (File.Exists(hashed))
+                return hashed;
+        }
+
+        // Prefer the plain layout path for missing-file errors on non-obfuscated builds.
+        return plain;
 #endif
     }
 }

@@ -103,6 +103,14 @@ public class DiskAsset : BootableAsset
             names[i] = children[i].DisplayLabel;
         return names;
     }
+#else
+    /// <summary>Player builds have no AssetDatabase child index.</summary>
+    public static bool HasChildDisks(DiskAsset parent) => false;
+
+    public static List<DiskAsset> GetChildDisks(DiskAsset parent) => new List<DiskAsset>();
+
+    public static string[] GetChildDiskNames(DiskAsset parent) => Array.Empty<string>();
+#endif
 
     public List<DiskAsset> GetChainFromRoot()
     {
@@ -123,6 +131,7 @@ public class DiskAsset : BootableAsset
         return chain.Count > 0 ? chain[0] : this;
     }
 
+#if UNITY_EDITOR
     public static DiskAsset FindByFilesystemPath(string filesystemPath)
     {
         if (string.IsNullOrEmpty(filesystemPath))

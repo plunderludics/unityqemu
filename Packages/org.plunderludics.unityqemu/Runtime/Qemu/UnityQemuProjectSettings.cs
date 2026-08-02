@@ -23,6 +23,12 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
         "When off, copy the entire qemu~ tree (~1.2 GB).")]
     bool trimQemuToI386 = true;
 
+    [SerializeField]
+    [Tooltip(
+        "When on, player builds store guest images under QemuAssets as SHA-256(path) filenames " +
+        "(qcow2 backing headers are rebased). Off by default.")]
+    bool obfuscateGuestFileNames = false;
+
     /// <summary>Project-relative media root (e.g. <c>Assets/qemu</c>).</summary>
     public string QemuDirectory
     {
@@ -51,6 +57,20 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
         set
         {
             trimQemuToI386 = value;
+            Save(true);
+        }
+    }
+
+    /// <summary>
+    /// When true, guest images in the player build use opaque SHA-256 filenames derived from
+    /// their project-relative paths.
+    /// </summary>
+    public bool ObfuscateGuestFileNames
+    {
+        get => obfuscateGuestFileNames;
+        set
+        {
+            obfuscateGuestFileNames = value;
             Save(true);
         }
     }
@@ -112,12 +132,24 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
                 if (EditorGUI.EndChangeCheck())
                     settings.TrimQemuToI386 = trim;
 
+                EditorGUI.BeginChangeCheck();
+                bool obfuscate = EditorGUILayout.Toggle(
+                    new GUIContent(
+                        "Obfuscate Guest File Names",
+                        "Player builds: store disks/ISOs/etc. as SHA-256(project path) under " +
+                        "QemuAssets (rebase qcow2 backing headers). Off by default."),
+                    settings.ObfuscateGuestFileNames);
+                if (EditorGUI.EndChangeCheck())
+                    settings.ObfuscateGuestFileNames = obfuscate;
+
                 EditorGUILayout.HelpBox(
                     "QEMU Directory is the starting folder for PeripheralsUI media pickers. " +
                     "Snapshot save/load keeps using the current snap or disk location.\n\n" +
                     "Trim QEMU To i386 packages qemu-system-i386 + qemu-img + DLL closure + " +
                     "SeaBIOS (regenerate qemu-i386.manifest after updating QEMU). " +
-                    "Turn off only if you need other softmmu arches or the full share/ tree.",
+                    "Turn off only if you need other softmmu arches or the full share/ tree.\n\n" +
+                    "Obfuscate Guest File Names hides original filenames in the build folder; " +
+                    "content is unchanged (not encryption).",
                     MessageType.Info);
             },
         };

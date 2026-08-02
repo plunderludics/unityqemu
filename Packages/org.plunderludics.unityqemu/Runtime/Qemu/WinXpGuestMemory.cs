@@ -5,14 +5,17 @@ using UnityEngine;
 
 namespace UnityQemu {
 /// <summary>
-/// Win32 x86 kernel struct helpers (Windows XP SP2/SP3-ish offsets).
+/// Windows XP x86 kernel struct helpers (SP2/SP3-ish EPROCESS offsets).
+/// Not valid for other Windows versions without different offsets.
 /// Reads via guest <b>physical</b> memory.
 /// </summary>
-public static class Win32X86GuestMemory
+public static class WinXpGuestMemory
 {
     public struct EprocessOffsets
     {
         public int DirectoryTableBase; // KPROCESS
+        /// <summary>LARGE_INTEGER; non-zero once the process has exited (XP SP3).</summary>
+        public int ExitTime;
         public int UniqueProcessId;
         public int ActiveProcessLinks;
         public int ImageFileName;
@@ -25,12 +28,23 @@ public static class Win32X86GuestMemory
     public static EprocessOffsets XpSp3Defaults => new EprocessOffsets
     {
         DirectoryTableBase = 0x18,
+        ExitTime = 0x78,
         UniqueProcessId = 0x84,
         ActiveProcessLinks = 0x88,
         ImageFileName = 0x174,
         VadRoot = 0x11C,
         SectionBaseAddress = 0x138,
     };
+
+    /// <summary>Result of probing a previously known EPROCESS physical address.</summary>
+    public enum ProcessProbeResult
+    {
+        Alive,
+        /// <summary>PID/name still match but <c>ExitTime</c> is set.</summary>
+        Exited,
+        /// <summary>Pool reused or object gone (PID/name mismatch or unreadable).</summary>
+        Gone,
+    }
 
     /// <summary>MMVAD node layout when EPROCESS.VadRoot is an MM_AVL_TABLE (XP SP3).</summary>
     const int MmvadLeft = 0x00;
@@ -188,6 +202,96 @@ public static class Win32X86GuestMemory
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Cheap liveness check for a cached EPROCESS (a few physical reads).
+    /// Does not walk the process list.
+    /// </summary>
+    public static ProcessProbeResult ProbeProcess(
+        Func<long, int, byte[]> readPhys,
+        long eprocessPhysical,
+        uint expectedPid,
+        string expectedName,
+        EprocessOffsets off)
+    {
+        if (eprocessPhysical == 0 || expectedPid == 0)
+            return ProcessProbeResult.Gone;
+
+        try
+        {
+            if (!TryReadProcess(readPhys, eprocessPhysical, off, out GuestProcess proc))
+                return ProcessProbeResult.Gone;
+            if (proc.Pid != expectedPid || !ProcessNamesMatch(expectedName, proc.Name))
+                return ProcessProbeResult.Gone;
+
+            int exitOff = off.ExitTime != 0 ? off.ExitTime : XpSp3Defaults.ExitTime;
+            ulong exitTime = ReadUInt64(readPhys, eprocessPhysical + exitOff);
+            return exitTime != 0 ? ProcessProbeResult.Exited : ProcessProbeResult.Alive;
+        }
+        catch
+        {
+            return ProcessProbeResult.Gone;
+        }
+    }
+
+    /// <summary>Walk from System and return the first process whose name matches.</summary>
+    public static bool TryFindProcessByName(
+        Func<long, int, byte[]> readPhys,
+        long systemEprocessPhysical,
+        string processName,
+        EprocessOffsets off,
+        out GuestProcess proc,
+        int maxProcesses = 512)
+    {
+        proc = default;
+        if (systemEprocessPhysical == 0 || string.IsNullOrEmpty(processName))
+            return false;
+
+        var list = WalkProcessList(readPhys, systemEprocessPhysical, off, maxProcesses);
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (!ProcessNamesMatch(processName, list[i].Name))
+                continue;
+            proc = list[i];
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Case-insensitive match; optional <c>.exe</c>/<c>.dll</c> suffix on either side.</summary>
+    public static bool ProcessNamesMatch(string requested, string actual)
+    {
+        if (string.IsNullOrEmpty(requested) || string.IsNullOrEmpty(actual))
+            return false;
+        if (requested.Equals(actual, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        string req = StripExeExtension(requested);
+        string act = StripExeExtension(actual);
+        return req.Equals(act, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string StripExeExtension(string name)
+    {
+        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            return name.Substring(0, name.Length - 4);
+        return name;
+    }
+
+    /// <summary>Fill any zero offset fields from <see cref="XpSp3Defaults"/>.</summary>
+    public static EprocessOffsets WithDefaults(EprocessOffsets off)
+    {
+        var d = XpSp3Defaults;
+        if (off.DirectoryTableBase == 0) off.DirectoryTableBase = d.DirectoryTableBase;
+        if (off.ExitTime == 0) off.ExitTime = d.ExitTime;
+        if (off.UniqueProcessId == 0) off.UniqueProcessId = d.UniqueProcessId;
+        if (off.ActiveProcessLinks == 0) off.ActiveProcessLinks = d.ActiveProcessLinks;
+        if (off.ImageFileName == 0) off.ImageFileName = d.ImageFileName;
+        if (off.VadRoot == 0) off.VadRoot = d.VadRoot;
+        if (off.SectionBaseAddress == 0) off.SectionBaseAddress = d.SectionBaseAddress;
+        return off;
     }
 
     /// <summary>
@@ -430,6 +534,14 @@ public static class Win32X86GuestMemory
     {
         byte[] b = readPhys(address, 4);
         return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+    }
+
+    static ulong ReadUInt64(Func<long, int, byte[]> readPhys, long address)
+    {
+        byte[] b = readPhys(address, 8);
+        uint lo = (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+        uint hi = (uint)(b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24));
+        return lo | ((ulong)hi << 32);
     }
 
     static string ReadFixedString(byte[] bytes, int maxLen)

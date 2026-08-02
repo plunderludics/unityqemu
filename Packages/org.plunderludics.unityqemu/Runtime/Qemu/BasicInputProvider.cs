@@ -10,7 +10,7 @@ public class BasicInputProvider : InputProvider
     public bool passKeyboardInput = true;
     public bool passMouseInput = true;
 
-    protected override void PollInput()
+    protected override void PollInput(QemuInputFrame frame)
     {
         if (Machine == null || Machine.Texture == null)
             return;

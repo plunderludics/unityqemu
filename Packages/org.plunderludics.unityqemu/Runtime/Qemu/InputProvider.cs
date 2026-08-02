@@ -1,36 +1,44 @@
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace UnityQemu {
-
 /// <summary>
 /// Base class for supplying keyboard and pointer input to a <see cref="VirtualMachine"/>.
-/// Subclasses implement <see cref="PollInput"/> and enqueue events with the public input API.
+/// Subclasses implement <see cref="PollInput"/> and enqueue with
+/// <see cref="AddKeyEvent"/> / <see cref="SetMouseState"/> (or write <paramref name="frame"/> directly).
 /// </summary>
 public abstract class InputProvider : MonoBehaviour
 {
-    readonly List<KeyInputEvent> _keyEvents = new();
-    MouseInputEvent _mouseEvent;
-    bool _hasMouseEvent;
+    readonly QemuInputFrame _processFrame = new QemuInputFrame();
+    QemuInputFrame _currentFrame;
+
+    int _lastMouseX;
+    int _lastMouseY;
+    bool _hasLastMousePos;
 
     protected VirtualMachine Machine { get; private set; }
 
     /// <summary>
-    /// Called once per frame before queued input is sent.
-    /// Override this to poll a custom input source and call AddKeyEvent or SetMouseState.
+    /// Fill <paramref name="frame"/> for this provider. Prefer
+    /// <see cref="AddKeyEvent"/> / <see cref="SetMouseState"/>, which write to this frame.
     /// </summary>
-    protected abstract void PollInput();
+    protected abstract void PollInput(QemuInputFrame frame);
 
-    /// <summary>Queue a Unity key press or release for the next input update.</summary>
+    /// <summary>
+    /// Optional post-collect transform (e.g. key remapping in a downstream package).
+    /// Default is identity.
+    /// </summary>
+    protected virtual void TransformFrame(QemuInputFrame frame) { }
+
+    /// <summary>Queue a Unity key press or release for the current collect.</summary>
     public void AddKeyEvent(KeyCode key, bool down)
     {
-        _keyEvents.Add(new KeyInputEvent(key, down));
+        EnsureCurrentFrame().AddKey(key, down);
     }
 
-    /// <summary>Queue a raw VNC/X11 keysym press or release for the next input update.</summary>
+    /// <summary>Queue a raw VNC/X11 keysym press or release for the current collect.</summary>
     public void AddKeyEvent(int keysym, bool down)
     {
-        _keyEvents.Add(new KeyInputEvent(keysym, down));
+        EnsureCurrentFrame().AddKeysym(keysym, down);
     }
 
     /// <summary>
@@ -39,18 +47,25 @@ public abstract class InputProvider : MonoBehaviour
     /// </summary>
     public void SetMousePosition(int x, int y)
     {
-        SetMouseState(x, y, _mouseEvent.leftButton, _mouseEvent.middleButton, _mouseEvent.rightButton);
+        var f = EnsureCurrentFrame();
+        bool left = f.HasMouse && f.LeftButton;
+        bool middle = f.HasMouse && f.MiddleButton;
+        bool right = f.HasMouse && f.RightButton;
+        SetMouseState(x, y, left, middle, right);
     }
 
     /// <summary>Set pointer buttons while preserving the current guest position.</summary>
     public void SetMouseButtons(bool leftButton, bool middleButton, bool rightButton)
     {
-        SetMouseState(_mouseEvent.x, _mouseEvent.y, leftButton, middleButton, rightButton);
+        var f = EnsureCurrentFrame();
+        int x = f.HasMouse ? f.MouseX : _lastMouseX;
+        int y = f.HasMouse ? f.MouseY : _lastMouseY;
+        SetMouseState(x, y, leftButton, middleButton, rightButton);
     }
 
     /// <summary>
     /// Queue a complete pointer state in guest framebuffer pixels, measured from the top-left.
-    /// Multiple calls in one frame are coalesced to the latest state.
+    /// Multiple calls in one collect are coalesced to the latest state.
     /// </summary>
     public void SetMouseState(
         int x,
@@ -59,89 +74,82 @@ public abstract class InputProvider : MonoBehaviour
         bool middleButton = false,
         bool rightButton = false)
     {
-        _mouseEvent = new MouseInputEvent(x, y, leftButton, middleButton, rightButton);
-        _hasMouseEvent = true;
+        EnsureCurrentFrame().SetMouse(x, y, leftButton, middleButton, rightButton);
+        _lastMouseX = x;
+        _lastMouseY = y;
+        _hasLastMousePos = true;
     }
 
     /// <summary>
-    /// Poll this provider and send any queued key/mouse events to <paramref name="machine"/>.
-    /// Safe to call from a composite provider that fans out to several sources.
+    /// Poll into <paramref name="frame"/> without transforming or sending.
+    /// Used by composites to aggregate child providers.
     /// </summary>
-    public void ProcessInput(VirtualMachine machine)
+    public void CollectInput(VirtualMachine machine, QemuInputFrame frame)
     {
-        if (!isActiveAndEnabled || machine.Texture == null)
+        if (!isActiveAndEnabled || machine == null || machine.Texture == null || frame == null)
             return;
 
         Machine = machine;
-        PollInput();
-
-        foreach (var keyEvent in _keyEvents)
+        var previous = _currentFrame;
+        _currentFrame = frame;
+        try
         {
-            if (keyEvent.isRawKeysym)
-                machine.SendKeyEvent(keyEvent.keysym, keyEvent.down);
+            PollInput(frame);
+        }
+        finally
+        {
+            _currentFrame = previous;
+        }
+    }
+
+    /// <summary>
+    /// Poll, run <see cref="TransformFrame"/>, and send to <paramref name="machine"/>.
+    /// </summary>
+    public void ProcessInput(VirtualMachine machine)
+    {
+        if (!isActiveAndEnabled || machine == null || machine.Texture == null)
+            return;
+
+        _processFrame.Clear();
+        if (_hasLastMousePos)
+        {
+            _processFrame.MouseX = _lastMouseX;
+            _processFrame.MouseY = _lastMouseY;
+        }
+
+        CollectInput(machine, _processFrame);
+        TransformFrame(_processFrame);
+        Flush(_processFrame, machine);
+    }
+
+    QemuInputFrame EnsureCurrentFrame()
+    {
+        if (_currentFrame == null)
+            throw new System.InvalidOperationException(
+                "AddKeyEvent/SetMouseState require an active CollectInput/ProcessInput.");
+        return _currentFrame;
+    }
+
+    protected static void Flush(QemuInputFrame frame, VirtualMachine machine)
+    {
+        for (int i = 0; i < frame.Keys.Count; i++)
+        {
+            var kev = frame.Keys[i];
+            if (kev.isRawKeysym)
+                machine.SendKeyEvent(kev.keysym, kev.down);
             else
-                machine.SendKeyEvent(keyEvent.key, keyEvent.down);
-        }
-        _keyEvents.Clear();
-
-        if (_hasMouseEvent)
-        {
-            machine.SendMouseEvent(
-                _mouseEvent.x,
-                _mouseEvent.y,
-                _mouseEvent.leftButton,
-                _mouseEvent.middleButton,
-                _mouseEvent.rightButton);
-            _hasMouseEvent = false;
-        }
-    }
-
-    readonly struct KeyInputEvent
-    {
-        public readonly KeyCode key;
-        public readonly int keysym;
-        public readonly bool down;
-        public readonly bool isRawKeysym;
-
-        public KeyInputEvent(KeyCode key, bool down)
-        {
-            this.key = key;
-            this.down = down;
-            keysym = 0;
-            isRawKeysym = false;
+                machine.SendKeyEvent(kev.key, kev.down);
         }
 
-        public KeyInputEvent(int keysym, bool down)
-        {
-            key = KeyCode.None;
-            this.keysym = keysym;
-            this.down = down;
-            isRawKeysym = true;
-        }
-    }
+        if (!frame.HasMouse)
+            return;
 
-    readonly struct MouseInputEvent
-    {
-        public readonly int x;
-        public readonly int y;
-        public readonly bool leftButton;
-        public readonly bool middleButton;
-        public readonly bool rightButton;
-
-        public MouseInputEvent(
-            int x,
-            int y,
-            bool leftButton,
-            bool middleButton,
-            bool rightButton)
-        {
-            this.x = x;
-            this.y = y;
-            this.leftButton = leftButton;
-            this.middleButton = middleButton;
-            this.rightButton = rightButton;
-        }
+        machine.SendMouseEvent(
+            frame.MouseX,
+            frame.MouseY,
+            frame.LeftButton,
+            frame.MiddleButton,
+            frame.RightButton);
     }
 }
-
 }

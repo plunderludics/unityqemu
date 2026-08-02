@@ -21,8 +21,9 @@ vvfat drives are attached from `PeripheralsUI` (not launch config).
 Then press Play or enable edit-mode run.
 
 Project Settings → **UnityQemu** sets the default **QEMU Directory** (e.g. `Assets/qemu`)
-used as the starting folder for media pickers, and **Trim QEMU To i386** for player
-builds. Snapshot save/load still uses the current snap/disk folder.
+used as the starting folder for media pickers, plus player-build options (**Trim QEMU
+To i386**, **Obfuscate Guest File Names**). Snapshot save/load still uses the current
+snap/disk folder.
 
 ### Input
 
@@ -46,7 +47,9 @@ GameObject and leave the field empty for automatic discovery.
 1. Scans build scenes for `DiskAsset` / `UqsnapAsset` / `CdRomAsset` / `FloppyAsset` (and nested
    launch-config CDs), walks qcow2 backing chains, and copies those files into
    `{exe}_Data/QemuAssets/` (Assets-relative layout; package samples under
-   `{exe}_Data/Packages/…`).
+   `{exe}_Data/Packages/…`). With **Obfuscate Guest File Names** (off by default),
+   files are stored as `SHA-256(project-relative path)` instead, and qcow2 backing
+   headers are rebased to match.
 2. If any were found, copies `qemu~` per Project Settings → **UnityQemu** →
    **Trim QEMU To i386** (on by default):
    - **Trimmed:** only `qemu-i386.manifest`

@@ -206,12 +206,12 @@ public partial class VirtualMachine : MonoBehaviour
 
     [Group("Advanced")]
     [Tooltip(
-        "GDB stub for guest memory peek/poke (RamSearch, MemViewer). " +
+        "GDB stub for guest memory peek/poke (WinXpRamSearch, MemViewer). " +
         "Idle overhead is small; each memory op briefly stops the vCPU.")]
     public bool enableGdb = true;
 
     [Group("Advanced")]
-    [Tooltip("Use physical addresses for GDB memory ops (needed for RamSearch).")]
+    [Tooltip("Use physical addresses for GDB memory ops (needed for WinXpRamSearch).")]
     [LabelText("GDB Physical Memory")]
     [SerializeField] bool gdbPhysicalMemory = true;
 
