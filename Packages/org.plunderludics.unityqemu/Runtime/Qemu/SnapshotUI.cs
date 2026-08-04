@@ -32,17 +32,24 @@ public class SnapshotUI : MonoBehaviour
     [PropertyOrder(0)]
     [Tooltip(
         "Also write a .uqsnap migration stream (RAM/CPU) next to the disk tip. " +
-        "On by default. Turn off to save a cold-bootable child/sibling DiskAsset only. " +
+        "On by default. Uses migrate fd: (Windows get-win32-socket; macOS/Linux getfd). " +
+        "Turn off to save a cold-bootable child/sibling DiskAsset only. " +
         "Attached USB vvfat drives are disconnected automatically (with confirmation) before capture.")]
     [LabelText("Include machine state")]
+    [EnableIf(nameof(CanIncludeMachineState))]
     public bool includeMachineState = true;
+
+    bool CanIncludeMachineState => MigrationRelay.SupportsOutgoingFdCapture;
+
+    bool EffectiveIncludeMachineState =>
+        includeMachineState && MigrationRelay.SupportsOutgoingFdCapture;
 
     [PropertyOrder(0)]
     [Tooltip(
         "Gzip the machine-state file when saving. On by default (smaller files). " +
         "Turn off for faster saves; the choice is stored with each snapshot so load stays correct.")]
     [LabelText("Compress machine state")]
-    [EnableIf(nameof(includeMachineState))]
+    [EnableIf(nameof(EffectiveIncludeMachineState))]
     public bool compressMachineState = true;
 
     [PropertyOrder(0)]
@@ -50,7 +57,7 @@ public class SnapshotUI : MonoBehaviour
         "Write a sibling .png (same basename as the .uqsnap) from the live VNC frame when saving. " +
         "Used as UqsnapAsset.screenshot and the Project window icon.")]
     [LabelText("Capture screenshot")]
-    [EnableIf(nameof(includeMachineState))]
+    [EnableIf(nameof(EffectiveIncludeMachineState))]
     public bool captureScreenshot = true;
 
     [PropertyTooltip("$CurrentSnapshotTooltip")]
@@ -125,17 +132,17 @@ public class SnapshotUI : MonoBehaviour
 
     public Task<bool> OverwriteCurrentSnapshotAsync() =>
         OverwriteAsync(
-            virtualMachine, includeMachineState, compressMachineState, captureScreenshot,
+            virtualMachine, EffectiveIncludeMachineState, compressMachineState, captureScreenshot,
             s => status = s);
 
     public Task<bool> SaveChildSnapshotAsync() =>
         SaveChildAsync(
-            virtualMachine, includeMachineState, compressMachineState, captureScreenshot,
+            virtualMachine, EffectiveIncludeMachineState, compressMachineState, captureScreenshot,
             s => status = s);
 
     public Task<bool> SaveSiblingSnapshotAsync() =>
         SaveSiblingAsync(
-            virtualMachine, includeMachineState, compressMachineState, captureScreenshot,
+            virtualMachine, EffectiveIncludeMachineState, compressMachineState, captureScreenshot,
             s => status = s);
 
     [PropertyOrder(3)]

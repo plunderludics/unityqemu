@@ -13,55 +13,35 @@ using UnityEngine;
 namespace UnityQemu {
 public class QmpClient : IDisposable
 {
-    private TcpClient _tcpClient;
-    private NetworkStream _stream;
-    private StreamReader _reader;
-    private StreamWriter _writer;
-    private bool _isConnected = false;
-    private bool _capabilitiesNegotiated = false;
-    private int _commandIdCounter = 1;
+    Socket _socket;
+    NetworkStream _stream;
+    StreamReader _reader;
+    StreamWriter _writer;
+    bool _isConnected;
+    bool _capabilitiesNegotiated;
+    int _commandIdCounter = 1;
 
     /// <summary>Log connect/handshake/command traffic to the console.</summary>
     public bool Verbose { get; set; }
 
-    /// <summary>
-    /// Whether the client is connected to QEMU's QMP socket.
-    /// </summary>
-    public bool IsConnected => _isConnected && _tcpClient != null && _tcpClient.Connected;
+    /// <summary>True when connected over a unix-domain socket (SCM_RIGHTS / getfd capable).</summary>
+    public bool IsUnixTransport { get; private set; }
 
-    /// <summary>
-    /// Connect to QEMU's QMP socket.
-    /// </summary>
-    /// <param name="host">Hostname or IP address (usually "127.0.0.1" for localhost)</param>
-    /// <param name="port">QMP port number</param>
+    /// <summary>Whether the client is connected to QEMU's QMP socket.</summary>
+    public bool IsConnected =>
+        _isConnected && _socket != null && _socket.Connected;
+
+    /// <summary>Connect to QEMU's QMP TCP socket.</summary>
     public async Task ConnectAsync(string host, int port)
     {
         LogVerbose($"Connecting to QMP socket on {host}:{port}");
         try
         {
-            _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(host, port);
-            _stream = _tcpClient.GetStream();
-            _reader = new StreamReader(_stream, Encoding.UTF8);
-            _writer = new StreamWriter(_stream, Encoding.ASCII) { AutoFlush = true };
-            _isConnected = true;
-
-            // QEMU sends a greeting message immediately upon connection
-            string greeting = await _reader.ReadLineAsync();
-            LogVerbose($"QMP greeting: {greeting}");
-
-            if (!string.IsNullOrEmpty(greeting))
-            {
-                JObject greetingObj = JObject.Parse(greeting);
-                if (greetingObj["QMP"] != null)
-                {
-                    await NegotiateCapabilitiesAsync();
-                }
-                else
-                {
-                    throw new Exception("Invalid QMP greeting - expected QMP property");
-                }
-            }
+            ResetTransport();
+            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await _socket.ConnectAsync(host, port);
+            IsUnixTransport = false;
+            await FinishConnectAsync();
         }
         catch (Exception e)
         {
@@ -71,10 +51,88 @@ public class QmpClient : IDisposable
         }
     }
 
-    private async Task NegotiateCapabilitiesAsync()
+    /// <summary>
+    /// Connect to QEMU's QMP unix-domain socket (required for <see cref="PassFdAsync"/>).
+    /// </summary>
+    public async Task ConnectUnixAsync(string socketPath)
+    {
+        if (string.IsNullOrEmpty(socketPath))
+            throw new ArgumentException("socket path required", nameof(socketPath));
+
+        LogVerbose($"Connecting to QMP unix socket '{socketPath}'");
+        try
+        {
+            ResetTransport();
+            _socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            await _socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath));
+            IsUnixTransport = true;
+            await FinishConnectAsync();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to connect to QMP unix socket: {e.Message}");
+            _isConnected = false;
+            throw;
+        }
+    }
+
+    async Task FinishConnectAsync()
+    {
+        _stream = new NetworkStream(_socket, ownsSocket: false);
+        _reader = new StreamReader(_stream, Encoding.UTF8);
+        _writer = new StreamWriter(_stream, Encoding.ASCII) { AutoFlush = true };
+        _isConnected = true;
+
+        string greeting = await _reader.ReadLineAsync();
+        LogVerbose($"QMP greeting: {greeting}");
+
+        if (string.IsNullOrEmpty(greeting))
+            throw new Exception("Empty QMP greeting");
+
+        JObject greetingObj = JObject.Parse(greeting);
+        if (greetingObj["QMP"] == null)
+            throw new Exception("Invalid QMP greeting - expected QMP property");
+
+        await NegotiateCapabilitiesAsync();
+    }
+
+    void ResetTransport()
+    {
+        try { _reader?.Dispose(); } catch { /* ignore */ }
+        try { _writer?.Dispose(); } catch { /* ignore */ }
+        try { _stream?.Dispose(); } catch { /* ignore */ }
+        try { _socket?.Dispose(); } catch { /* ignore */ }
+        _reader = null;
+        _writer = null;
+        _stream = null;
+        _socket = null;
+        IsUnixTransport = false;
+        _capabilitiesNegotiated = false;
+        _isConnected = false;
+    }
+
+    /// <summary>
+    /// Pass a file descriptor to QEMU via SCM_RIGHTS, then bind it with QMP <c>getfd</c>.
+    /// Requires <see cref="IsUnixTransport"/>.
+    /// </summary>
+    public async Task PassFdAsync(int fd, string fdname)
+    {
+        if (!IsConnected)
+            throw new InvalidOperationException("Not connected to QMP socket");
+        if (!IsUnixTransport)
+            throw new InvalidOperationException(
+                "QMP getfd requires a unix-domain QMP connection");
+        if (string.IsNullOrEmpty(fdname))
+            throw new ArgumentException("fdname required", nameof(fdname));
+
+        UnixScmRights.SendFd(_socket, fd);
+        await ExecuteCommandAsync("getfd", new JObject { ["fdname"] = fdname });
+    }
+
+    async Task NegotiateCapabilitiesAsync()
     {
         var response = await ExecuteCommandAsync("qmp_capabilities");
-        
+
         if (response["return"] != null)
         {
             _capabilitiesNegotiated = true;
@@ -102,13 +160,13 @@ public class QmpClient : IDisposable
         }
 
         int commandId = _commandIdCounter++;
-        
+
         JObject commandObj = new JObject
         {
             ["execute"] = command,
             ["id"] = commandId
         };
-        
+
         if (arguments != null)
         {
             commandObj["arguments"] = arguments;
@@ -132,7 +190,6 @@ public class QmpClient : IDisposable
             if (response["event"] != null)
             {
                 string eventName = response["event"]?.ToString() ?? "?";
-                // Routine lifecycle noise (our own device_del, pause/resume) stays Verbose-only.
                 if (Verbose)
                     Debug.Log($"QMP event: {responseLine}");
                 else if (!IsRoutineQmpEvent(eventName))
@@ -148,7 +205,6 @@ public class QmpClient : IDisposable
                 string errorClass = error["class"]?.ToString() ?? "Unknown";
                 string errorDesc = error["desc"]?.ToString() ?? "Unknown error";
                 string message = $"QMP `{command}` failed: {errorClass} - {errorDesc}";
-                // Always surface — callers sometimes catch/swallow.
                 Debug.LogWarning(message);
                 throw new Exception(message);
             }
@@ -218,18 +274,7 @@ public class QmpClient : IDisposable
 
     public void Dispose()
     {
-        _isConnected = false;
-        _capabilitiesNegotiated = false;
-
-        _reader?.Dispose();
-        _writer?.Dispose();
-        _stream?.Dispose();
-        _tcpClient?.Dispose();
-
-        _reader = null;
-        _writer = null;
-        _stream = null;
-        _tcpClient = null;
+        ResetTransport();
     }
 }
 }

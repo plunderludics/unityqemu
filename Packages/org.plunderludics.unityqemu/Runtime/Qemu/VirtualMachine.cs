@@ -91,6 +91,12 @@ public partial class VirtualMachine : MonoBehaviour
         "that backend yourself to avoid double playback with the host mixer.")]
     public bool playAudioInUnity = false;
 
+    [ShowIf(nameof(playAudioInUnity))]
+    [Tooltip(
+        "Optional AudioSource that plays guest audio (VncAudioPlayer is added on that " +
+        "object if needed). Leave empty to use / add one on this GameObject.")]
+    public AudioSource audioOutput;
+
     [Header("Input")]
     [Tooltip("If null, uses an attached InputProvider or adds a BasicInputProvider in Play mode.")]
     public InputProvider inputProvider;
@@ -254,10 +260,16 @@ public partial class VirtualMachine : MonoBehaviour
     int _activeVncPort;
     int _activeQmpPort;
     int _activeGdbPort;
+    /// <summary>Unix-domain QMP path (macOS/Linux). Null on Windows TCP QMP.</summary>
+    string _activeQmpSocketPath;
     QemuPortAllocator.HeldPort _heldVncPort;
     QemuPortAllocator.HeldPort _heldQmpPort;
     QemuPortAllocator.HeldPort _heldGdbPort;
     const int MaxPortBindRetries = 3;
+
+    static bool PreferUnixQmp =>
+        !System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
 
     [Group("Status")]
     [ShowInInspector, ReadOnly]
@@ -1392,13 +1404,20 @@ public partial class VirtualMachine : MonoBehaviour
             vncDisplay += ",audiodev=snd0";
         process.StartInfo.ArgumentList.Add(vncDisplay);
         
-        // Add QMP socket for command control
-        // Format: -qmp tcp:host:port,server,nowait
-        // -qmp replaces the default HMP monitor, so keep readline HMP on the VC explicitly
-        // (Ctrl+Alt+2 in the SDL/GTK window) when we also want interactive monitor access.
+        // QMP: TCP on Windows; unix-domain on macOS/Linux (needed for getfd / migrate fd:).
+        // -qmp replaces the default HMP monitor, so keep readline HMP on the VC explicitly.
         if (enableQmp) {
             process.StartInfo.ArgumentList.Add("-qmp");
-            process.StartInfo.ArgumentList.Add($"tcp:127.0.0.1:{_activeQmpPort},server,nowait");
+            if (!string.IsNullOrEmpty(_activeQmpSocketPath))
+            {
+                process.StartInfo.ArgumentList.Add(
+                    $"unix:{_activeQmpSocketPath.Replace('\\', '/')},server,nowait");
+            }
+            else
+            {
+                process.StartInfo.ArgumentList.Add(
+                    $"tcp:127.0.0.1:{_activeQmpPort},server,nowait");
+            }
             process.StartInfo.ArgumentList.Add("-monitor");
             process.StartInfo.ArgumentList.Add("vc");
         }
@@ -1430,7 +1449,11 @@ public partial class VirtualMachine : MonoBehaviour
 
         UnityEngine.Debug.Log(
             $"Started QEMU process (PID: {process.Id}) with VNC on port {_activeVncPort}" +
-            (enableQmp ? $", QMP {_activeQmpPort}" : "") +
+            (enableQmp
+                ? (!string.IsNullOrEmpty(_activeQmpSocketPath)
+                    ? $", QMP unix:{Path.GetFileName(_activeQmpSocketPath)}"
+                    : $", QMP {_activeQmpPort}")
+                : "") +
             (enableGdb ? $", GDB {_activeGdbPort}" : "") +
             $" (preferred VNC display :{QemuPortAllocator.PreferredVncDisplay()})");
 
@@ -1796,23 +1819,60 @@ public partial class VirtualMachine : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Host for <see cref="VncAudioPlayer"/>: <see cref="audioOutput"/>'s object, else this one.
+    /// OnAudioFilterRead must live on the same GameObject as the playing AudioSource.
+    /// </summary>
+    GameObject AudioPlaybackHost =>
+        audioOutput != null ? audioOutput.gameObject : gameObject;
+
+    VncAudioPlayer EnsureAudioPlayer(bool startPlayback)
+    {
+        var host = AudioPlaybackHost;
+        var player = host.GetComponent<VncAudioPlayer>();
+        if (player == null)
+            player = host.AddComponent<VncAudioPlayer>();
+
+        // Avoid double playback if we previously used a different host.
+        if (host != gameObject)
+        {
+            var onSelf = GetComponent<VncAudioPlayer>();
+            if (onSelf != null && onSelf != player)
+                onSelf.StopPlayback();
+        }
+
+        if (startPlayback)
+        {
+            player.enabled = true;
+            player.StartPlayback();
+        }
+        else
+            player.StopPlayback();
+
+        return player;
+    }
+
+    void StopAudioPlayback()
+    {
+        var host = AudioPlaybackHost;
+        var player = host.GetComponent<VncAudioPlayer>();
+        if (player != null)
+            player.StopPlayback();
+        if (host != gameObject)
+        {
+            var onSelf = GetComponent<VncAudioPlayer>();
+            if (onSelf != null && onSelf != player)
+                onSelf.StopPlayback();
+        }
+    }
+
     Task ConnectVncAsync()
     {
         VncAudioPlayer audioPlayer = null;
         if (playAudioInUnity)
-        {
-            audioPlayer = GetComponent<VncAudioPlayer>();
-            if (audioPlayer == null)
-                audioPlayer = gameObject.AddComponent<VncAudioPlayer>();
-            audioPlayer.enabled = true;
-            audioPlayer.StartPlayback();
-        }
+            audioPlayer = EnsureAudioPlayer(startPlayback: true);
         else
-        {
-            var existing = GetComponent<VncAudioPlayer>();
-            if (existing != null)
-                existing.StopPlayback();
-        }
+            StopAudioPlayback();
 
         _vncClient = new VncClient
         {
@@ -1839,7 +1899,43 @@ public partial class VirtualMachine : MonoBehaviour
     Task ConnectQmpAsync()
     {
         _qmpClient = new QmpClient { Verbose = verboseQmp };
+        if (!string.IsNullOrEmpty(_activeQmpSocketPath))
+            return ConnectQmpUnixAsync(_qmpClient, _activeQmpSocketPath, verboseQmp);
         return ConnectQmpCoreAsync(_qmpClient, _activeQmpPort, verboseQmp);
+    }
+
+    static async Task ConnectQmpUnixAsync(QmpClient client, string socketPath, bool verbose)
+    {
+        try
+        {
+            // QEMU may need a moment to create the socket file after spawn.
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            Exception last = null;
+            while (DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    if (File.Exists(socketPath))
+                    {
+                        await client.ConnectUnixAsync(socketPath);
+                        if (verbose)
+                            UnityEngine.Debug.Log($"QMP client connected (unix:{socketPath})");
+                        return;
+                    }
+                }
+                catch (Exception e)
+                {
+                    last = e;
+                }
+                await Task.Delay(50);
+            }
+            throw last ?? new TimeoutException(
+                $"QMP unix socket not ready: {socketPath}");
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogError($"Failed to connect QMP client: {e.Message}");
+        }
     }
 
     static async Task ConnectQmpCoreAsync(QmpClient client, int port, bool verbose)
@@ -2021,19 +2117,38 @@ public partial class VirtualMachine : MonoBehaviour
             // Non-empty reply is logged by TryGetHumanMonitorFailureAsync.
             await TryGetHumanMonitorFailureAsync(saveCmd);
 
-            if (captureMachineState)
+            if (captureMachineState && !MigrationRelay.SupportsOutgoingFdCapture)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "UnityQemu: durable machine-state save (migrate fd:) is not supported " +
+                    "on this platform. Saving disk tip only.");
+            }
+            else if (captureMachineState)
             {
                 try
                 {
-                    using (var capture = MigrationRelay.OutgoingCapture.Create(_qemuProcess.Id))
+                    using (var capture = MigrationRelay.OutgoingCapture.Create(
+                               MigrationRelay.UsesWin32SocketCapture ? _qemuProcess.Id : 0))
                     {
-                        var fdArgs = new JObject
+                        if (MigrationRelay.UsesWin32SocketCapture)
                         {
-                            ["info"] = capture.ProtocolInfoBase64,
-                            ["fdname"] = capture.FdName,
-                        };
-                        await _qmpClient.ExecuteCommandAsync(
-                            "get-win32-socket", fdArgs.ToString(Newtonsoft.Json.Formatting.None));
+                            var fdArgs = new JObject
+                            {
+                                ["info"] = capture.ProtocolInfoBase64,
+                                ["fdname"] = capture.FdName,
+                            };
+                            await _qmpClient.ExecuteCommandAsync(
+                                "get-win32-socket",
+                                fdArgs.ToString(Newtonsoft.Json.Formatting.None));
+                        }
+                        else
+                        {
+                            if (!_qmpClient.IsUnixTransport)
+                                throw new InvalidOperationException(
+                                    "Unix getfd requires a unix-domain QMP connection");
+                            await _qmpClient.PassFdAsync(capture.QemuEndFd, capture.FdName);
+                        }
+
                         capture.CloseQemuEnd();
 
                         Task<long> receiveTask = capture.ReceiveToFileAsync(vmstateOutputPath, gzip);
@@ -2447,10 +2562,8 @@ public partial class VirtualMachine : MonoBehaviour
 
         _vncClient?.Dispose();
         _vncClient = null;
-        var audioPlayer = GetComponent<VncAudioPlayer>();
-        if (audioPlayer != null)
-            audioPlayer.StopPlayback();
-        
+        StopAudioPlayback();
+
         _qmpClient?.Dispose();
         _qmpClient = null;
 
@@ -2508,6 +2621,7 @@ public partial class VirtualMachine : MonoBehaviour
         _activeVncPort = 0;
         _activeQmpPort = 0;
         _activeGdbPort = 0;
+        ClearQmpSocketPath();
 
         try
         {
@@ -2515,7 +2629,7 @@ public partial class VirtualMachine : MonoBehaviour
             {
                 _heldVncPort = QemuPortAllocator.ClaimExact(vncPort);
                 _activeVncPort = _heldVncPort.Port;
-                if (enableQmp)
+                if (enableQmp && !PreferUnixQmp)
                 {
                     _heldQmpPort = QemuPortAllocator.ClaimExact(qmpPort);
                     _activeQmpPort = _heldQmpPort.Port;
@@ -2531,7 +2645,7 @@ public partial class VirtualMachine : MonoBehaviour
             {
                 _heldVncPort = QemuPortAllocator.ClaimVncDisplayPort();
                 _activeVncPort = _heldVncPort.Port;
-                if (enableQmp)
+                if (enableQmp && !PreferUnixQmp)
                 {
                     _heldQmpPort = QemuPortAllocator.ClaimEphemeralPort();
                     _activeQmpPort = _heldQmpPort.Port;
@@ -2542,12 +2656,45 @@ public partial class VirtualMachine : MonoBehaviour
                     _activeGdbPort = _heldGdbPort.Port;
                 }
             }
+
+            if (enableQmp && PreferUnixQmp)
+                PrepareUnixQmpSocketPath();
         }
         catch
         {
             ReleaseClaimedPorts();
             throw;
         }
+    }
+
+    void PrepareUnixQmpSocketPath()
+    {
+        Directory.CreateDirectory(Paths.WorkDirectory);
+        string safe = WorkSessionId.Replace('/', '-').Replace('\\', '-').Replace(':', '-');
+        _activeQmpSocketPath = Path.Combine(Paths.WorkDirectory, $"qmp-{safe}.sock");
+        try
+        {
+            if (File.Exists(_activeQmpSocketPath))
+                File.Delete(_activeQmpSocketPath);
+        }
+        catch
+        {
+            /* stale socket from a crash — QEMU will fail to bind if undeleted */
+        }
+    }
+
+    void ClearQmpSocketPath()
+    {
+        if (!string.IsNullOrEmpty(_activeQmpSocketPath))
+        {
+            try
+            {
+                if (File.Exists(_activeQmpSocketPath))
+                    File.Delete(_activeQmpSocketPath);
+            }
+            catch { /* ignore */ }
+        }
+        _activeQmpSocketPath = null;
     }
 
     void HandOffPortsToQemu()
@@ -2565,6 +2712,7 @@ public partial class VirtualMachine : MonoBehaviour
         _heldQmpPort = null;
         _heldGdbPort?.Dispose();
         _heldGdbPort = null;
+        ClearQmpSocketPath();
     }
 
     /// <summary>

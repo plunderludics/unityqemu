@@ -112,6 +112,8 @@ the disk state.
    process (`WSADuplicateSocketW` → QMP `get-win32-socket`), runs `migrate fd:<name>`;
    pump socket → gzip/raw → `X.uqsnap` (temp + rename). Completion by polling
    QMP `query-migrate` until `completed`, then `closefd` + quiet-drain (§2).
+   **Windows only** historically; macOS/Linux use SCM_RIGHTS + QMP `getfd` over a
+   unix-domain QMP socket (best-effort — see `docs/host-qemu.md`).
 5. `cont` — total pause is steps 1–5, a few seconds. QEMU keeps running throughout;
    no process restart on any save.
 6. Offline, while the guest runs: `qemu-img convert -O qcow2 -B <parent> <frozen layer>
@@ -174,8 +176,8 @@ been removed.
 ## 6. Implementation map
 
 1. `MigrationRelay` (Runtime): `OutgoingCapture` (socket pair + `WSADuplicateSocketW`
-   + gzip receive with quiet-drain), `.uqsnap` feeder with connect retry (load).
-   Pumps on a worker thread.
+   / unix `getfd` + gzip receive with quiet-drain), `.uqsnap` feeder with connect retry (load).
+   Pumps on a worker thread. macOS/Linux QMP uses a unix-domain socket for SCM_RIGHTS.
 2. `VirtualMachine`: `-incoming` launch mode + state feed + auto quick-save;
    cold-boot fallback when state restore fails; `CaptureStateAsync`;
    work-layer chain tracking + cleanup; thin overlay on the linked `DiskAsset`.

@@ -4,6 +4,7 @@
 
 # Ignore qemu assets and testing stuff
 /Packages/org.plunderludics.unityqemu/qemu~/
+!/Packages/org.plunderludics.unityqemu/qemu~/README.md
 /Assets/qemu/
 
 # Ignore agent files

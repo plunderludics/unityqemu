@@ -19,8 +19,9 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
 
     [SerializeField]
     [Tooltip(
-        "When on (default), player builds copy only qemu-i386.manifest (~120 MB). " +
-        "When off, copy the entire qemu~ tree (~1.2 GB).")]
+        "When on (default), Windows player builds copy only qemu-i386.manifest (~120 MB). " +
+        "When off, copy the entire Windows qemu tree (~1.2 GB). Ignored for macOS/Linux " +
+        "(full host tree is copied; PE trim does not apply).")]
     bool trimQemuToI386 = true;
 
     [SerializeField]
@@ -126,8 +127,8 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
                 bool trim = EditorGUILayout.Toggle(
                     new GUIContent(
                         "Trim QEMU To i386",
-                        "Player builds: copy only qemu-i386.manifest (~120 MB) instead of " +
-                        "the full qemu~ tree (~1.2 GB)."),
+                        "Windows player builds: copy only qemu-i386.manifest (~120 MB) instead of " +
+                        "the full Windows qemu tree (~1.2 GB). macOS/Linux always copy their full tree."),
                     settings.TrimQemuToI386);
                 if (EditorGUI.EndChangeCheck())
                     settings.TrimQemuToI386 = trim;
@@ -145,11 +146,15 @@ public sealed class UnityQemuProjectSettings : ScriptableSingleton<UnityQemuProj
                 EditorGUILayout.HelpBox(
                     "QEMU Directory is the starting folder for PeripheralsUI media pickers. " +
                     "Snapshot save/load keeps using the current snap or disk location.\n\n" +
-                    "Trim QEMU To i386 packages qemu-system-i386 + qemu-img + DLL closure + " +
+                    "Host QEMU trees live under Packages/…/qemu~/win|macos|macos-x64|linux " +
+                    "(Windows also accepts a legacy flat qemu~ layout). See docs/host-qemu.md.\n\n" +
+                    "Trim QEMU To i386 packages Windows qemu-system-i386 + qemu-img + DLL closure + " +
                     "SeaBIOS (regenerate qemu-i386.manifest after updating QEMU). " +
                     "Turn off only if you need other softmmu arches or the full share/ tree.\n\n" +
                     "Obfuscate Guest File Names hides original filenames in the build folder; " +
-                    "content is unchanged (not encryption).",
+                    "content is unchanged (not encryption).\n\n" +
+                    "Durable .uqsnap save uses migrate fd: on Windows (get-win32-socket) " +
+                    "and on macOS/Linux (getfd over unix-domain QMP).",
                     MessageType.Info);
             },
         };

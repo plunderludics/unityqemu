@@ -107,7 +107,7 @@ class SnapshotSaveDialog : EditorWindow
         SnapshotUI ui = vm.GetComponent<SnapshotUI>();
         if (ui == null)
             return;
-        _includeMachineState = ui.includeMachineState;
+        _includeMachineState = ui.includeMachineState && MigrationRelay.SupportsOutgoingFdCapture;
         _captureScreenshot = ui.captureScreenshot;
         _compressMachineState = ui.compressMachineState;
     }
@@ -205,11 +205,23 @@ class SnapshotSaveDialog : EditorWindow
 
             EditorGUILayout.Space(10);
             EditorGUILayout.LabelField("Options", EditorStyles.boldLabel);
-            _includeMachineState = EditorGUILayout.ToggleLeft(
-                new GUIContent(
-                    "Include machine state (.uqsnap)",
-                    "Off = save a cold-bootable DiskAsset tip only."),
-                _includeMachineState);
+            if (!MigrationRelay.SupportsOutgoingFdCapture)
+            {
+                _includeMachineState = false;
+                EditorGUILayout.HelpBox(
+                    "Machine-state save (.uqsnap) is not supported on this host. " +
+                    "This save will be disk-only.",
+                    MessageType.Info);
+            }
+
+            using (new EditorGUI.DisabledScope(!MigrationRelay.SupportsOutgoingFdCapture))
+            {
+                _includeMachineState = EditorGUILayout.ToggleLeft(
+                    new GUIContent(
+                        "Include machine state (.uqsnap)",
+                        "Off = save a cold-bootable DiskAsset tip only."),
+                    _includeMachineState);
+            }
             using (new EditorGUI.DisabledScope(!_includeMachineState))
             {
                 _captureScreenshot = EditorGUILayout.ToggleLeft(

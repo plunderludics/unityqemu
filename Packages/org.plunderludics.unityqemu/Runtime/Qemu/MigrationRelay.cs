@@ -12,9 +12,10 @@ namespace UnityQemu {
 /// <summary>
 /// Plumbing for QEMU migration streams (durable snapshot state capture/restore).
 /// <list type="bullet">
-/// <item>Save: a connected loopback socket is duplicated into the QEMU process
-/// (QMP <c>get-win32-socket</c>) and used with <c>migrate fd:</c>; we optionally
-/// gzip the stream into a <c>.uqsnap</c> asset.</item>
+/// <item>Save (Windows): loopback socket duplicated via QMP <c>get-win32-socket</c>,
+/// then <c>migrate fd:</c>.</item>
+/// <item>Save (macOS/Linux): same pair; write end via SCM_RIGHTS + QMP <c>getfd</c>
+/// over unix-domain QMP, then <c>migrate fd:</c>.</item>
 /// <item>Load: QEMU <c>-incoming tcp:</c> listens; we connect and feed the (possibly
 /// gunzipped) <c>.uqsnap</c> stream.</item>
 /// </list>
@@ -30,6 +31,18 @@ namespace UnityQemu {
 /// </summary>
 public static class MigrationRelay
 {
+    /// <summary>
+    /// Outgoing <c>migrate fd:</c> on Windows (<c>get-win32-socket</c>) and on
+    /// macOS/Linux (<c>getfd</c> over unix-domain QMP).
+    /// </summary>
+    public static bool SupportsOutgoingFdCapture =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+
+    public static bool UsesWin32SocketCapture =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
     [DllImport("ws2_32.dll", SetLastError = true)]
     static extern int WSADuplicateSocketW(IntPtr socketHandle, int processId, byte[] protocolInfo);
 
@@ -56,8 +69,25 @@ public static class MigrationRelay
         /// Create a connected loopback socket pair and duplicate the write end into
         /// process <paramref name="qemuPid"/>.
         /// </summary>
-        public static OutgoingCapture Create(int qemuPid)
+        /// <summary>Raw OS handle for the QEMU write end (unix <c>getfd</c>).</summary>
+        public int QemuEndFd =>
+            _qemuEnd != null ? _qemuEnd.Handle.ToInt32() : -1;
+
+        /// <summary>
+        /// Create a connected loopback TCP pair. On Windows, also duplicate the write
+        /// end into <paramref name="qemuPid"/> for <c>get-win32-socket</c>.
+        /// On unix, register with <see cref="QmpClient.PassFdAsync"/> using
+        /// <see cref="QemuEndFd"/> (<paramref name="qemuPid"/> ignored).
+        /// </summary>
+        public static OutgoingCapture Create(int qemuPid = 0)
         {
+            if (!SupportsOutgoingFdCapture)
+            {
+                throw new PlatformNotSupportedException(
+                    "UnityQemu durable machine-state save (migrate fd:) is not supported " +
+                    "on this platform.");
+            }
+
             var capture = new OutgoingCapture();
             var listener = new TcpListener(IPAddress.Loopback, 0);
             try
@@ -73,14 +103,24 @@ public static class MigrationRelay
                 listener.Stop();
             }
 
-            var info = new byte[ProtocolInfoSize];
-            if (WSADuplicateSocketW(capture._qemuEnd.Handle, qemuPid, info) != 0)
+            if (UsesWin32SocketCapture)
             {
-                capture.Dispose();
-                throw new InvalidOperationException(
-                    $"WSADuplicateSocketW failed (error {Marshal.GetLastWin32Error()})");
+                if (qemuPid <= 0)
+                {
+                    capture.Dispose();
+                    throw new ArgumentException("qemuPid required on Windows", nameof(qemuPid));
+                }
+
+                var info = new byte[ProtocolInfoSize];
+                if (WSADuplicateSocketW(capture._qemuEnd.Handle, qemuPid, info) != 0)
+                {
+                    capture.Dispose();
+                    throw new InvalidOperationException(
+                        $"WSADuplicateSocketW failed (error {Marshal.GetLastWin32Error()})");
+                }
+                capture.ProtocolInfoBase64 = Convert.ToBase64String(info);
             }
-            capture.ProtocolInfoBase64 = Convert.ToBase64String(info);
+
             return capture;
         }
 

@@ -49,6 +49,48 @@ public class PathsTests
     }
 
     [Test]
+    public void ResolveEditorQemuDir_Windows_PrefersWinSubdirWhenPresent()
+    {
+        string root = Paths.QemuRootDir;
+        string win = Path.Combine(root, Paths.QemuHostSubdirWindows);
+        string resolved = Paths.ResolveEditorQemuDir(QemuHostKind.Windows);
+        if (Directory.Exists(win) && Paths.HasQemuSystemBinary(win, QemuHostKind.Windows))
+            Assert.AreEqual(Path.GetFullPath(win), Path.GetFullPath(resolved));
+        else
+            Assert.AreEqual(Path.GetFullPath(root), Path.GetFullPath(resolved));
+    }
+
+    [Test]
+    public void HostBinaryNames_MatchOs()
+    {
+        Assert.AreEqual("qemu-system-i386.exe", Paths.QemuSystemBinaryName(QemuHostKind.Windows));
+        Assert.AreEqual("qemu-img.exe", Paths.QemuImgBinaryName(QemuHostKind.Windows));
+        Assert.AreEqual("qemu-system-i386", Paths.QemuSystemBinaryName(QemuHostKind.MacOS));
+        Assert.AreEqual("qemu-img", Paths.QemuImgBinaryName(QemuHostKind.Linux));
+    }
+
+    [Test]
+    public void ResolveEditorQemuDir_Mac_PrefersRequestedArch()
+    {
+        string root = Paths.QemuRootDir;
+        string arm = Path.Combine(root, Paths.QemuHostSubdirMacOS);
+        string x64 = Path.Combine(root, Paths.QemuHostSubdirMacOSX64);
+        if (Directory.Exists(arm) && Paths.HasQemuSystemBinary(arm, QemuHostKind.MacOS))
+        {
+            Assert.AreEqual(
+                Path.GetFullPath(arm),
+                Path.GetFullPath(Paths.ResolveEditorQemuDir(QemuHostKind.MacOS, preferX64: false)));
+        }
+
+        if (Directory.Exists(x64) && Paths.HasQemuSystemBinary(x64, QemuHostKind.MacOS))
+        {
+            Assert.AreEqual(
+                Path.GetFullPath(x64),
+                Path.GetFullPath(Paths.ResolveEditorQemuDir(QemuHostKind.MacOS, preferX64: true)));
+        }
+    }
+
+    [Test]
     public void QueryBundledQemuVersion_ReturnsQemuBanner()
     {
         string version = VirtualMachine.QueryBundledQemuVersion();

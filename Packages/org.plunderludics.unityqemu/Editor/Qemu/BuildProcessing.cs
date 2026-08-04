@@ -13,7 +13,8 @@ namespace UnityQemu {
 /// <summary>
 /// Packages QEMU binaries and referenced guest images into player builds.
 /// Follows UnityHawk <c>BuildProcessing</c>: collect scene deps → copy into
-/// <c>{exe}_Data/QemuAssets</c>, and copy <c>qemu~</c> when anything is used.
+/// the player data folder under <c>QemuAssets</c>, and copy the host-matched
+/// <c>qemu~</c> tree when anything is used.
 /// </summary>
 public class BuildProcessing :
     IPreprocessBuildWithReport,
@@ -21,6 +22,14 @@ public class BuildProcessing :
     IPostprocessBuildWithReport
 {
     const string ManifestFileName = "qemu-i386.manifest";
+
+    static readonly HashSet<string> PlatformSubdirNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        Paths.QemuHostSubdirWindows,
+        Paths.QemuHostSubdirMacOS,
+        Paths.QemuHostSubdirMacOSX64,
+        Paths.QemuHostSubdirLinux,
+    };
 
     static readonly Dictionary<string, HashSet<CopyItem>> FilesForScene = new();
     static readonly HashSet<DiskAsset> DisksForBuild = new();
@@ -32,11 +41,11 @@ public class BuildProcessing :
 
     public void OnPreprocessBuild(BuildReport report)
     {
-        string qemuDir = GetQemuDirInBuild(report.summary.outputPath);
+        string qemuDir = GetQemuDirInBuild(report.summary.outputPath, report.summary.platform);
         if (Directory.Exists(qemuDir))
             Directory.Delete(qemuDir, recursive: true);
 
-        string assetsDir = GetQemuAssetsDirInBuild(report.summary.outputPath);
+        string assetsDir = GetQemuAssetsDirInBuild(report.summary.outputPath, report.summary.platform);
         if (Directory.Exists(assetsDir))
             Directory.Delete(assetsDir, recursive: true);
 
@@ -60,14 +69,15 @@ public class BuildProcessing :
         // Re-read in case settings changed, or scene process was skipped on rebuild.
         ReadProjectBuildSettings();
 
+        BuildTarget target = report.summary.platform;
         string exePath = report.summary.outputPath;
-        int nCopied = CopyFilesToBuild(exePath);
+        int nCopied = CopyFilesToBuild(exePath, target);
         Debug.Log(
             $"[UnityQemu] Copied {nCopied} guest image file(s) into build" +
             (_obfuscateGuestFileNames ? " (obfuscated names)." : "."));
 
         if (_obfuscateGuestFileNames && nCopied > 0)
-            RebaseObfuscatedDiskChains(GetQemuAssetsDirInBuild(exePath));
+            RebaseObfuscatedDiskChains(GetQemuAssetsDirInBuild(exePath, target));
 
         if (nCopied == 0)
         {
@@ -77,21 +87,175 @@ public class BuildProcessing :
             return;
         }
 
-        string sourceQemu = Paths.QemuDir;
-        if (!Directory.Exists(sourceQemu))
+        if (!TryGetQemuHostKind(target, out QemuHostKind hostKind))
         {
-            throw new FileNotFoundException(
-                "[UnityQemu] qemu~ directory missing — cannot package QEMU into the build.",
-                sourceQemu);
+            throw new BuildFailedException(
+                $"[UnityQemu] Unsupported player platform '{target}'. " +
+                "Supported: Standalone Windows / macOS / Linux.");
         }
 
-        string targetQemu = GetQemuDirInBuild(exePath);
-        if (_trimQemuToI386)
-            CopyTrimmedQemu(sourceQemu, targetQemu);
+        string targetQemu = GetQemuDirInBuild(exePath, target);
+
+        if (hostKind == QemuHostKind.MacOS)
+        {
+            PackageMacQemu(targetQemu);
+        }
         else
-            CopyFullQemu(sourceQemu, targetQemu);
+        {
+            string sourceQemu = Paths.ResolveEditorQemuDir(hostKind);
+            if (!Paths.HasQemuSystemBinary(sourceQemu, hostKind))
+            {
+                throw new FileNotFoundException(
+                    $"[UnityQemu] No QEMU binaries for {hostKind} at '{sourceQemu}'. " +
+                    $"Place a {Paths.HostSubdirName(hostKind)} tree under Packages/{Paths.PackageName}/{Paths.QemuDirName}/ " +
+                    "(see docs/host-qemu.md). Windows may also use a legacy flat qemu~ layout.",
+                    sourceQemu);
+            }
+
+            bool canTrim = hostKind == QemuHostKind.Windows && _trimQemuToI386;
+            if (_trimQemuToI386 && !canTrim)
+            {
+                Debug.LogWarning(
+                    "[UnityQemu] Trim QEMU To i386 applies to Windows PE builds only; " +
+                    $"copying the full {hostKind} qemu tree.");
+            }
+
+            if (canTrim)
+                CopyTrimmedQemu(sourceQemu, targetQemu);
+            else
+                CopyFullQemu(sourceQemu, targetQemu, excludePlatformSiblings: IsLegacyFlatWindowsRoot(sourceQemu, hostKind));
+        }
+
+        if (hostKind != QemuHostKind.Windows)
+        {
+            Debug.LogWarning(
+                "[UnityQemu] macOS/Linux QEMU packaging is best-effort. After copying to a " +
+                "Mac/Linux machine, ensure binaries are executable (chmod +x) and clear " +
+                "quarantine on macOS if Gatekeeper blocks launch (xattr -cr). " +
+                "See docs/host-qemu.md.");
+        }
     }
 
+    enum MacQemuPackMode
+    {
+        Arm64Flat,
+        X64Flat,
+        UniversalNested,
+    }
+
+    static void PackageMacQemu(string targetQemu)
+    {
+        MacQemuPackMode mode = GetMacQemuPackMode();
+        // Use exact arch trees (no cross-arch fallback) so universal builds can't
+        // accidentally ship the same tree twice.
+        string armSrc = Path.Combine(Paths.QemuRootDir, Paths.QemuHostSubdirMacOS);
+        string x64Src = Path.Combine(Paths.QemuRootDir, Paths.QemuHostSubdirMacOSX64);
+
+        switch (mode)
+        {
+            case MacQemuPackMode.Arm64Flat:
+                RequireMacSource(armSrc, "Apple Silicon (macos/)");
+                CopyFullQemu(armSrc, targetQemu, excludePlatformSiblings: false);
+                break;
+            case MacQemuPackMode.X64Flat:
+                RequireMacSource(x64Src, "Intel (macos-x64/)");
+                CopyFullQemu(x64Src, targetQemu, excludePlatformSiblings: false);
+                break;
+            case MacQemuPackMode.UniversalNested:
+                RequireMacSource(armSrc, "Apple Silicon (macos/)");
+                RequireMacSource(x64Src, "Intel (macos-x64/)");
+                Directory.CreateDirectory(targetQemu);
+                CopyFullQemu(
+                    armSrc,
+                    Path.Combine(targetQemu, Paths.QemuPlayerArchArm64),
+                    excludePlatformSiblings: false);
+                CopyFullQemu(
+                    x64Src,
+                    Path.Combine(targetQemu, Paths.QemuPlayerArchX64),
+                    excludePlatformSiblings: false);
+                Debug.Log(
+                    "[UnityQemu] Universal Mac build: packaged both arm64/ and x64/ QEMU trees.");
+                break;
+        }
+    }
+
+    static void RequireMacSource(string sourceQemu, string label)
+    {
+        if (!Paths.HasQemuSystemBinary(sourceQemu, QemuHostKind.MacOS))
+        {
+            throw new FileNotFoundException(
+                $"[UnityQemu] No QEMU binaries for {label} at '{sourceQemu}'. " +
+                "See docs/host-qemu.md.",
+                sourceQemu);
+        }
+    }
+
+    /// <summary>
+    /// Reads the Mac player Architecture build setting (Intel / Apple Silicon / Universal).
+    /// Defaults to Apple Silicon when unset.
+    /// </summary>
+    static MacQemuPackMode GetMacQemuPackMode()
+    {
+        try
+        {
+            // Unity 6+: UnityEditor.OSXStandalone.UserBuildSettings.architecture
+            var arch = UnityEditor.OSXStandalone.UserBuildSettings.architecture;
+            string name = arch.ToString();
+            if (name.IndexOf("x64ARM64", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Universal", StringComparison.OrdinalIgnoreCase) >= 0)
+                return MacQemuPackMode.UniversalNested;
+            if (string.Equals(name, "x64", StringComparison.OrdinalIgnoreCase))
+                return MacQemuPackMode.X64Flat;
+            return MacQemuPackMode.Arm64Flat;
+        }
+        catch (Exception e)
+        {
+            // Fallback when OSXStandalone is unavailable (older modules / odd editors).
+            string raw = EditorUserBuildSettings.GetPlatformSettings(
+                "Standalone", "OSXUniversal", "Architecture");
+            Debug.LogWarning(
+                $"[UnityQemu] Could not read OSXStandalone architecture ({e.GetType().Name}); " +
+                $"platform setting='{raw}'. Defaulting via string parse.");
+            if (string.Equals(raw, "x64ARM64", StringComparison.OrdinalIgnoreCase))
+                return MacQemuPackMode.UniversalNested;
+            if (string.Equals(raw, "x64", StringComparison.OrdinalIgnoreCase))
+                return MacQemuPackMode.X64Flat;
+            return MacQemuPackMode.Arm64Flat;
+        }
+    }
+
+    static bool TryGetQemuHostKind(BuildTarget target, out QemuHostKind kind)
+    {
+        switch (target)
+        {
+            case BuildTarget.StandaloneWindows:
+            case BuildTarget.StandaloneWindows64:
+                kind = QemuHostKind.Windows;
+                return true;
+            case BuildTarget.StandaloneOSX:
+                kind = QemuHostKind.MacOS;
+                return true;
+            case BuildTarget.StandaloneLinux64:
+                kind = QemuHostKind.Linux;
+                return true;
+            default:
+                kind = default;
+                return false;
+        }
+    }
+
+    static bool IsLegacyFlatWindowsRoot(string sourceQemu, QemuHostKind kind)
+    {
+        if (kind != QemuHostKind.Windows)
+            return false;
+        string root = Paths.QemuRootDir;
+        return string.Equals(
+            Path.GetFullPath(sourceQemu).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    // NOTE: the following methods continue below — placeholder removed
     static void ReadProjectBuildSettings()
     {
         var settings = UnityQemuProjectSettings.instance;
@@ -99,13 +263,38 @@ public class BuildProcessing :
         _obfuscateGuestFileNames = settings.ObfuscateGuestFileNames;
     }
 
-    static void CopyFullQemu(string sourceQemu, string targetQemu)
+    static void CopyFullQemu(string sourceQemu, string targetQemu, bool excludePlatformSiblings)
     {
         Debug.Log($"[UnityQemu] Copying full qemu~ from '{sourceQemu}' to '{targetQemu}'…");
         Directory.CreateDirectory(targetQemu);
-        FileUtil.ReplaceDirectory(
-            Path.GetFullPath(sourceQemu),
-            Path.GetFullPath(targetQemu));
+        if (!excludePlatformSiblings)
+        {
+            FileUtil.ReplaceDirectory(
+                Path.GetFullPath(sourceQemu),
+                Path.GetFullPath(targetQemu));
+            return;
+        }
+
+        // Legacy flat Windows root may also hold macos/linux sibling trees — don't ship them.
+        CopyDirectoryFiltered(sourceQemu, targetQemu, skipDirNames: PlatformSubdirNames);
+    }
+
+    static void CopyDirectoryFiltered(string sourceDir, string destDir, HashSet<string> skipDirNames)
+    {
+        Directory.CreateDirectory(destDir);
+        foreach (string file in Directory.GetFiles(sourceDir))
+        {
+            string name = Path.GetFileName(file);
+            File.Copy(file, Path.Combine(destDir, name), overwrite: true);
+        }
+
+        foreach (string dir in Directory.GetDirectories(sourceDir))
+        {
+            string name = Path.GetFileName(dir);
+            if (skipDirNames != null && skipDirNames.Contains(name))
+                continue;
+            CopyDirectoryFiltered(dir, Path.Combine(destDir, name), skipDirNames: null);
+        }
     }
 
     static void CopyTrimmedQemu(string sourceQemu, string targetQemu)
@@ -164,16 +353,18 @@ public class BuildProcessing :
 
     static string ResolveManifestPath(string qemuDir)
     {
-        // Package root is the parent of qemu~ (works for Packages/ and PackageCache/).
-        string packageRoot = Directory.GetParent(Path.GetFullPath(qemuDir))?.FullName;
-        if (!string.IsNullOrEmpty(packageRoot))
+        // Manifest lives at the package root (sibling of qemu~), not inside win/.
+        string full = Path.GetFullPath(qemuDir);
+        string dir = full;
+        // Walk up until we find the package folder containing the manifest.
+        for (int i = 0; i < 4 && !string.IsNullOrEmpty(dir); i++)
         {
-            string candidate = Path.Combine(packageRoot, ManifestFileName);
+            string candidate = Path.Combine(dir, ManifestFileName);
             if (File.Exists(candidate))
                 return candidate;
+            dir = Directory.GetParent(dir)?.FullName;
         }
 
-        // Fallback: project Packages/org.plunderludics.unityqemu/
         return Path.GetFullPath(Path.Combine(
             Application.dataPath, "..", "Packages", Paths.PackageName, ManifestFileName));
     }
@@ -188,9 +379,9 @@ public class BuildProcessing :
         Debug.Log($"[UnityQemu] Collected {items.Count} file(s) for scene '{scene.path}'.");
     }
 
-    int CopyFilesToBuild(string exePath)
+    int CopyFilesToBuild(string exePath, BuildTarget target)
     {
-        string assetsRoot = GetQemuAssetsDirInBuild(exePath);
+        string assetsRoot = GetQemuAssetsDirInBuild(exePath, target);
         int nCopied = 0;
 
         var scenePaths = EditorBuildSettings.scenes
@@ -474,16 +665,23 @@ public class BuildProcessing :
             discovered.Add(uo);
     }
 
-    static string GetBuildDataDir(string exePath) =>
-        Path.Combine(
-            Path.GetDirectoryName(exePath)!,
-            $"{Path.GetFileNameWithoutExtension(exePath)}_Data");
+    static string GetBuildDataDir(string outputPath, BuildTarget target)
+    {
+        // Mac player: Application.dataPath is <App>.app/Contents
+        if (target == BuildTarget.StandaloneOSX)
+            return Path.Combine(outputPath, "Contents");
 
-    static string GetQemuAssetsDirInBuild(string exePath) =>
-        Path.Combine(GetBuildDataDir(exePath), Paths.QemuAssetsDirName);
+        // Windows / Linux: {name}_Data next to the executable
+        return Path.Combine(
+            Path.GetDirectoryName(outputPath)!,
+            $"{Path.GetFileNameWithoutExtension(outputPath)}_Data");
+    }
 
-    static string GetQemuDirInBuild(string exePath) =>
-        Path.Combine(GetBuildDataDir(exePath), Paths.PackageName, Paths.QemuDirName);
+    static string GetQemuAssetsDirInBuild(string outputPath, BuildTarget target) =>
+        Path.Combine(GetBuildDataDir(outputPath, target), Paths.QemuAssetsDirName);
+
+    static string GetQemuDirInBuild(string outputPath, BuildTarget target) =>
+        Path.Combine(GetBuildDataDir(outputPath, target), Paths.PackageName, Paths.QemuDirName);
 
     public sealed class CopyItem : IEquatable<CopyItem>
     {

@@ -5,7 +5,9 @@ import struct
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parents[2]
-QEMU = PACKAGE / "qemu~"
+QEMU_ROOT = PACKAGE / "qemu~"
+# Prefer multi-host layout (qemu~/win); fall back to legacy flat qemu~.
+QEMU = QEMU_ROOT / "win" if (QEMU_ROOT / "win").is_dir() else QEMU_ROOT
 OUT = PACKAGE / "qemu-i386.manifest"
 
 SYSTEM = {
@@ -72,7 +74,9 @@ def read_pe_imports(path: Path) -> list[str]:
 
 def main() -> None:
     if not QEMU.is_dir():
-        raise SystemExit(f"qemu~ missing at {QEMU}")
+        raise SystemExit(
+            f"Windows QEMU tree missing at {QEMU} "
+            f"(expected qemu~/win or legacy flat qemu~)")
 
     pending = ["qemu-system-i386.exe", "qemu-img.exe"]
     seen: set[str] = set()
